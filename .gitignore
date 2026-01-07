@@ -1,0 +1,12 @@
+data/auth/*
+data/compressed/*
+data/gaza_journalists/*
+data/images/*
+data/israel_news_orgs/*
+data/parts/*
+data/posts/*
+data/users/*
+data/videos/*
+.DS_Store
+data/.DS_Store
+__pycache__
