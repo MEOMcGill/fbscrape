@@ -1,6 +1,6 @@
-from instagram_scraper.rabbit_mq_utilities import get_channel
-from instagram_scraper.api_clients import get_bearer_token, insert_crawler_history
-from instagram_scraper.config import MEOAPI_PASSWORD, MEOAPI_USERNAME, meo_api_queue
+from facebook_scraper.rabbit_mq_utilities import get_channel
+from facebook_scraper.api_clients import get_bearer_token, insert_crawler_history
+from facebook_scraper.config import MEOAPI_PASSWORD, MEOAPI_USERNAME, meo_api_queue
 import json
 
 def consumer():
