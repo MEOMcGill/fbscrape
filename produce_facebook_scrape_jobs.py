@@ -1,14 +1,14 @@
-from instagram_scraper.config import handles_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY, USERS_DIR, PARTS_DIR, POSTS_DIR, MEOAPI_USERNAME, MEOAPI_PASSWORD
-from instagram_scraper.config import *
-from instagram_scraper.rabbit_mq_utilities import send_data_to_queue
-from instagram_scraper.api_clients import get_gaps_api, get_bearer_token
+from facebook_scraper.config import handles_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY, USERS_DIR, PARTS_DIR, POSTS_DIR, MEOAPI_USERNAME, MEOAPI_PASSWORD
+from facebook_scraper.config import *
+from facebook_scraper.rabbit_mq_utilities import send_data_to_queue
+from facebook_scraper.api_clients import get_gaps_api, get_bearer_token
 import pandas as pd
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 import os
 import shutil
 import requests
 
-# from instagram_scraper.rabbit_mq_utilities import get_channel
+# from facebook_scraper.rabbit_mq_utilities import get_channel
 # def queue_backlogged(my_queue, backlog_threshold):
 #     channel = get_channel()
 #     status = channel.queue_declare(queue=my_queue, durable=True)
@@ -32,6 +32,8 @@ def get_gaps():
     seeds_df = df[['ID', 'SeedID', 'Handle', 'Collection']]
     seeds_df = seeds_df.drop_duplicates('ID')
     seeds_df = seeds_df.rename(columns={'Handle': 'handle'})
+    #TODO REMOVE AFTER TEST
+    seeds_df = seeds_df.head(3)
     seeds = seeds_df.to_dict('records')
 
     for seed in seeds:
@@ -48,7 +50,7 @@ def get_gaps():
         end_dates = list(set(temp_df['missing_end_date']))
         end_dates = [convert_to_date(my_date) for my_date in end_dates]
         end_date = max(end_dates)
-        end_date = min(end_date, datetime.now(UTC).date())
+        end_date = min(end_date, datetime.now(timezone.utc).date())
 
         seed['start_date'] = start_date.strftime('%Y-%m-%d')
         seed['end_date'] = end_date.strftime('%Y-%m-%d')
@@ -75,7 +77,7 @@ if __name__ == "__main__":
             archive_name = shutil.make_archive(
                 os.path.join(
                     f"{dir_to_compressed_dir[my_dir]}",
-                    f"{my_dir.split(" / ")[-1]}_{today}"
+                    f"{my_dir.split(' / ')[-1]}_{today}"
                 ),
                 "zip",
                 my_dir,

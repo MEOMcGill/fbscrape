@@ -2,8 +2,8 @@ import os
 import json
 from tqdm import tqdm
 import boto3
-from instagram_scraper.post_scraper import load_data
-from instagram_scraper.config import handles_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY, USERS_DIR, PARTS_DIR, POSTS_DIR
+from facebook_scraper.post_scraper import load_data
+from facebook_scraper.config import handles_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY, USERS_DIR, PARTS_DIR, POSTS_DIR
 
 def push_post_and_user_metadata_to_cloud(s3_parent_folder: str, s3_target_bucket: str):
     s3_folder = s3_parent_folder
@@ -73,6 +73,6 @@ def push_folder(s3_parent_folder: str, s3_target_bucket: str, folder_name: str):
 
 if __name__ == "__main__":
     s3_target_bucket = "meo-raw-data"
-    s3_parent_folder = "instagram/scraper/"
+    s3_parent_folder = "facebook/scraper/"
     push_post_and_user_metadata_to_cloud(s3_parent_folder, s3_target_bucket)
     #push_folder(s3_parent_folder, s3_target_bucket, "/Users/mikad/MEOMcGill/instagram-scraper/instagram-scraper/data/old_parts")

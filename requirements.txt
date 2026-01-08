@@ -1,6 +1,6 @@
 pandas
 tqdm
-pika
+pika>=1.2.0
 bs4
 lxml
 black

@@ -1,5 +1,5 @@
-from config import video_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY
-from instagram_scraper.rabbit_mq_utilities import get_channel
+from .config import video_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY
+from .rabbit_mq_utilities import get_channel
 import json
 import os
 from time import sleep
@@ -107,9 +107,9 @@ def consumer():
         # s3_parent_folder = message["s3-parent-folder"]
         # seed_list_name = message["seed-list-name"]
         # start_date = message["start-date"]
-        handle = message['aws-dir'][len('instagram/scraper/'):]
+        handle = message['aws-dir'][len('facebook/scraper/'):]
         handle = handle[:handle.find('/')]
-        aws_dir = f"instagram/scraper/videos/{handle}/"
+        aws_dir = f"facebook/scraper/videos/{handle}/"
 
         if not os.path.exists(video_dir):
             print(f"{video_dir} does not exist. skipping video")

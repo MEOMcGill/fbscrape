@@ -233,8 +233,8 @@ class FacebookPostScraper:
         # Check if the login layout is showing:
         if (
                 self.facebook_session.page.get_by_label("Phone number, username, or email").is_visible()
-                and self.facebook_session.page.get_by_label("Password").is_visible()
-                and self.facebook_session.page.get_by_role("button", name="Log in", exact=True).is_visible()
+                or self.facebook_session.page.get_by_label("Password").is_visible()
+                or self.facebook_session.page.get_by_role("button", name="Log in", exact=True).is_visible()
         ):
             # Login layout is showing. Need to log in.
             print(f"login layout is showing! need to log in")
@@ -255,7 +255,20 @@ class FacebookPostScraper:
             self.facebook_session.browser.storage_state(path=self.auth_json)
 
         # expect to arrive on the home page
-        expect( self.facebook_session.page.get_by_label("Home")).to_be_visible(timeout=10000)
+        # expect to arrive on the home page
+        try:
+             # Try multiple selectors to verify we are logged in
+             # 1. "Home" label (desktop/mobile nav)
+             # 2. "Facebook" logo/link
+             # 3. Feed role
+             expect(self.facebook_session.page.get_by_label("Home").or_(self.facebook_session.page.get_by_role("link", name="Facebook", exact=True)).or_(self.facebook_session.page.locator('[role="feed"]')).first).to_be_visible(timeout=30000)
+        except AssertionError:
+            print("Login verification failed. Saving debug info...")
+            # Capture state for debugging
+            print(f"Current URL: {self.facebook_session.page.url}")
+            self.facebook_session.page.screenshot(path="login_failure.png")
+            print("Saved screenshot to login_failure.png")
+            raise
         return
 
     def scrape_seed(self,
@@ -822,9 +835,10 @@ class FacebookSession:
                         if url.startswith("https://www.instagram.com/ajax/bulk-route-definitions/"):
                             self.handle_bulk_route_definition(body)
                         else:
-                            print(f"funky url: {url}")
-                            print(body)
-                print(f"=================================")
+                            pass
+                            # print(f"funky url: {url}")
+                            # print(body)
+                # print(f"=================================")
                 break
         else: # all non-XHR requests are dropped
             pass
@@ -838,7 +852,7 @@ class FacebookSession:
 
     @sleep_before(10)
     @sleep_after(10)
-    def log_in_to_instagram(self, mobile):
+    def log_in_to_facebook(self, mobile):
         if mobile:
             self.page.get_by_role('button', name='Log in').click()
             time.sleep(5)

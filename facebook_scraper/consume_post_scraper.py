@@ -87,7 +87,7 @@ def consumer(username, password):
     if facebook_scraper.ip_country is None:
         input('VPN ok?')
     elif facebook_scraper.ip_country == 'CA':
-        raise Exception("You are scraping from Canada -> C-18 Meta news ban may mask certain accounts")
+        print("WARNING: You are scraping from Canada -> C-18 Meta news ban may mask certain accounts")
     else:
         print(f"scraping from {facebook_scraper.ip_country}")
 

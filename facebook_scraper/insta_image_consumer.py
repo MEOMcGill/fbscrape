@@ -1,4 +1,4 @@
-from config import image_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY
+from .config import image_queue, AWS_ACCESS_KEY, AWS_SECRET_KEY
 from .rabbit_mq_utilities import get_channel
 import json
 import os
@@ -116,9 +116,9 @@ def consumer():
             image_url = message['profile_pic_url']
         image_dir = message["image-dir"]
         s3_target_bucket = message["s3-bucket"]
-        handle = message['aws-dir'][len('instagram/scraper/'):]
+        handle = message['aws-dir'][len('facebook/scraper/'):]
         handle = handle[:handle.find('/')]
-        aws_dir = f"instagram/scraper/images/{handle}/"
+        aws_dir = f"facebook/scraper/images/{handle}/"
 
         if not os.path.exists(image_dir):
             print(f"{image_dir} does not exist. skipping image")

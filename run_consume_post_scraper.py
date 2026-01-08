@@ -1,9 +1,9 @@
-from instagram_scraper.config import instagram_logins
-from instagram_scraper.consume_post_scraper import run as run_post_consumer
+from facebook_scraper.config import facebook_logins
+from facebook_scraper.consume_post_scraper import run as run_post_consumer
 import argparse
 
 parser = argparse.ArgumentParser(
-    description="This script retrieves Instagram posts."
+    description="This script retrieves Facebook posts."
 )
 parser.add_argument(
     "--credentials",
@@ -14,6 +14,6 @@ parser.add_argument(
 args = parser.parse_args()
 
 print(f"using {args.credentials} for credentials...")
-username = instagram_logins[args.credentials]['username']
-password = instagram_logins[args.credentials]['password']
+username = facebook_logins[args.credentials]['username']
+password = facebook_logins[args.credentials]['password']
 run_post_consumer(username, password)

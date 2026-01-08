@@ -42,6 +42,11 @@ We have successfully converted the `instagram_scraper` codebase into a `facebook
 - **`run_image_consumer.py` & `run_video_consumer.py`**: Updated imports to `facebook_scraper`.
 - **`push_scraped_data_to_cloud.py`**: Updated config and S3 paths.
 
+## Prerequisites
+- **RabbitMQ Server**: You must have a RabbitMQ server running locally.
+    - **Docker**: `docker run -d --hostname my-rabbit --name some-rabbit -p 15672:15672 -p 5672:5672 rabbitmq:3-management`
+    - **Linux**: `sudo systemctl start rabbitmq-server`
+
 ## Usage Instructions
 
 1.  **Configure Credentials**:
