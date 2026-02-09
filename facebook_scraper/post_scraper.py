@@ -1,7 +1,6 @@
 """
-contains the functions for running an instagram post scraper
-the principal function should be embeddable in a rabbitmq consumer
-it should also be callable on its own
+Facebook post scraper - orchestration layer
+Uses fbscrape module for core scraping functionality
 """
 
 from .config import (SCREEN_HEIGHT, MEOAPI_USERNAME, MEOAPI_PASSWORD, API_BASE_URL)
@@ -20,8 +19,7 @@ import boto3
 from tqdm import tqdm
 from pika.adapters.blocking_connection import BlockingChannel
 
-from playwright.sync_api import sync_playwright, expect, TimeoutError
-# from playwright_stealth import stealth_sync
+from playwright.sync_api import expect
 from .api_clients import get_seedlist_new, get_bearer_token, insert_crawler_history
 from .api_clients import get_crawler_histories, validate_or_sanitize_date
 
@@ -32,6 +30,16 @@ from .rabbit_mq_utilities import send_data_to_queue
 import re
 import requests
 import geocoder
+
+# Import fbscrape components
+from fbscrape import (
+    BrowserManager,
+    PageController,
+    FacebookAuth,
+    ResponseInterceptor,
+    FacebookScraper,
+    ScrapingResult
+)
 
 MAX_NUM_HANDLES_TO_HOVER_OVER = 2  # random.choice(range(0, 10))
 AVG_NUM_SECONDS_TO_HOVER = 3
@@ -46,16 +54,6 @@ AVG_MINUTES_TO_WAIT_BETWEEN_HANDLES = 2
 BASE_URL = "https://www.facebook.com/"
 POST_BASE_URL = BASE_URL
 REEL_BASE_URL = BASE_URL + 'reel/'
-
-def internet_good():
-    try:
-        requests.get(f"https://8.8.8.8", timeout=10)
-        return True
-    except (ConnectionError, requests.exceptions.ConnectTimeout, requests.exceptions.Timeout):
-        return False
-    except Exception as e:
-        print(f"Unexpected error checking internet connectivity: {e}")
-        return False
 
 def sleep_before(seconds):
     def decorator(func):
@@ -82,25 +80,6 @@ def sleep_after(seconds):
         return wrapper
 
     return decorator
-
-def extract_posts_from_a_tags(page):
-
-    def is_post(my_href):
-        if my_href.startswith('/p/') or my_href.startswith('/reel/'):
-            return True
-        else:
-            return False
-
-    result = page.locator("a")
-    a_tags_revealed_now = result.count()
-
-    posts = []
-    for i in range(0, result.count()):
-        elt = result.nth(i)
-        if is_post(elt.get_attribute("href")):
-            posts.append(elt)
-
-    return posts
 
 class FacebookPostScraper:
     def __init__(self,
@@ -144,7 +123,6 @@ class FacebookPostScraper:
         self.password = password
         self.auth_json = os.path.join(self.auth_dir, f"{self.username.lower()}_login.json")
         self.seeds = []
-        self.facebook_session = None
         self.video_queue = video_queue
         self.image_queue = image_queue
         self.pika_parameters = pika_parameters
@@ -155,10 +133,72 @@ class FacebookPostScraper:
         self.crash_cases = crash_cases
         self.batches = []
 
+        # fbscrape components (initialized later)
+        self.browser_manager = None
+        self.page_controller = None
+        self.facebook_auth = None
+        self.response_interceptor = None
+        self.context = None
+
         assert self.s3_parent_folder[-1] == "/"
 
-    def create_playwright_instance(self):
-        self.playwright = sync_playwright().start()
+    def initialize(self):
+        """Initialize fbscrape components for scraping"""
+        print("Initializing Facebook scraper components...")
+
+        # Create browser manager and playwright instance
+        self.browser_manager = BrowserManager()
+        self.browser_manager.create_playwright_instance()
+
+        # Create Facebook auth manager
+        self.facebook_auth = FacebookAuth(
+            username=self.username,
+            password=self.password,
+            auth_json_path=self.auth_json
+        )
+
+        # Create browser context with saved session
+        self.context = self.browser_manager.create_browser_context(
+            headless=self.headless,
+            mobile=self.mobile,
+            auth_storage_path=self.auth_json
+        )
+
+        # Create page controller
+        page = self.context.new_page()
+        self.page_controller = PageController(page)
+
+        # Create response interceptor
+        self.response_interceptor = ResponseInterceptor()
+        self.response_interceptor.setup_interception(self.page_controller.page)
+
+        # Navigate to Facebook and log in if necessary
+        self.page_controller.goto(BASE_URL)
+        time.sleep(10)
+
+        if self.facebook_auth.need_to_log_in(self.page_controller.page):
+            print("Login required")
+            time.sleep(5)
+            self.facebook_auth.manual_login(self.page_controller.page, self.mobile)
+            time.sleep(10)
+            self.facebook_auth.save_session_state(self.context)
+            self.facebook_auth.clear_post_login_popups(self.page_controller.page, self.mobile)
+
+        # Verify we are logged in
+        try:
+            expect(
+                self.page_controller.page.get_by_label("Home")
+                .or_(self.page_controller.page.get_by_role("link", name="Facebook", exact=True))
+                .or_(self.page_controller.page.locator('[role="feed"]'))
+                .first
+            ).to_be_visible(timeout=30000)
+            print("Login verification successful")
+        except AssertionError:
+            print("Login verification failed. Saving debug info...")
+            print(f"Current URL: {self.page_controller.page.url}")
+            self.page_controller.page.screenshot(path="login_failure.png")
+            print("Saved screenshot to login_failure.png")
+            raise
 
     def get_ip_address(self):
         resp = requests.get(f"https://ifconfig.me")
@@ -170,117 +210,29 @@ class FacebookPostScraper:
         geocoder_data = geocoder.ip(self.ip)
         self.ip_country = geocoder_data.country
 
-    def failed_to_load_retry_button_appears(self):
-        """
-        Sometimes, instead of forcibly logging you out, Instagram will prevent you from
-        scrolling down a target home page by presenting a temporary pop-up window saying
-        'Failed to Load. [Retry]' with a retry button. If this happens, the scraping
-        accounts needs to be switched out, so the scraper needs to crash gracefully.
-        """
-        retry_button = self.insta_session.page.get_by_role("button", name="Retry")
-        if retry_button.count() > 0:
-            failed_to_load_message = self.insta_session.page.get_by_text("Failed to Load")
-            if failed_to_load_message.count() > 0:
-                return True
-            else:
-                raise Exception
-        return False
-
-    def check_if_user_and_password_are_acceptable(self):
-        print(f"scraping {self.seed_list_name} with @{self.username} ({self.ip})")
-        # input('ok?')
-
-    def check_if_local_dir_is_clear(self):
-        for my_dir in (self.image_dir, self.video_dir, self.data_dir):
-            if len(os.listdir(my_dir)) > 0:
-                raise Exception(f"{my_dir} is non-empty")
-
-    def initialize_facebook_session(self):
-        if self.mobile:
-            my_phone = self.playwright.devices['iPhone 13']
-            browser = self.playwright.webkit.launch(headless=False)
-            context = browser.new_context(
-                **my_phone,
-                storage_state=self.auth_json if os.path.exists(self.auth_json) else None
-            )
-        else:
-            browser = self.playwright.chromium.launch(headless=self.headless)
-            # browser = self.playwright.webkit.launch(headless=self.headless)
-            context = browser.new_context(
-                storage_state=self.auth_json if os.path.exists(self.auth_json) else None
-            )
-        self.facebook_session = FacebookSession(self.username, self.password, False, context)
-
-    def cookies_expired(self) -> bool:
-        if not os.path.exists(self.auth_json):
-            return True
-
-        with open(self.auth_json, "r") as f:
-            auth_dict = json.load(f)
-
-        for cookie in auth_dict["cookies"]:
-            if datetime.fromtimestamp(cookie["expires"]) < datetime.now():
-                return True
-
-        return False
-
-    def need_to_log_in(self) -> bool:
-        # if self.cookies_expired():
-        #     # Cookies are expired. Need to log in.
-        #     print('cookies expired; need to log in')
-        #     return True
-
-        # Check if the login layout is showing:
-        if (
-                self.facebook_session.page.get_by_label("Phone number, username, or email").is_visible()
-                or self.facebook_session.page.get_by_label("Password").is_visible()
-                or self.facebook_session.page.get_by_role("button", name="Log in", exact=True).is_visible()
-        ):
-            # Login layout is showing. Need to log in.
-            print(f"login layout is showing! need to log in")
-            return True
-
-        # Cookies are not expired and the login layout is not showing. No need to log in.
-        return False
-
-
-    @sleep_before(5)
-    @sleep_after(10)
-    def log_in_if_necessary(self):
-        self.facebook_session.page.goto(BASE_URL)
-        time.sleep(10)
-
-        if self.need_to_log_in():
-            self.facebook_session.log_in_to_facebook(self.mobile)
-            self.facebook_session.browser.storage_state(path=self.auth_json)
-
-        # expect to arrive on the home page
-        # expect to arrive on the home page
-        try:
-             # Try multiple selectors to verify we are logged in
-             # 1. "Home" label (desktop/mobile nav)
-             # 2. "Facebook" logo/link
-             # 3. Feed role
-             expect(self.facebook_session.page.get_by_label("Home").or_(self.facebook_session.page.get_by_role("link", name="Facebook", exact=True)).or_(self.facebook_session.page.locator('[role="feed"]')).first).to_be_visible(timeout=30000)
-        except AssertionError:
-            print("Login verification failed. Saving debug info...")
-            # Capture state for debugging
-            print(f"Current URL: {self.facebook_session.page.url}")
-            self.facebook_session.page.screenshot(path="login_failure.png")
-            print("Saved screenshot to login_failure.png")
-            raise
-        return
-
     def scrape_seed(self,
             seed, ch: BlockingChannel | None = None) -> dict:
 
         print(f"now scraping @{seed['handle']}'s home page...")
-        # flush API data from scraper
+        # Flush collected data from previous scrapes
         self.flush_data()
 
-        # scrape the data from instagram
-        metadata = self.scraper_user_home_page(seed, ch)
+        # CORE SCRAPING (delegated to HomepageScraper)
+        homepage_scraper = FacebookScraper(
+            page_controller=self.page_controller,
+            response_interceptor=self.response_interceptor
+        )
 
+        scraping_result = homepage_scraper.scrape_user_homepage(
+            handle=seed['handle'],
+            start_date=seed['start_date'],
+            end_date=seed['end_date'],
+            channel=ch
+        )
+
+        metadata = scraping_result.to_dict()
+
+        # ORCHESTRATION (remains here)
         if metadata['result'] in self.retry_cases:
            return metadata
 
@@ -290,19 +242,21 @@ class FacebookPostScraper:
         elif metadata['result'] in self.success_cases:
             # POST & USER METADATA:
             if metadata['result'] != 'no posts' and metadata['result'] != 'account is private' and metadata['result'] != 'profile is not available':
-                # save the post and user data locally
-                self.facebook_session.post_metadata_list = post_flattener(self.facebook_session.post_metadata_list)
-                self.facebook_session.post_metadata_list = post_date_filterer(self.facebook_session.post_metadata_list, seed['start_date'], seed['end_date'])
-                self.facebook_session.post_metadata_list = post_authorship_filterer(seed['handle'], self.facebook_session.post_metadata_list)
-                file_name = self.save_data_locally(seed)
-                # push the post and user data to cloud
-                # self.push_post_and_user_metadata_to_cloud(file_name)
-                # # delete the post and user data locally
-                # self.delete_post_and_user_metadata_locally(post_file_name, user_file_name)
+                # Get collected posts and users from scraping result
+                posts = scraping_result.posts
+                users = scraping_result.users
 
-                # extract asset URLs and send to queues for concurrent downloading:
+                # Data transformation
+                posts = post_flattener(posts)
+                posts = post_date_filterer(posts, seed['start_date'], seed['end_date'])
+                posts = post_authorship_filterer(seed['handle'], posts)
+
+                # Save data locally
+                file_name = self.save_data_locally_from_lists(seed, posts, users)
+
+                # Extract asset URLs and send to queues for concurrent downloading:
                 """if pursue_assets:
-                    videos_metadata, images_metadata, profile_pics_metadata = extract_assets_from_posts(self.insta_session.post_metadata_list, self.insta_session.user_metadata_list)
+                    videos_metadata, images_metadata, profile_pics_metadata = extract_assets_from_posts(posts, users)
                     self.push_video_metadata_to_download_queue(videos_metadata, f"{self.s3_parent_folder}{seed['handle']}/{seed['date_range_phrase']}/post_videos/")
                     self.push_image_metadata_to_download_queue(images_metadata, f"{self.s3_parent_folder}{seed['handle']}/{seed['date_range_phrase']}/post_images/")
                     self.push_image_metadata_to_download_queue(profile_pics_metadata, f"{self.s3_parent_folder}{seed['handle']}/{seed['date_range_phrase']}/profile_pics/")"""
@@ -330,12 +284,21 @@ class FacebookPostScraper:
         }
         return row
 
-    def save_data_locally(self, seed: dict) -> str:
-        posts = self.insta_session.post_metadata_list
-        users = self.insta_session.user_metadata_list
-        print(f"saving posts...")
+    def save_data_locally_from_lists(self, seed: dict, posts: list, users: list) -> str:
+        """
+        Save posts and users data locally
+
+        Args:
+            seed: Seed information
+            posts: List of post dictionaries
+            users: List of user dictionaries
+
+        Returns:
+            Filename of saved data
+        """
+        print(f"Saving {len(posts)} posts and {len(users)} users...")
         crawled_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        filename = f"instagram_from_{seed['start_date']}_to_{seed['end_date']}.jsonl"
+        filename = f"facebook_from_{seed['start_date']}_to_{seed['end_date']}.jsonl"
 
         for data_type, data in (("posts", posts), ("users", users)):
             if data_type == "posts":
@@ -348,7 +311,7 @@ class FacebookPostScraper:
             # Create file and append the data line by line
             with open(data_file_path, "a") as my_file:
                 for row in data:
-                    # each 'row' is a dictionary of data from Instagram
+                    # each 'row' is a dictionary of data from Facebook
                     # add a few extra fields tagging the data so its origin is identifiable
                     try:
                         assert isinstance(row, dict)
@@ -431,491 +394,26 @@ class FacebookPostScraper:
         insert_crawler_history(token, API_BASE_URL, phh_id, start_date, end_date)
 
     def flush_data(self):
-        print(f"flushing data...")
-        self.insta_session.post_metadata_list = []
-        self.insta_session.user_metadata_list = []
+        """Flush collected data from response interceptor"""
+        print("Flushing collected data...")
+        if self.response_interceptor:
+            self.response_interceptor.flush()
 
 
-    def find_lowest_post(self):
-        lowest_post = None
-        def is_post(my_href: str):
-            if my_href is None:
-                return False
-            # Facebook post patterns
-            post_pattern = r"/posts/[A-Za-z0-9-_.]+"
-            permalink_pattern = r"/permalink.php\?"
-            watch_pattern = r"/watch/\?"
-            photo_pattern = r"/photo/\?"
-            
-            if "facebook.com" in my_href:
-                # simplify absolute URLs
-                pass
+# ============================================================================
+# Utility functions for data processing
+# ============================================================================
 
-            if "/posts/" in my_href:
-                return True
-            if "/permalink.php" in my_href:
-                return True
-            if "/watch" in my_href:
-                return True
-            if "/photo" in my_href:
-                return True
-            return False
+def post_flattener(posts: list[dict]) -> list[dict]:
+    """
+    Flatten posts from nested structure
 
-        result = self.insta_session.page.locator("a")
-
-        for i in range(0, result.count()):
-            j = result.count() - 1 - i # last index first
-            elt = result.nth(j)
-            print(elt.get_attribute('href'))
-            if is_post(elt.get_attribute("href")):
-                lowest_post = elt
-                break
-        return lowest_post
-
-    def get_lowest_post_datetime_utc(self, post_element):
-        if post_element is None:
-            return None
-
-        try:
-            # Strategy 1: Look for aria-label in links (common for timestamps)
-            # Facebook timestamps often appear in links that point to the post itself
-            links = post_element.locator("a")
-            for i in range(links.count()):
-                link = links.nth(i)
-                aria_label = link.get_attribute("aria-label")
-                if aria_label:
-                    # Check if it looks like a date/time
-                    parsed_date = parse_facebook_date(aria_label)
-                    if parsed_date:
-                        return parsed_date
-                
-                # Check for hover text (sometimes in 'role=link' or similar)
-                # Strategy 2: Look for 'abbr' tags
-                abbr = link.locator("abbr")
-                if abbr.count() > 0:
-                     # sometimes the text inside abbr is "2 h" or similar
-                     text = abbr.inner_text()
-                     parsed_date = parse_facebook_date(text)
-                     if parsed_date:
-                         return parsed_date
-
-            # Strategy 3: Text content search for time patterns (risky but fallback)
-            # This is hard without being too aggressive.
-            
-            return None
-
-        except Exception as e:
-            print(f"Error extracting date: {e}")
-            return None
-
-    def scraper_user_home_page(self, seed, ch: BlockingChannel | None):
-        handle = seed['handle']
-        start_date = seed['start_date']
-        total_scrolls = 0
-        prev_post_url = None
-        scrape_start_time = datetime.now(timezone.utc)
-        repeated_post_count = 0
-        num_retries_lowest_post = 0
-        internet_bad_count = 0
-        while True:
-            if self.failed_to_load_retry_button_appears() and self.insta_session.page.url == f"{BASE_URL}{handle}/": # this is catching old errors from previous homepages so make sure that we're in fact on the page to scrape
-                return {'result': 'failed to load',
-                        'time-started': str(scrape_start_time),
-                        'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                        }
-
-            try:
-                if not self.insta_session.page.url == f"{BASE_URL}{handle}/":
-                    try:
-                        self.go_to_target_home_page(handle)
-                    except Exception as e:
-                        raise # TODO: add logic here!
-
-                if not self.insta_session.page.url == f"{BASE_URL}{handle}/":
-                    print("Logged out :/")
-                    return {'result': 'logged out while scraping',
-                            'time-started': str(scrape_start_time),
-                            'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                            }
-
-                # scroll:
-                while True:
-                    if (ch is not None) and (total_scrolls % 20 == 0):
-                        if ch.is_open:
-                            ch.connection.process_data_events(time_limit=0)
-                        else:
-                            print("WARNING: channel is closed !!")
-                    retry_button = self.insta_session.page.get_by_role("button", name="Retry")
-                    if retry_button.count() > 0:
-                        print(f"oh no! provoked the 'Failed to Load / Retry' sequence")
-                        # case 1: the account is private
-                        account_is_private = self.insta_session.page.get_by_text("account is private")
-                        if account_is_private.count() > 0:
-                            print("account is private")
-                            return {'result': 'account is private',
-                                    'time-started': str(scrape_start_time),
-                                    'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)}
-                        else:
-                            print("account is is not private")
-
-                        # case 2: failed to load
-                        failed_to_load_message = self.insta_session.page.get_by_text("Failed to Load")
-                        print(f"failed to load message") if failed_to_load_message.count()>0 else print(f"no failed to load message")
-                        return {'result': 'failed to load',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-
-                    reload_button = self.insta_session.page.get_by_role('button', name='Reload page')
-                    if reload_button.count() > 0:
-                        print(f"oh no! provoked the 'Something went wrong / Reload' sequence")
-                        something_went_wrong_message = self.insta_session.page.get_by_text("Something went wrong")
-                        print(f"something went wrong message") if something_went_wrong_message.count() > 0 else print(f"no something went wrong message")
-                        return {'result': 'something went wrong - reload',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-
-                    # check if profile is available
-                    profile_not_available = self.insta_session.page.get_by_text("Profile isn't available")
-                    if profile_not_available.count() > 0:
-                        print("Profile isn't available")
-                        return {'result': 'profile is not available',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-
-                    try:
-                        lowest_post = self.find_lowest_post()
-                        num_retries_lowest_post = 0
-                        break
-                    except Exception as e:
-                        print(e)
-                        if str(e) == "Target crashed":
-                            # Instagram has crashed
-                            return {'result': 'target crashed',
-                                    'time-started': str(scrape_start_time),
-                                    'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                    }
-
-                        else:
-                            print(f"trying again...")
-                            num_retries_lowest_post += 1
-                            if num_retries_lowest_post > 5:
-                                raise
-                            sleep(5)
-
-
-                if lowest_post is None:
-                    if self.insta_session.page.get_by_text("Sorry, this page isn't available").count() > 0:
-                        print(f"no posts found! :/")
-                        return {'result': 'no posts',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-                    elif self.insta_session.page.get_by_text("No Posts Yet").count() > 0:
-                        print(f"no posts found! :/")
-                        return {'result': 'no posts',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-                    elif self.insta_session.page.get_by_text("This account is private").count() > 0:
-                        print(f"no posts found! :/")
-                        return {'result': 'no posts',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-                    else:
-                        return {'result': 'timeout error',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-
-                try:
-                    lowest_post_url = lowest_post.get_attribute('href')
-                except Exception as e:
-                    print(e)
-                    raise
-
-                lowest_post.scroll_into_view_if_needed()
-                total_scrolls += 1
-
-                lowest_post_datetime_utc = self.get_lowest_post_datetime_utc(lowest_post)
-                if lowest_post_datetime_utc is None: # deals with the case where self.insta_session.post_metadata_list == []
-                    return {'result': 'timeout error',
-                            'time-started': str(scrape_start_time),
-                            'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)}
-
-                print(f"post date is {lowest_post_datetime_utc}")
-                print(f"start date is {start_date}")
-
-                if lowest_post_datetime_utc < datetime.strptime(
-                        start_date, "%Y-%m-%d"):
-                    print(f"post pre-dates the target start date! you have scrolled down far enough :)")
-                    # exit post page:
-                    return {'result': 'scraped until user-specified starting date was reached',
-                            'time-started': str(scrape_start_time),
-                            'time-taken': str(datetime.now(timezone.utc)-scrape_start_time)
-                            }
-
-                if lowest_post_url == prev_post_url:
-                    print(f"uh-oh! this is the same post we scrolled to on the last iteration!")
-                    repeated_post_count += 1
-
-                    if repeated_post_count > 15: # unsure why modular division...
-                        if not internet_good():
-                            internet_bad_count += 1
-                            repeated_post_count = 0
-
-                            if internet_bad_count > 10:
-                                return {'result': 'bad internet',
-                                        'time-started': str(scrape_start_time),
-                                        'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                        }
-
-                    if repeated_post_count > 20:
-                        return {'result': 'scraped until first ever post was reached',
-                                'time-started': str(scrape_start_time),
-                                'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                                }
-                else:
-                    repeated_post_count = 0
-
-                prev_post_url = lowest_post_url
-
-                print(f"scrolled {total_scrolls} times so far!")
-                print(f"uncovered {len(self.insta_session.post_metadata_list)} posts!")
-                print(f"uncovered {len(self.insta_session.user_metadata_list)} users!")
-                print(f"scraper has been running for this long: {datetime.now(timezone.utc)-scrape_start_time}")
-                
-                
-                sleep(1)
-            except TimeoutError as f:
-                return {'result': 'timeout error',
-                                    'time-started': str(scrape_start_time),
-                                    'time-taken': str(datetime.now(timezone.utc) - scrape_start_time)
-                        }
-            except Exception as f:
-                print(f)
-                raise f
-
-    @sleep_before(2)
-    def scrape_datetime(self):
-        time_elts = self.insta_session.page.locator('time')
-        if time_elts.count() == 0:
-            print(f"no datetime found :/")
-            return
-
-        last_time_elt = time_elts.nth(time_elts.count()-1)
-        utc_datetime_of_post = last_time_elt.get_attribute("datetime")
-        return utc_datetime_of_post
-
-
-    @sleep_after(5)
-    def go_to_target_home_page(self, seed):
-        target_home_page = f"https://www.facebook.com/{seed}/"
-        self.insta_session.page.goto(target_home_page)
-
-
-class FacebookSession:
-    def __init__(self, username, password, want_headless, browser):
-        self.username = username
-        self.password = password
-        self.want_headless = want_headless
-        self.browser = browser
-        self.page = self.open_page()
-        self.responses = []
-        self.xhr_bodies = []
-        self.images = []
-        self.videos = []
-        self.user_metadata_list = []
-        self.post_metadata_list = []
-
-        self.page.on("response", self.intercept_response)
-
-    def clear_popup_after_login_if_necessary(self, mobile):
-        if mobile:
-            label = 'Not now'
-        else:
-            label = "Not Now"
-
-        try:
-            self.page.get_by_role('button', name=label).nth(0).click(timeout=5000)
-        except Exception as e:
-            print(e)
-            print('no pop-up window! continuing...')
-
-    def flush_response_lists(self):
-        self.xhr_bodies = []
-        self.images = []
-        self.videos = []
-        self.responses = []
-
-    def open_page(self):
-        page = self.browser.new_page()
-        # stealth_sync(page)  # stealthify
-        return page
-
-    def extract_media_name_from_url(self, media_url):
-        for file_ext in ('.jpg', '.png', '.heic', '.mp4', '.gif', '.webp'):
-            if media_url.find(file_ext) != -1:
-                media_name = media_url[0:media_url.find(file_ext)] + file_ext
-                media_name = media_name[media_name.rfind('/') + 1:]
-                return media_name
-        raise Exception
-
-    def parse_data_from_feed(self, data):
-        edges = data['edges']
-        count = 0
-        for edge in edges:
-            node = edge['node']
-            print(node['__typename'])
-            if node['__typename'] == 'XDTFeedItem':
-                if node['media'] is not None:
-                    self.post_metadata_list.append(node)
-                    count += 1
-                else:
-                    print(node['media'])
-                    print(f"(ignoring)")
-            elif node['__typename'] == 'XDTMediaDict':
-                self.post_metadata_list.append(node)
-                count += 1
-            else:
-                print(f"what is this??")
-                # TODO: handle
-                raise Exception
-        print(f"appended {count} new data items!")
-        return
-
-    def handle_bulk_route_definition(self, body):
-        body_decoded = body.decode('utf-8')
-        if body_decoded.startswith('for (;;);'):
-            body_decoded = body_decoded[len('for (;;);'):]
-        my_dict = json.loads(body_decoded)
-        data = my_dict['payload']
-        data = data['payloads']
-        print(data.keys())
-        # self.responses.append((url, body))
-
-    def intercept_response(self, response):
-        # sift through web browser traffic, identifying assets (images and videos) and API responses
-        if response.request.resource_type == 'xhr':
-            while True:
-                explore = False
-                body = response.body()
-                url = response.url
-
-                # if the url starts with any of the following API directories, set explore=True:
-                for api_directory in (
-                        "https://www.facebook.com/api/graphql/",
-                        "https://www.facebook.com/graphql/"
-                ):
-                    if url.startswith(api_directory):
-                        explore = True
-                        break
-
-                if explore:
-                    my_dict = json.loads(body.decode('utf-8'))
-                    if 'data' not in my_dict.keys():
-                        if 'status' in my_dict.keys():
-                            print(my_dict)
-                            print(f'(ignoring)')
-                            break
-                        else:
-                            print(f"unexpected!")
-                            break
-                    # Placeholder for Facebook GraphQL parsing
-                    # print(f"Found GraphQL response: {url}")
-                    if False:
-                        # Placeholder for future Facebook response handling
-                        pass
-                else:
-                    # explore = False
-                    if url.find('.js')==-1: # not javascript
-                        if url.startswith("https://www.instagram.com/ajax/bulk-route-definitions/"):
-                            self.handle_bulk_route_definition(body)
-                        else:
-                            pass
-                            # print(f"funky url: {url}")
-                            # print(body)
-                # print(f"=================================")
-                break
-        else: # all non-XHR requests are dropped
-            pass
-        return response
-
-    def check_if_logged_in(self):
-        return False  # TODO: figure out how to know if we're logged in / not
-
-    def close_browser(self):
-        self.page.close()
-
-    @sleep_before(10)
-    @sleep_after(10)
-    def log_in_to_facebook(self, mobile):
-        if mobile:
-            self.page.get_by_role('button', name='Log in').click()
-            time.sleep(5)
-        self.page.get_by_label('Phone number, username, or email').fill(self.username)
-        time.sleep(1)
-        self.page.get_by_label('Password').fill(self.password)
-        time.sleep(1)
-        if mobile:
-            self.page.get_by_role('button', name='Log in').click() # TODO: doesn't seem to work when mobile=False
-        else:
-            self.page.get_by_role('button', name='Log in').nth(0).click()
-
-    def click_prev_post(self):
-        try:
-            # find somewhere neutral to position the mouse
-            comment_button = self.page.get_by_label("Add a comment") # TODO: not foolproof, as some posts have comments disabled
-            if comment_button.count() == 0:
-                comment_button = self.page.get_by_text("Comments on this post have been limited.")
-                comment_button.count()
-            comment_button.hover()
-
-            go_back_button = self.page.get_by_role('button').locator("css=svg[aria-label='Go back']")
-            assert go_back_button.count() == 1
-            go_back_button.click(timeout=10000)
-
-            return True
-
-        except Exception as e:
-            try:
-                self.page.keyboard.press("ArrowLeft")
-                return True
-            except:
-                print(e)
-                raise
-
-    def click_next_post(self):
-        try:
-            svgs = self.page.locator('svg')
-            svgs = [svgs.nth(i) for i in range(0, svgs.count())]
-            nexts = [svg for svg in svgs if svg.get_attribute('aria-label') == "Next"]
-
-            if len(nexts) == 0:
-                return False
-
-            elif len(nexts) > 1:
-                self.page.keyboard.press("ArrowRight")
-                return True
-
-            else: # len(nexts) == 1
-                next = nexts[0]
-                try:
-                    next.click()
-                    return True
-                except Exception as e:
-                    print(e)
-                    raise
-        except Exception as e:
-            print(e)
-            raise
-
-    @sleep_after(10)
-    def get_page(self, url):
-        self.page.goto(url)
+    For Facebook posts, this may need to be updated based on actual response structure.
+    Currently keeps posts as-is since Facebook GraphQL structure is TBD.
+    """
+    # TODO: Update based on actual Facebook GraphQL response structure
+    # For now, just return posts as-is
+    return posts
 
 
 def extract_assets_from_post(post: dict) -> (list[dict], list[dict], list[dict]):
@@ -1218,45 +716,4 @@ def convert_to_date(my_date):
     try:
         return datetime.strptime(my_date, "%Y-%m-%d").date()
     except:
-        return None
-
-def parse_facebook_date(date_str: str):
-    """
-    Parses Facebook date strings into datetime objects (UTC).
-    Examples: 
-    - "2h", "5m", "Just now"
-    - "Yesterday at 5:00 PM"
-    - "July 24 at 5:00 PM"
-    - "July 24, 2023 at 5:00 PM"
-    """
-    if not date_str:
-        return None
-    
-    date_str = date_str.strip()
-    now = datetime.now(timezone.utc)
-    
-    try:
-        # Relative time
-        if date_str.endswith('m'): # mins
-            return now - timedelta(minutes=int(date_str[:-1]))
-        elif date_str.endswith('h'): # hours
-            return now - timedelta(hours=int(date_str[:-1]))
-        elif date_str.endswith('d'): # days
-            return now - timedelta(days=int(date_str[:-1]))
-        elif date_str.lower() in ["just now", "now"]:
-            return now
-        
-        # Absolute formats
-        # "Yesterday at 5:00 PM"
-        pass # TODO: Implement full parsing logic with re or dateparser if robust parsing is needed.
-             # For now, returning None for complex strings to avoid bad data, 
-             # or implementing simple fallback.
-        
-        # Simple absolute extraction (naive)
-        # Verify if string contains year
-        # This requires more complex logic or external lib
-        
-        return None
-        
-    except Exception:
         return None

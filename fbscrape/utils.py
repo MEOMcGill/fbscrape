@@ -1,0 +1,182 @@
+"""
+Utility functions for Facebook scraping
+"""
+import os
+from pathlib import Path
+import re
+import requests
+from datetime import datetime, timedelta, timezone
+import json
+
+
+def internet_good() -> bool:
+    """
+    Check if internet connection is working
+
+    Returns:
+        True if internet is working, False otherwise
+    """
+    try:
+        requests.get("https://8.8.8.8", timeout=10)
+        return True
+    except (ConnectionError, requests.exceptions.ConnectTimeout, requests.exceptions.Timeout):
+        return False
+    except Exception as e:
+        print(f"Unexpected error checking internet connectivity: {e}")
+        return False
+
+
+def is_post_url(href: str) -> bool:
+    """
+    Determine if a URL is a Facebook post URL
+
+    Args:
+        href: URL to check
+
+    Returns:
+        True if URL is a Facebook post, False otherwise
+    """
+    if href is None:
+        return False
+
+    # Facebook post patterns
+    if "/posts/" in href:
+        return True
+    if "/reel/" in href:
+        return True
+    """if "/permalink.php" in href:
+        return True
+    if "/watch" in href:
+        return True
+    if "/photo" in href:
+        return True"""
+
+    return False
+
+
+def extract_post_id(url: str) -> str | None:
+    """
+    Extract post ID from Facebook post URL
+
+    Args:
+        url: Facebook post URL
+
+    Returns:
+        Post ID if found, None otherwise
+    """
+    if not url:
+        return None
+
+    # Pattern: /posts/{post_id}
+    match = re.search(r'/posts/([A-Za-z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    # Pattern: /permalink.php?story_fbid={id}
+    match = re.search(r'story_fbid=(\d+)', url)
+    if match:
+        return match.group(1)
+
+    # Pattern: /watch/?v={id}
+    match = re.search(r'[?&]v=(\d+)', url)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def parse_facebook_date(date_str: str) -> datetime | None:
+    """
+    Parse Facebook date strings into datetime objects (UTC).
+
+    Examples:
+        - "2h", "5m", "Just now"
+        - "Yesterday at 5:00 PM"
+        - "July 24 at 5:00 PM"
+        - "July 24, 2023 at 5:00 PM"
+
+    Args:
+        date_str: Facebook date string
+
+    Returns:
+        datetime object in UTC, or None if parsing fails
+    """
+    if not date_str:
+        return None
+
+    date_str = date_str.strip()
+    now = datetime.now(timezone.utc)
+
+    try:
+        # Relative time patterns
+        if date_str.endswith('m'):  # minutes
+            minutes = int(date_str[:-1])
+            return now - timedelta(minutes=minutes)
+        elif date_str.endswith('h'):  # hours
+            hours = int(date_str[:-1])
+            return now - timedelta(hours=hours)
+        elif date_str.endswith('d'):  # days
+            days = int(date_str[:-1])
+            return now - timedelta(days=days)
+        elif date_str.lower() in ["just now", "now"]:
+            return now
+
+        # "Yesterday" pattern
+        if date_str.lower().startswith("yesterday"):
+            return now - timedelta(days=1)
+
+        # Absolute formats (not fully implemented)
+        # For complex date strings like "July 24, 2023 at 5:00 PM"
+        # we would need more sophisticated parsing or external library
+        # For now, return None for unhandled patterns
+
+        return None
+
+    except Exception:
+        return None
+
+def unix_to_datetime(unix_timestamp: int) -> datetime:
+    return datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+
+def get_home_dir_path():
+    return os.path.dirname(Path(os.path.abspath(__file__)).parent)
+
+def get_config_path():
+    return os.path.join(get_home_dir_path(), "meo_facebook_scraper_config.cfg")
+
+def parse_json_or_jsonl(body: str) -> list[dict]:
+    # json.loads(body.decode('utf-8').strip().split('\n')[0])
+    try:
+        return [json.loads(body)]
+    except json.decoder.JSONDecodeError:
+        return [json.loads(i) for i in body.strip().split('\n')]
+
+def flatten_dict(d: dict, parent_key='', sep='.') -> dict:
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        elif isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    items.extend(flatten_dict(item, f"{new_key}.{i}", sep=sep).items())
+                else:
+                    items.append((f"{new_key}.{i}", item))
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+def recursively_get_dict_value(dictionary: dict, key: str) -> dict | None:
+    dictionary_flattened = flatten_dict(dictionary)
+    matches = {k: v for k, v in dictionary_flattened.items() if k.endswith(key)}
+    return matches
+
+def save_jsonl(path: str, data: list[dict]) -> None:
+    with open(path, "w") as f:
+        for d in data:
+            json.dump(d, f)
+            f.write("\n")
+
+if __name__ == "__main__":
+    print(get_home_dir_path())

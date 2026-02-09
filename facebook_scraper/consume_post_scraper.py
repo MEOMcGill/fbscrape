@@ -91,9 +91,8 @@ def consumer(username, password):
     else:
         print(f"scraping from {facebook_scraper.ip_country}")
 
-    facebook_scraper.create_playwright_instance()
-    facebook_scraper.initialize_facebook_session()
-    facebook_scraper.log_in_if_necessary()
+    # Initialize fbscrape components (browser, auth, response interceptor)
+    facebook_scraper.initialize()
 
     input_channel = get_channel()
     input_channel.queue_declare(queue=handles_queue, durable=True)

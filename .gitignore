@@ -10,3 +10,5 @@ data/videos/*
 .DS_Store
 data/.DS_Store
 __pycache__
+auth
+.idea
