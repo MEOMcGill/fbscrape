@@ -1,0 +1,2 @@
+[console_scripts]
+fbscrape = fbscrape.cli:main

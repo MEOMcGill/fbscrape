@@ -1,12 +1,91 @@
 """
 Utility functions for Facebook scraping
 """
+import base64
 import os
 from pathlib import Path
 import re
 import requests
 from datetime import datetime, timedelta, timezone
 import json
+import asyncio
+
+class utc:
+    @staticmethod
+    def now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def from_iso(iso: str) -> datetime:
+        return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def ts() -> int:
+        return int(utc.now().timestamp())
+
+
+def parse_cookies(val: str) -> list[dict]:
+    """
+    Parse cookies from various formats into Playwright cookie format.
+
+    Returns:
+        List of cookie dicts in Playwright format (with domain, expires, httpOnly, etc.)
+    """
+    try:
+        val = base64.b64decode(val).decode()
+    except Exception:
+        pass
+
+    try:
+        try:
+            res = json.loads(val)
+            if isinstance(res, dict) and "cookies" in res:
+                res = res["cookies"]
+
+            if isinstance(res, list):
+                # Already in Playwright format (list of cookie dicts)
+                return res
+            if isinstance(res, dict):
+                # Simple name-value dict, convert to Playwright format
+                return [
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": ".facebook.com",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                        "sameSite": "None"
+                    }
+                    for name, value in res.items()
+                ]
+        except json.JSONDecodeError:
+            # Cookie string format: "name1=value1; name2=value2"
+            res = val.split("; ")
+            res = [x.split("=", 1) for x in res]
+            return [
+                {
+                    "name": x[0],
+                    "value": x[1],
+                    "domain": ".facebook.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "None"
+                }
+                for x in res
+            ]
+    except Exception:
+        pass
+
+    raise ValueError(f"Invalid cookie value: {val}")
+
+
+def get_env_bool(key: str, default_val: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default_val
+    return val.lower() in ("1", "true", "yes")
 
 
 def internet_good() -> bool:
@@ -177,6 +256,10 @@ def save_jsonl(path: str, data: list[dict]) -> None:
         for d in data:
             json.dump(d, f)
             f.write("\n")
+
+async def gather(coros):
+    for c in asyncio.as_completed(list(coros)):
+        yield await c
 
 if __name__ == "__main__":
     print(get_home_dir_path())

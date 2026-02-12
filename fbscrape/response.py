@@ -3,12 +3,14 @@ Response interception and Facebook GraphQL parsing
 """
 
 import json
-from playwright.sync_api import Page, Response
+import traceback
+from playwright.async_api import Page, Response
 from fbscrape.utils import parse_json_or_jsonl, flatten_dict, recursively_get_dict_value
+from .logger import logger
 
 
 class FacebookGraphQLParser:
-    """Parses Facebook GraphQL responses to extract posts and users"""
+    """Parses Facebook GraphQL responses to extract posts"""
 
     def parse_timeline_response(self, body: bytes, url: str) -> dict | None:
         """
@@ -19,33 +21,25 @@ class FacebookGraphQLParser:
             url: Response URL
 
         Returns:
-            Dict with 'posts' and 'users' keys, or None if parsing fails
+            Dict with 'posts' key, or None if parsing fails
         """
         try:
             response_data = parse_json_or_jsonl(body.decode('utf-8'))
             posts = []
-            users = []
             for data in response_data:
-                # TODO: IMPLEMENT ACTUAL PARSING LOGIC
-                # Once you inspect the saved JSON files (debug_graphql_*.json),
-                # you'll see the structure and can implement extraction here
-
                 if 'data' in data:
-                    # post
                     if 'node' in data['data']:
                         if self.is_post_node(data['data']['node']):
                             posts.append(data['data'])
-                    pass
 
-            return {'posts': posts, 'users': users}
+            return {'posts': posts}
 
         except json.JSONDecodeError as e:
-            print(f"[PARSER ERROR] Failed to decode JSON: {e}")
+            logger.error(f"[PARSER ERROR] Failed to decode JSON: {e}")
             return None
         except Exception as e:
-            print(f"[PARSER ERROR] {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[PARSER ERROR] {e}")
+            logger.error(traceback.print_exc())
             return None
 
     def is_post_node(self, node: dict) -> bool | None:
@@ -59,7 +53,6 @@ class FacebookGraphQLParser:
             bool indicating if node is a post, or None if parsing fails
         """
         try:
-            # TODO: Implement based on actual Facebook GraphQL structure
             # if there's the link to a post 'https://www.facebook.com/reel/893086710220638/'
             post_data = flatten_dict(node)
             post_url = [
@@ -76,38 +69,17 @@ class FacebookGraphQLParser:
             return is_post
 
         except Exception as e:
-            print(f"Failed to parse post node: {e}")
+            logger.error(f"Failed to parse post node: {e}")
             return None
-
-    def is_user_node(self, node: dict) -> dict | None:
-        """
-        Extract user metadata from GraphQL node
-
-        Args:
-            node: User node from GraphQL response
-
-        Returns:
-            User metadata dict or None
-        """
-        try:
-            # TODO: Implement based on actual Facebook GraphQL structure
-            # Example fields to extract:
-            # - username
-            # - profile_pic_url
-            # - id
-            pass
-        except Exception as e:
-            print(f"Failed to parse user node: {e}")
-            return None
-
 
 class ResponseInterceptor:
     """Intercepts and handles browser network responses"""
 
     def __init__(self):
         self.posts = []
-        self.users = []
+        self.graphql_request_count = 0
         self.parser = FacebookGraphQLParser()
+        self.page = None
 
     def setup_interception(self, page: Page):
         """
@@ -116,19 +88,22 @@ class ResponseInterceptor:
         Args:
             page: Playwright page object
         """
-        page.on("response", self.intercept_response)
-        print("Response interception enabled")
+        self.page = page
+        self.page.on("response", self.intercept_response)
+        logger.info("Response interception enabled")
 
-    def intercept_response(self, response: Response):
+    def stop_interception(self):
+        if self.page:
+            self.page.remove_listener("response", self.intercept_response)
+            self.page = None
+
+    async def intercept_response(self, response: Response):
         """
         Callback for intercepted responses
 
         Args:
             response: Playwright response object
         """
-        # DEBUG: Uncomment to see ALL responses
-        # print(f"[DEBUG] Response: {response.request.resource_type} | {response.url[:100]}")
-
         # Only process XHR requests
         if response.request.resource_type != 'xhr':
             return
@@ -142,35 +117,36 @@ class ResponseInterceptor:
         )
 
         is_graphql = any(url.startswith(endpoint) for endpoint in graphql_endpoints)
-
         if not is_graphql:
             return
 
+        self.graphql_request_count += 1
+
         try:
-            body = response.body()
-
+            body = await response.body()
             parsed = self.parser.parse_timeline_response(body, url)
-
             if parsed:
                 self.posts.extend(parsed['posts'])
-                self.users.extend(parsed['users'])
             else:
-                print(f"[PARSER] Returned None - parser needs implementation")
+                logger.warning(f"[PARSER] Returned None - parser needs implementation")
 
         except Exception as e:
-            print(f"[ERROR] Error intercepting response: {e}")
-            import traceback
+            logger.error(f"[ERROR] Error intercepting response: {e}")
             traceback.print_exc()
 
     def get_posts(self) -> list[dict]:
         """Get collected posts"""
         return self.posts
 
-    def get_users(self) -> list[dict]:
-        """Get collected users"""
-        return self.users
+    def has_graphql_activity(self) -> bool:
+        """Check if any GraphQL requests have been intercepted"""
+        return self.graphql_request_count > 0
+
+    def get_graphql_request_count(self) -> int:
+        """Get the number of GraphQL requests intercepted"""
+        return self.graphql_request_count
 
     def flush(self):
-        """Clear collected data"""
+        """Clear collected data and reset counters"""
         self.posts = []
-        self.users = []
+        self.graphql_request_count = 0

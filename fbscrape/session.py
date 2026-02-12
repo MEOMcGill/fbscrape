@@ -2,11 +2,11 @@
 Facebook authentication and session management
 """
 
+import asyncio
 import json
 import os
-import time
 from datetime import datetime
-from playwright.sync_api import Page, BrowserContext
+from playwright.async_api import Page, BrowserContext
 
 
 class FacebookAuth:
@@ -48,7 +48,7 @@ class FacebookAuth:
             print(f"Error checking cookie expiration: {e}")
             return True
 
-    def need_to_log_in(self, page: Page) -> bool:
+    async def need_to_log_in(self, page: Page) -> bool:
         """
         Check if login is required
 
@@ -59,26 +59,30 @@ class FacebookAuth:
             True if login is needed, False otherwise
         """
         # Check if the login layout is showing
-        if (
-            page.get_by_label("Phone number, username, or email").is_visible()
-            or page.get_by_label("Password").is_visible()
-            or page.get_by_role("button", name="Log in", exact=True).is_visible()
-        ):
-            print("Login layout is showing - need to log in")
-            return True
 
-        return False
+        try:
+            await page.get_by_label("Phone number, username, or email").or_(
+                page.get_by_label("Password")
+            ).or_(
+                page.get_by_role("button", name="Log in", exact=True)
+            ).first.wait_for(state="visible", timeout=5000)
+            login_visible = True
+        except:
+            login_visible = False
 
-    def cookie_login(self, context: BrowserContext):
+        print(f"Login layout detected - {login_visible}")
+        return login_visible
+
+    async def cookie_login(self, context: BrowserContext):
         """Login using saved cookies"""
         print(f"Logging in to Facebook as {self.username} using saved cookies")
-        with open(self.auth_json_path, "r") as f:
-            auth_dict = json.load(f)
-
-        context.add_cookies(auth_dict.get("cookies", []))
+        if os.path.exists(self.auth_json_path):
+            with open(self.auth_json_path, "r") as f:
+                auth_dict = json.load(f)
+            await context.add_cookies(auth_dict.get("cookies", []))
         print("Cookies loaded successfully")
 
-    def manual_login(self, page: Page, mobile: bool):
+    async def manual_login(self, page: Page, mobile: bool):
         """
         Execute Facebook login flow
 
@@ -90,36 +94,36 @@ class FacebookAuth:
 
         # On mobile, click the "Log in" button first
         if mobile:
-            page.get_by_role('button', name='Log in').click()
-            time.sleep(5)
+            await page.get_by_role('button', name='Log in').click()
+            await asyncio.sleep(5)
 
         # Fill username
-        page.get_by_label('Email or phone number').fill(self.username)
-        time.sleep(1)
+        await page.get_by_label('Email or phone number').fill(self.username)
+        await asyncio.sleep(1)
 
         # Fill password
-        page.get_by_label('Password').fill(self.password)
-        time.sleep(1)
+        await page.get_by_label('Password').fill(self.password)
+        await asyncio.sleep(1)
 
         # Click login button
         if mobile:
-            page.get_by_role('button', name='Log in').click()
+            await page.get_by_role('button', name='Log in').click()
         else:
-            page.get_by_role('button', name='Log in').nth(0).click()
+            await page.get_by_role('button', name='Log in').nth(0).click()
 
         print("Login form submitted")
 
-    def save_session_state(self, context: BrowserContext):
+    async def save_session_state(self, context: BrowserContext):
         """
         Save browser session state to file
 
         Args:
             context: Browser context to save
         """
-        context.storage_state(path=self.auth_json_path)
+        await context.storage_state(path=self.auth_json_path)
         print(f"Session state saved to {self.auth_json_path}")
 
-    def clear_post_login_popups(self, page: Page, mobile: bool):
+    async def clear_post_login_popups(self, page: Page, mobile: bool):
         """
         Dismiss post-login popup dialogs
 
@@ -133,7 +137,7 @@ class FacebookAuth:
             label = "Not Now"
 
         try:
-            page.get_by_role('button', name=label).nth(0).click(timeout=5000)
+            await page.get_by_role('button', name=label).nth(0).click(timeout=5000)
             print("Dismissed post-login popup")
         except Exception as e:
             print("No post-login popup to dismiss")
