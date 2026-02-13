@@ -11,7 +11,7 @@ from .exceptions import FailedLoginError
 
 import asyncio
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser, Locator
 from camoufox.async_api import AsyncNewBrowser
 from typing import Optional
@@ -34,6 +34,10 @@ class BrowserSession:
         self.headless = headless
         self.mobile = mobile
 
+        # the endpoint we're scrolling
+        self.endpoint: Optional[str] = None
+
+        # browser-related objects
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -71,6 +75,12 @@ class BrowserSession:
             proxy=proxy_settings,
             geoip=True if proxy_settings else False,
             os=self.account.os,
+            firefox_user_prefs={
+                "browser.aboutwelcome.enabled": False,
+                "browser.startup.firstrunSkipsHomepage": True,
+                "browser.shell.checkDefaultBrowser": False,
+                "datareporting.policy.dataSubmissionEnabled": False,
+            }
         )
 
         self._context: BrowserContext = await self._browser.new_context()
@@ -89,26 +99,20 @@ class BrowserSession:
         if self.account.cookies:
             try:
                 await self._context.add_cookies(self.account.cookies)
-                logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.identifier}")
+                logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.display_name}")
             except Exception as e:
-                logger.warning(f"Failed to inject cookies for {self.account.identifier}: {e}")
+                logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
         else:
             successful_login = await self.login()
             if not successful_login:
-                raise FailedLoginError(f"Failed to login for {self.account.identifier}")
+                raise FailedLoginError(f"Failed to login for {self.account.display_name}")
 
         await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
 
-        logger.info(f"Browser session initialized for {self.account.identifier}")
+        logger.info(f"Browser session initialized for {self.account.display_name}")
 
     async def close(self):
         """Close browser session and cleanup resources"""
-        # Save cookies BEFORE closing browser (requires active context)
-        try:
-            await self.save_cookies()
-        except Exception as e:
-            logger.warning(f"Failed to save cookies on close: {e}")
-
         if self.response_interceptor:
             self.response_interceptor.stop_interception()
         if self._browser:
@@ -116,7 +120,7 @@ class BrowserSession:
         if self._pw:
             await self._pw.stop()
 
-        logger.info(f"Browser session closed for {self.account.identifier}")
+        logger.info(f"Browser session closed for {self.account.display_name}")
 
     # ==================== Authentication ====================
 
@@ -136,10 +140,10 @@ class BrowserSession:
 
         # Check if login form is visible
         if not await self._is_login_form_visible():
-            logger.warning(f"Cannot login {self.account.identifier}: no login form and not logged in")
+            logger.warning(f"Cannot login {self.account.display_name}: no login form and not logged in")
             return False
 
-        logger.info(f"Logging in to Facebook as {self.account.identifier}")
+        logger.info(f"Logging in to Facebook as {self.account.display_name}")
 
         try:
             # Fill username with human-like typing
@@ -169,18 +173,30 @@ class BrowserSession:
             if await self.check_logged_in(timeout=10.0):
                 # Save cookies after successful login
                 await self.save_cookies()
-                # Mark account as active
-                await self.pool.set_active(self.account.identifier, True)
+                # Mark account as active and clear any previous error message
+                await self.pool.set_active(self.account.identifier, True, None)
+                # Reset scroll_count_overall_24h if last_used was over 24h ago
+                if self.account.last_used:
+                    time_since_last_used = datetime.now(timezone.utc) - self.account.last_used.replace(tzinfo=timezone.utc)
+                    if time_since_last_used > timedelta(hours=24):
+                        await self.pool.reset_scroll_counts(self.account.identifier)
+                        logger.info(f"Reset scroll counts for {self.account.display_name} (last used {time_since_last_used} ago)")
+                # Update last_used timestamp
+                await self.pool.update_last_used(self.account.identifier)
                 # Clear any post-login popups
                 await self._clear_post_login_popups()
-                logger.info(f"Login successful for {self.account.identifier}")
+                logger.info(f"Login successful for {self.account.display_name}")
                 return True
             else:
-                logger.warning(f"Login failed for {self.account.identifier}")
+                # Failed login - mark account as inactive with error
+                await self.pool.set_active(self.account.identifier, False, "Login failed")
+                logger.warning(f"Login failed for {self.account.display_name}")
                 return False
 
         except Exception as e:
-            logger.error(f"Login error for {self.account.identifier}: {e}")
+            # Login error - mark account as inactive with error message
+            await self.pool.set_active(self.account.identifier, False, f"Login error: {e}")
+            logger.error(f"Login error for {self.account.display_name}: {e}")
             return False
 
     async def check_logged_in(self, timeout: float = 10.0) -> bool:
@@ -207,8 +223,6 @@ class BrowserSession:
             while elapsed < timeout:
                 if temp_interceptor.has_graphql_activity():
                     logger.info(f"Logged in: intercepted {temp_interceptor.get_graphql_request_count()} GraphQL requests")
-                    # Update last_used on successful login check
-                    await self.pool.update_last_used(self.account.identifier)
                     return True
                 await asyncio.sleep(interval)
                 elapsed += interval
@@ -227,11 +241,11 @@ class BrowserSession:
         """Save current cookies to the database"""
         cookies = await self.get_cookies()
         await self.pool.update_cookies(self.account.identifier, cookies)
-        logger.info(f"Saved cookies for {self.account.identifier}")
+        logger.info(f"Saved cookies for {self.account.display_name}")
 
     # ==================== Scraping ====================
 
-    async def scrape_user_homepage(
+    async def user_timeline(
         self,
         handle: str,
         start_date: str,
@@ -248,6 +262,9 @@ class BrowserSession:
         Returns:
             ScrapingResult with outcome and collected data
         """
+
+        self.endpoint = "UserTimeline"
+
         base_url = "https://www.facebook.com/"
         target_url = f"{base_url}{handle}/"
 
@@ -295,6 +312,9 @@ class BrowserSession:
                     logger.info(f"Navigating to {target_url}")
                     await self.goto(target_url)
                     await asyncio.sleep(5)
+
+                    # press escape key
+                    await self.page.keyboard.press('Escape')
 
                     # Check if we got logged out
                     if not self.is_on_page(target_url):
@@ -346,21 +366,19 @@ class BrowserSession:
 
                         # Check if we've reached the target date
                         if oldest_timestamp.replace(tzinfo=None) < start_datetime:
-                            logger.info(f"Reached target start date for @{handle}")
+                            response_interceptor_posts = self.response_interceptor.get_posts()
+                            logger.info(f"Reached target start date {start_date} for @{handle} scraping {len(response_interceptor_posts)} posts")
                             return ScrapingResult(
                                 query=query,
                                 result='scraped until user-specified starting date was reached',
-                                posts=self.response_interceptor.get_posts(),
+                                posts=response_interceptor_posts,
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
 
-                # Scroll to trigger loading more posts
-                await self.page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+                # Scroll to trigger loading more posts (also records scroll in database)
+                await self.scroll()
                 total_scrolls += 1
-
-                # Record scroll in database
-                await self.record_scroll("user_page")
 
                 # Rate limiting
                 if total_scrolls % 20 == 0:
@@ -468,6 +486,12 @@ class BrowserSession:
         """Query elements by selector"""
         return self.page.locator(selector)
 
+    async def scroll(self, window_height_coefficient: float = 3):
+        """Scroll window by window_height_coefficient * window.innerHeight"""
+        await self.page.evaluate(f"window.scrollBy(0, window.innerHeight * {window_height_coefficient})")
+        await self.record_scroll(endpoint=self.endpoint if self.endpoint else "general", count=1)
+
+
     # ==================== Private Helpers ====================
 
     def _get_proxy_dict(self) -> dict | None:
@@ -507,18 +531,31 @@ class BrowserSession:
         except Exception:
             return False
 
+    async def _close_firefox_startup_overlay(self):
+        """Close Firefox startup overlay if present"""
+        try:
+            await self.page.get_by_role('button', name='Close').nth(0).click(timeout=5000)
+            logger.info("Closed Firefox startup overlay")
+        except Exception:
+            pass
+
+    async def _close_not_now_pop(self):
+        """Close Not Now popup if present"""
+        try:
+            label = 'Not now' if self.mobile else 'Not Now'
+            await self.page.get_by_role('button', name=label).nth(0).click(timeout=5000)
+            logger.info("Closed Not Now popup")
+        except Exception:
+            pass
+
     async def _clear_pre_login_popups(self):
         """Dismiss pre-login popup dialogs"""
         await self._decline_optional_cookies()
 
     async def _clear_post_login_popups(self):
         """Dismiss post-login popup dialogs"""
-        label = 'Not now' if self.mobile else 'Not Now'
-        try:
-            await self.page.get_by_role('button', name=label).nth(0).click(timeout=5000)
-            logger.info("Dismissed post-login popup")
-        except Exception:
-            pass  # No popup to dismiss
+        await self._close_firefox_startup_overlay()
+        await self._close_not_now_pop()
 
     async def _human_type(self, locator: Locator, text: str, mean_delay: float = 0.1, std_dev: float = 0.03):
         """

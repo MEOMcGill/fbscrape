@@ -15,7 +15,7 @@ async def create_browser_context(headless: bool = headless, mobile: bool = mobil
     # Work which will be done by Worker.py
     pool = AccountsPool(db_file=os.path.join(get_home_dir_path(), "db", "accounts.db"))
     await pool.release_account(identifier=None)
-    account: Account = await pool.get(identifier="+12192636156")
+    account: Account = await pool.get(identifier="+16156262335")
 
     try:
         async with BrowserSession(

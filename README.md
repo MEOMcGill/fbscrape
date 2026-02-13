@@ -32,6 +32,7 @@ from fbscrape.browser_session import BrowserSession
 from fbscrape.accounts_pool import AccountsPool
 import asyncio
 
+
 async def main():
     # Initialize account pool
     pool = AccountsPool("accounts.db")
@@ -46,7 +47,7 @@ async def main():
             print(f"Logged in as {account.identifier}")
 
             # Scrape a user's homepage
-            result = await session.scrape_user_homepage(
+            result = await session.user_timeline(
                 handle="zuck",
                 start_date="2024-01-01",
                 end_date="2025-01-01"
@@ -57,6 +58,7 @@ async def main():
     # Release the account
     await pool.release_account(account.identifier)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -65,6 +67,7 @@ if __name__ == "__main__":
 
 ```python
 from fbscrape.utils import gather
+
 
 async def scrape_multiple():
     pool = AccountsPool("accounts.db")
@@ -80,8 +83,8 @@ async def scrape_multiple():
 
     # Scrape concurrently and yield results as they complete
     async for result in gather(
-        session.scrape_user_homepage(handle, "2024-01-01", "2025-01-01")
-        for session, handle in sessions
+            session.user_timeline(handle, "2024-01-01", "2025-01-01")
+            for session, handle in sessions
     ):
         print(f"Completed: {result.query.query} - {len(result.posts)} posts")
         # Save result immediately, don't accumulate in memory
@@ -243,6 +246,31 @@ fbscrape set-cookies user@example.com cookies.json
 # Export cookies to file
 fbscrape export-cookies user@example.com output.json
 ```
+
+### Field Management
+
+Update individual account fields directly from the CLI:
+
+```bash
+# Set a field value for an account
+fbscrape set <identifier> <field> <value>
+
+# Examples
+fbscrape set user@example.com username myusername
+fbscrape set user@example.com active true
+fbscrape set user@example.com proxy_server http://proxy:8080
+fbscrape set user@example.com error_msg null       # clears the field
+
+# List all updatable fields
+fbscrape fields
+```
+
+**Updatable fields:**
+`active`, `email`, `email_password`, `error_msg`, `fingerprint`, `os`, `password`, `phone_number`, `proxy_password`, `proxy_server`, `proxy_username`, `twofa_id`, `username`
+
+**Special values:**
+- `null` or `none` - sets the field to NULL
+- `true` / `false` - for boolean fields like `active`
 
 ## Architecture
 

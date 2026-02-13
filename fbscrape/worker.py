@@ -1,24 +1,65 @@
+"""
+Worker class for managing account lifecycle and executing scraping tasks.
+
+Each task gets a fresh BrowserSession (via context manager), allowing clean
+separation between tasks and automatic resource cleanup.
+"""
+
 import asyncio
+from typing import Callable, Optional
 
 from .accounts_pool import AccountsPool
 from .account import Account
-from .logger import logger
 from .browser_session import BrowserSession
+from .exceptions import (
+    AccountBannedError,
+    FailedLoginError,
+    NoAccountError,
+    RateLimitError,
+)
+from .logger import logger
 from .models import Query, ScrapingResult
 
-from typing import Optional
 
 class Worker:
-    """This deals with a single browser session: execute tasks and handle account rotation"""
+    """
+    Manages account lifecycle and executes scraping tasks.
+
+    Creates a fresh BrowserSession for each task via context manager,
+    tracks scroll counts across tasks, and handles account rotation
+    when thresholds are reached or errors occur.
+    """
+
+    # Maps endpoint names to BrowserSession method names
+    ENDPOINT_METHODS = {
+        "user_timeline": "user_timeline",
+        # Add more as implemented:
+        # "search": "search",
+        # "group_posts": "group_posts",
+    }
+
     def __init__(
-            self,
-            id: str,
-            pool: AccountsPool,
-            scroll_threshold: int = 500,
-            headless: bool = False,
-            mobile: bool = False,
-            queue: str = "general"
+        self,
+        id: str,
+        pool: AccountsPool,
+        scroll_threshold: int = 500,
+        headless: bool = False,
+        mobile: bool = False,
+        queue: str = "general",
     ):
+        """
+        Initialize Worker with configuration only.
+
+        Use Worker.create() factory method or context manager for proper initialization.
+
+        Args:
+            id: Worker identifier for logging
+            pool: AccountsPool for account management
+            scroll_threshold: Scroll count before rotating account
+            headless: Run browser in headless mode
+            mobile: Use mobile browser emulation
+            queue: Queue name for account locking
+        """
         self.id = id
         self.pool = pool
         self.scroll_threshold = scroll_threshold
@@ -26,63 +67,259 @@ class Worker:
         self.mobile = mobile
         self.queue = queue
 
-        # set at init
+        # State set during initialize()
         self.current_account: Optional[Account] = None
-        self.browser_session: Optional[BrowserSession] = None
-        self.scroll_count = 0
+        self.scroll_count: int = 0
+        self._initialized: bool = False
+
+    @classmethod
+    async def create(
+        cls,
+        id: str,
+        pool: AccountsPool,
+        scroll_threshold: int = 500,
+        headless: bool = False,
+        mobile: bool = False,
+        queue: str = "general",
+    ) -> "Worker":
+        """
+        Factory method to create and initialize a Worker.
+
+        Args:
+            id: Worker identifier for logging
+            pool: AccountsPool for account management
+            scroll_threshold: Scroll count before rotating account
+            headless: Run browser in headless mode
+            mobile: Use mobile browser emulation
+            queue: Queue name for account locking
+
+        Returns:
+            Initialized Worker instance
+
+        Raises:
+            NoAccountError: If no account available in pool
+        """
+        instance = cls(
+            id=id,
+            pool=pool,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            queue=queue,
+        )
+        success = await instance.initialize()
+        if not success:
+            raise NoAccountError(f"Worker {id}: no account available")
+        return instance
+
+    async def __aenter__(self) -> "Worker":
+        """Async context manager entry - initialize worker."""
+        if not self._initialized:
+            success = await self.initialize()
+            if not success:
+                raise NoAccountError(f"Worker {self.id}: no account available")
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """Async context manager exit - release account."""
+        await self.close()
+        return False  # Don't suppress exceptions
 
     async def initialize(self) -> bool:
-        # fetch a free account
-        account: Account =  await self.pool.get_for_queue(queue=self.queue)
+        """
+        Initialize worker by acquiring an account from the pool.
+
+        Returns:
+            True if account acquired successfully, False otherwise
+        """
+        account = await self.pool.get_for_queue(queue=self.queue)
         if not account:
-            logger.warning("no account available for worker")
+            logger.warning(f"Worker {self.id}: no account available for queue '{self.queue}'")
             return False
+
         self.current_account = account
-        self.browser_session = await BrowserSession.create(account=self.current_account, headless=self.headless, mobile=self.mobile)
-        self.scroll_count: int = 0
-        logger.info(f"worker {self.id} initialized with account {self.current_account.email}")
+        self.scroll_count = 0
+        self._initialized = True
+
+        logger.info(f"Worker {self.id} initialized with account {self.current_account.display_name}")
         return True
 
-    async def run(self, task_queue: asyncio.Queue):
+    async def close(self):
+        """Release current account back to the pool."""
+        if self.current_account:
+            await self.pool.release_account(self.current_account.identifier, self.queue)
+            logger.info(f"Worker {self.id} released account {self.current_account.display_name}")
+            self.current_account = None
+
+        self.scroll_count = 0
+        self._initialized = False
+
+    async def run(self, task_queue: asyncio.Queue) -> list[ScrapingResult]:
+        """
+        Process tasks from queue until empty.
+
+        Args:
+            task_queue: AsyncIO queue containing Query objects
+
+        Returns:
+            List of ScrapingResult objects from completed tasks
+        """
+        results: list[ScrapingResult] = []
+
         while not task_queue.empty():
             task: Query = await task_queue.get()
+            logger.info(f"Worker {self.id} processing task: {task.endpoint} - {task.query}")
+
             try:
-                result: ScrapingResult = None
+                result = await self.execute_task(task)
+                results.append(result)
+                logger.info(
+                    f"Worker {self.id} completed task: {task.endpoint} - "
+                    f"{len(result.posts)} posts, result='{result.result}'"
+                )
+            except NoAccountError:
+                # No account available for rotation - put task back and stop
+                logger.error(f"Worker {self.id}: no account available, stopping")
+                await task_queue.put(task)
+                break
             except Exception as e:
-                logger.error(f'worker {self.id} error: {e}')
+                logger.error(f"Worker {self.id} unexpected error: {e}")
+                # Continue with next task
+
+            task_queue.task_done()
+
+        logger.info(f"Worker {self.id} finished, processed {len(results)} tasks")
+        return results
 
     async def execute_task(self, task: Query) -> ScrapingResult:
-        """Execute a single scraping task and rotate accounts if needed"""
-        if self.scroll_count > self.scroll_threshold:
-            logger.info(f'worker {self.id} reached scroll threshold ({self.scroll_threshold}), rotating account {self.current_account.email}')
+        """
+        Execute a single scraping task.
+
+        Creates a fresh BrowserSession for the task, executes the scraping
+        method, and handles errors with account rotation.
+
+        Args:
+            task: Query object describing the scraping task
+
+        Returns:
+            ScrapingResult from the scraping operation
+
+        Raises:
+            NoAccountError: If no account available after rotation attempt
+        """
+        # Check scroll threshold BEFORE task
+        if self.scroll_count >= self.scroll_threshold:
+            logger.info(
+                f"Worker {self.id} reached scroll threshold ({self.scroll_threshold}), "
+                f"rotating account {self.current_account.display_name}"
+            )
             await self.rotate_account()
 
-        try:
-            # execute scraping task
-            result = None
+        max_retries = 3
+        retry_count = 0
 
-        # here list all the types of scraping errors you can encounter
-        # (e.g. account banned, max limit of calls, private account etc...)
-        except Exception as e:
-            logger.error(f'worker {self.id} error: {e}')
+        while retry_count < max_retries:
+            try:
+                # Create fresh BrowserSession for this task
+                async with BrowserSession(
+                    account=self.current_account,
+                    pool=self.pool,
+                    headless=self.headless,
+                    mobile=self.mobile,
+                ) as session:
+                    # Get scraping method
+                    method = self._get_scraping_method(session, task.endpoint)
+
+                    # Execute scraping
+                    result = await method(
+                        **task.query
+                    )
+
+                    # Update Worker's scroll count from session
+                    endpoint_scrolls = await session.get_scroll_count(task.endpoint)
+                    self.scroll_count += endpoint_scrolls
+
+                    return result
+
+            except FailedLoginError as e:
+                logger.warning(
+                    f"Worker {self.id}: login failed for {self.current_account.display_name}, "
+                    f"marking inactive and rotating"
+                )
+                await self.pool.mark_inactive(
+                    self.current_account.identifier, f"Login failed: {e}"
+                )
+                await self.rotate_account()
+                retry_count += 1
+
+            except AccountBannedError as e:
+                logger.warning(
+                    f"Worker {self.id}: account {self.current_account.display_name} banned, "
+                    f"marking inactive and rotating"
+                )
+                await self.pool.mark_inactive(
+                    self.current_account.identifier, f"Account banned: {e}"
+                )
+                await self.rotate_account()
+                retry_count += 1
+
+            except RateLimitError as e:
+                logger.warning(
+                    f"Worker {self.id}: rate limited on {self.current_account.display_name}: {e}, "
+                    f"locking temporarily and rotating"
+                )
+                await self.pool.lock_until(
+                    self.current_account.identifier,
+                    "datetime('now', '+1 hour')",
+                )
+                await self.rotate_account()
+                retry_count += 1
+
+        # If we exhausted retries, raise to signal failure
+        raise RuntimeError(
+            f"Worker {self.id}: failed to execute task after {max_retries} retries"
+        )
 
     async def rotate_account(self):
-        """Release current account, get new one, recreate browser session"""
-        # Release old account
+        """
+        Release current account and acquire a new one.
+
+        Raises:
+            NoAccountError: If no account available for rotation
+        """
+        # Release current account
         if self.current_account:
-            await self.pool.release_account(self.current_account, queue=self.queue)
+            await self.pool.release_account(self.current_account.identifier, self.queue)
+            logger.info(f"Worker {self.id} released account {self.current_account.display_name}")
+            self.current_account = None
 
-        # Close old browser session
-        if self.browser_session:
-            await self.browser_session.close()
+        # Reset state
+        self.scroll_count = 0
+        self._initialized = False
 
-        # Reinitialize with new account
-        await self.initialize()
+        # Get new account
+        success = await self.initialize()
+        if not success:
+            raise NoAccountError(f"Worker {self.id}: no account available for rotation")
 
-    async def close(self):
-        """Cleanup browser session"""
-        if self.browser_session:
-            await self.browser_session.close()
-        if self.current_account:
-            await self.pool.release_account(self.current_account, "user_page")
+    def _get_scraping_method(self, session: BrowserSession, endpoint: str) -> Callable:
+        """
+        Get the BrowserSession method for a given endpoint.
 
+        Args:
+            session: BrowserSession instance
+            endpoint: Endpoint name (e.g., 'user_timeline')
+
+        Returns:
+            Bound method from BrowserSession
+
+        Raises:
+            ValueError: If endpoint is not supported
+        """
+        if endpoint not in self.ENDPOINT_METHODS:
+            raise ValueError(
+                f"Unsupported endpoint: {endpoint}. "
+                f"Supported endpoints: {list(self.ENDPOINT_METHODS.keys())}"
+            )
+        method_name = self.ENDPOINT_METHODS[endpoint]
+        return getattr(session, method_name)

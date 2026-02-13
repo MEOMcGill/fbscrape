@@ -38,6 +38,11 @@ class Account(JSONTrait):
         """Returns the account identifier (email or phone_number)"""
         return self.email if self.email else self.phone_number
 
+    @property
+    def display_name(self) -> str:
+        """Returns username if available, otherwise identifier (for logging)"""
+        return self.username if self.username else self.identifier
+
     @staticmethod
     def from_rs(rs: sqlite3.Row):
         doc = dict(rs)

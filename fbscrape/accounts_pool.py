@@ -15,7 +15,7 @@ class NoAccountError(Exception):
 
 
 class AccountsPool:
-    _order_by: str = "COALESCE(email, phone_number)"
+    _order_by: str = "scroll_count_overall_24h ASC"
 
     def __init__(
             self,
@@ -501,6 +501,53 @@ class AccountsPool:
                 await execute(self._db_file, qs)
 
         logger.info(f"Reset scroll counts for {identifier if identifier else 'all accounts'}" + (f" endpoint={endpoint}" if endpoint else ""))
+
+    # Allowed fields for update_field (prevents SQL injection by whitelisting)
+    _updatable_fields = {
+        'password', 'email', 'username', 'email_password', 'phone_number',
+        'active', 'proxy_server', 'proxy_username', 'proxy_password',
+        'fingerprint', 'os', 'error_msg', 'twofa_id',
+    }
+
+    async def update_field(
+            self,
+            identifier: str,
+            field: str,
+            value: str | bool | int | None,
+    ):
+        """
+        Update a single field for an account.
+
+        Args:
+            identifier: Account identifier (email or phone_number)
+            field: Field name to update (must be in _updatable_fields)
+            value: New value for the field
+
+        Raises:
+            ValueError: If field is not in _updatable_fields or account not found
+        """
+        if field not in self._updatable_fields:
+            raise ValueError(
+                f"Field '{field}' is not updatable. "
+                f"Allowed fields: {', '.join(sorted(self._updatable_fields))}"
+            )
+
+        # Check account exists
+        existing = await fetchone(
+            self._db_file,
+            f"SELECT * FROM accounts WHERE {self._identifier_condition(identifier)}"
+        )
+        if not existing:
+            raise ValueError(f"Account {identifier} not found")
+
+        # Handle type conversion for boolean fields
+        if field == 'active':
+            if isinstance(value, str):
+                value = value.lower() in ('true', '1', 'yes', 'y')
+
+        qs = f"UPDATE accounts SET {field} = :value WHERE {self._identifier_condition(identifier)}"
+        await execute(self._db_file, qs, {"value": value})
+        logger.info(f"Updated {field}={value} for {identifier}")
 
     async def stats(self):
         """Get statistics about accounts"""

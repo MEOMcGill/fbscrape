@@ -65,7 +65,11 @@ class FacebookGraphQLParser:
             # B: 'comet_sections.content.story.comet_sections.message.story.message.text'
             # B: 'comet_sections.content.story.comet_sections.message_container.story.message.text'
             # B: 'comet_sections.content.story.message.text'
-            is_post = len(post_url) > 0
+            has_post_url = len(post_url) > 0
+
+            # if has isFeedUnit, my hunch is it needs to be 'Story' but unsure
+            is_feed_unit = 'Story' in set(recursively_get_dict_value(post_data, '__isFeedUnit').values())
+            is_post: bool = has_post_url and is_feed_unit
             return is_post
 
         except Exception as e:

@@ -369,6 +369,64 @@ def release(ctx, identifier, release_all, queue):
     run_async(_release())
 
 
+# ============== Field Management ==============
+
+@cli.command(name='set')
+@click.argument('identifier')
+@click.argument('field')
+@click.argument('value')
+@click.pass_context
+def set_field(ctx, identifier, field, value):
+    """Set a field value for an account.
+
+    \b
+    IDENTIFIER: Account email or phone number
+    FIELD: Field name to update
+    VALUE: New value (use 'null' for None)
+
+    \b
+    Updatable fields:
+      password, email, username, email_password, phone_number,
+      active, proxy_server, proxy_username, proxy_password,
+      fingerprint, os, error_msg, twofa_id
+
+    \b
+    Examples:
+      fbscrape set user@example.com username myusername
+      fbscrape set user@example.com active true
+      fbscrape set user@example.com proxy_server http://proxy:8080
+      fbscrape set user@example.com error_msg null
+    """
+    async def _set():
+        pool = AccountsPool(ctx.obj['db'])
+
+        # Handle special values
+        parsed_value = value
+        if value.lower() == 'null' or value.lower() == 'none':
+            parsed_value = None
+        elif value.lower() in ('true', 'false'):
+            parsed_value = value.lower() == 'true'
+
+        try:
+            await pool.update_field(identifier, field, parsed_value)
+            display_value = parsed_value if parsed_value is not None else 'null'
+            click.echo(f"Updated {identifier}: {field} = {display_value}")
+        except ValueError as e:
+            raise click.UsageError(str(e))
+
+    run_async(_set())
+
+
+@cli.command(name='fields')
+def list_fields():
+    """List all updatable fields for the 'set' command"""
+    fields = sorted(AccountsPool._updatable_fields)
+    click.echo("Updatable fields for 'fbscrape set':")
+    click.echo("-" * 35)
+    for f in fields:
+        click.echo(f"  {f}")
+
+
 # ============== Scroll Management ==============
 
 @cli.command()

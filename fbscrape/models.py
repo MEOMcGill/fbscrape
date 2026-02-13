@@ -4,6 +4,7 @@ Data models for Facebook scraping results
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
+from typing import ClassVar
 import json
 
 @dataclass
@@ -16,11 +17,49 @@ class JSONTrait:
 
 @dataclass
 class Query(JSONTrait):
+    """
+    Represents a scraping task with endpoint-specific query validation.
+
+    The query dict is validated based on the endpoint to ensure all required
+    parameters are present before task execution.
+    """
+
+    # Maps endpoint names to required query fields
+    ENDPOINT_REQUIRED_FIELDS: ClassVar[dict[str, list[str]]] = {
+        "user_timeline": ["handle", "start_date", "end_date"],
+        # Add more as implemented:
+        # "search": ["query", "start_date", "end_date"],
+        # "group_posts": ["group_id", "start_date", "end_date"],
+    }
+
     endpoint: str
     query: dict
     params: dict
     start_date: datetime | None = None
     end_date: datetime | None = None
+
+    def __post_init__(self):
+        """Validate query fields based on endpoint."""
+        self._validate_endpoint()
+        self._validate_query_fields()
+
+    def _validate_endpoint(self):
+        """Check that endpoint is supported."""
+        if self.endpoint not in self.ENDPOINT_REQUIRED_FIELDS:
+            raise ValueError(
+                f"Unsupported endpoint: '{self.endpoint}'. "
+                f"Supported endpoints: {list(self.ENDPOINT_REQUIRED_FIELDS.keys())}"
+            )
+
+    def _validate_query_fields(self):
+        """Check that all required fields for the endpoint are present in query."""
+        required = self.ENDPOINT_REQUIRED_FIELDS[self.endpoint]
+        missing = [field for field in required if field not in self.query]
+        if missing:
+            raise ValueError(
+                f"Query for endpoint '{self.endpoint}' missing required fields: {missing}. "
+                f"Required: {required}"
+            )
 
     def to_dict(self):
         return {

@@ -11,20 +11,23 @@ from fbscrape.scraper import FacebookScraper
 from fbscrape.utils import gather
 import asyncio
 
+
 async def main():
-    fb_scraper = FacebookScraper(db="path_to_db")
-    handles_to_scrape: list[str] = ["handle_1", "handle_2", ..., "handle_n"]
-    
-    for c in gather(
-        *fb_scraper.scrape_user_homepage(handle=h, start_date="2025-01-01", end_date="2026-01-01") for h in handles_to_scrape
-    ):
-        scraping_result = await c
-        print(scraping_result)
-    
-    await fb_scraper.close()
+   fb_scraper = FacebookScraper(db="path_to_db")
+   handles_to_scrape: list[str] = ["handle_1", "handle_2", ..., "handle_n"]
+
+   for c in gather(
+           *fb_scraper.user_timeline(handle=h, start_date="2025-01-01", end_date="2026-01-01") for h in
+           handles_to_scrape
+   ):
+      scraping_result = await c
+      print(scraping_result)
+
+   await fb_scraper.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+   asyncio.run(main())
 ```
 
 For now only `scrape_user_homepage` is implemented but ideally in the future you can use more endpoints.
@@ -48,10 +51,10 @@ Usage:
 
 ```python
 async for result in gather(
-    scraper.scrape_user_homepage(handle=h, start_date=..., end_date=...)
-    for h in handles
+        scraper.user_timeline(handle=h, start_date=..., end_date=...)
+        for h in handles
 ):
-    save_to_db(result)
+   save_to_db(result)
 ```
    
 ### Worker pool
@@ -271,97 +274,97 @@ class WorkerPool:
 
 ```python
 class Worker:
-    def __init__(
-        self,
-        worker_id: int,
-        pool: AccountsPool,
-        scroll_threshold: int,
-        headless: bool,
-        proxy: str | None
-    ):
-        self.worker_id = worker_id
-        self.pool = pool
-        self.scroll_threshold = scroll_threshold
-        self.headless = headless
-        self.proxy = proxy
+   def __init__(
+           self,
+           worker_id: int,
+           pool: AccountsPool,
+           scroll_threshold: int,
+           headless: bool,
+           proxy: str | None
+   ):
+      self.worker_id = worker_id
+      self.pool = pool
+      self.scroll_threshold = scroll_threshold
+      self.headless = headless
+      self.proxy = proxy
 
-        self.browser_session: BrowserSession | None = None
-        self.current_account: Account | None = None
-        self.scroll_count: int = 0
+      self.browser_session: BrowserSession | None = None
+      self.current_account: Account | None = None
+      self.scroll_count: int = 0
 
-    async def initialize(self):
-        """Get account and create browser session"""
-        self.current_account = await self.pool.get_for_queue_or_wait("user_page")
-        if not self.current_account:
-            raise NoAccountError("No accounts available")
+   async def initialize(self):
+      """Get account and create browser session"""
+      self.current_account = await self.pool.get_for_queue_or_wait("user_page")
+      if not self.current_account:
+         raise NoAccountError("No accounts available")
 
-        self.browser_session = await BrowserSession.create(
-            account=self.current_account,
-            headless=self.headless,
-            proxy=self.proxy
-        )
-        self.scroll_count = 0
-        logger.info(f"Worker {self.worker_id} initialized with account {self.current_account.email}")
+      self.browser_session = await BrowserSession.create(
+         account=self.current_account,
+         headless=self.headless,
+         proxy=self.proxy
+      )
+      self.scroll_count = 0
+      logger.info(f"Worker {self.worker_id} initialized with account {self.current_account.email}")
 
-    async def run(self, task_queue: asyncio.Queue):
-        """Main worker loop - process tasks from queue"""
-        while True:
-            task: ScrapeTask = await task_queue.get()
-            try:
-                result = await self.execute_task(task)
-                task.result_future.set_result(result)
-            except Exception as e:
-                task.result_future.set_exception(e)
-            finally:
-                task_queue.task_done()
+   async def run(self, task_queue: asyncio.Queue):
+      """Main worker loop - process tasks from queue"""
+      while True:
+         task: ScrapeTask = await task_queue.get()
+         try:
+            result = await self.execute_task(task)
+            task.result_future.set_result(result)
+         except Exception as e:
+            task.result_future.set_exception(e)
+         finally:
+            task_queue.task_done()
 
-    async def execute_task(self, task: ScrapeTask) -> ScrapingResult:
-        """Execute scraping task, handle rotation if needed"""
-        # Check if need to rotate account
-        if self.scroll_count >= self.scroll_threshold:
-            logger.info(f"Worker {self.worker_id} reached scroll threshold, rotating account")
-            await self.rotate_account()
+   async def execute_task(self, task: ScrapeTask) -> ScrapingResult:
+      """Execute scraping task, handle rotation if needed"""
+      # Check if need to rotate account
+      if self.scroll_count >= self.scroll_threshold:
+         logger.info(f"Worker {self.worker_id} reached scroll threshold, rotating account")
+         await self.rotate_account()
 
-        try:
-            # Execute scraping
-            result = await self.browser_session.scrape_user_homepage(
-                handle=task.handle,
-                start_date=task.start_date,
-                end_date=task.end_date
-            )
+      try:
+         # Execute scraping
+         result = await self.browser_session.user_timeline(
+            handle=task.handle,
+            start_date=task.start_date,
+            end_date=task.end_date
+         )
 
-            # Track scrolls
-            # TODO: Extract scroll count from scraping logic
-            self.scroll_count += result.metadata.get('scroll_count', 0)
+         # Track scrolls
+         # TODO: Extract scroll count from scraping logic
+         self.scroll_count += result.metadata.get('scroll_count', 0)
 
-            return result
+         return result
 
-        except AccountBannedError as e:
-            logger.warning(f"Worker {self.worker_id} account banned: {e}")
-            await self.pool.mark_inactive(self.current_account.email, str(e))
-            await self.rotate_account()
-            # Retry with new account
-            return await self.execute_task(task)
+      except AccountBannedError as e:
+         logger.warning(f"Worker {self.worker_id} account banned: {e}")
+         await self.pool.mark_inactive(self.current_account.email, str(e))
+         await self.rotate_account()
+         # Retry with new account
+         return await self.execute_task(task)
 
-    async def rotate_account(self):
-        """Release current account, get new one, recreate browser session"""
-        # Release old account
-        if self.current_account:
-            await self.pool.release_account(self.current_account, "user_page")
+   async def rotate_account(self):
+      """Release current account, get new one, recreate browser session"""
+      # Release old account
+      if self.current_account:
+         await self.pool.release_account(self.current_account, "user_page")
 
-        # Close old browser session
-        if self.browser_session:
-            await self.browser_session.close()
+      # Close old browser session
+      if self.browser_session:
+         await self.browser_session.close()
 
-        # Reinitialize with new account
-        await self.initialize()
+      # Reinitialize with new account
+      await self.initialize()
 
-    async def close(self):
-        """Cleanup browser session"""
-        if self.browser_session:
-            await self.browser_session.close()
-        if self.current_account:
-            await self.pool.release_account(self.current_account, "user_page")
+   async def close(self):
+      """Cleanup browser session"""
+      if self.browser_session:
+         await self.browser_session.close()
+      if self.current_account:
+         await self.pool.release_account(self.current_account, "user_page")
 ```
 
 ---
