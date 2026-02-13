@@ -15,4 +15,4 @@ __pycache__
 
 # Authentication
 auth/*
-db/accounts.db
+#db/accounts.db
