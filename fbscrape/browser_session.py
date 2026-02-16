@@ -34,8 +34,8 @@ class BrowserSession:
         self.headless = headless
         self.mobile = mobile
 
-        # the endpoint we're scrolling
-        self.endpoint: Optional[str] = None
+        # the endpoint we're scrolling (set by scraping methods like user_timeline)
+        self.endpoint: str = ""
 
         # browser-related objects
         self._pw: Optional[Playwright] = None
@@ -46,26 +46,31 @@ class BrowserSession:
 
     @classmethod
     async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False):
+        logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}")
         instance = cls(account=account, pool=pool, headless=headless, mobile=mobile)
         await instance.initialize()
         return instance
 
     async def __aenter__(self):
         """Async context manager entry - initialize browser session"""
+        logger.debug(f"BrowserSession.__aenter__() for {self.account.display_name}")
         await self.initialize()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit - close browser session"""
+        logger.debug(f"BrowserSession.__aexit__() for {self.account.display_name}, exc_type={exc_type}")
         await self.close()
         return False  # Don't suppress exceptions
 
     async def initialize(self):
         """Initialize browser session with playwright and camoufox"""
+        logger.debug(f"BrowserSession.initialize() starting for {self.account.display_name}")
         self._pw = await async_playwright().start()
 
         # Get proxy settings from account
         proxy_settings = self._get_proxy_dict()
+        logger.debug(f"Proxy settings: {'configured' if proxy_settings else 'none'}")
 
         # Create browser context using camoufox
         self._browser: Browser = await AsyncNewBrowser(
@@ -84,9 +89,11 @@ class BrowserSession:
         )
 
         self._context: BrowserContext = await self._browser.new_context()
+        logger.debug("Browser context created")
 
         # Create page
         self.page = await self._context.new_page()
+        logger.debug("Page created")
 
         # To-do: Workaround for camoufox issue #473: br/zstd decompression broken
         await self.page.set_extra_http_headers({"Accept-Encoding": "gzip, deflate"})
@@ -97,12 +104,14 @@ class BrowserSession:
 
         # Inject cookies from account if available (already in Playwright format)
         if self.account.cookies:
+            logger.debug(f"Account has {len(self.account.cookies)} cookies, injecting...")
             try:
                 await self._context.add_cookies(self.account.cookies)
                 logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.display_name}")
             except Exception as e:
                 logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
         else:
+            logger.debug("No cookies available, attempting login...")
             successful_login = await self.login()
             if not successful_login:
                 raise FailedLoginError(f"Failed to login for {self.account.display_name}")
@@ -113,11 +122,15 @@ class BrowserSession:
 
     async def close(self):
         """Close browser session and cleanup resources"""
+        logger.debug(f"BrowserSession.close() for {self.account.display_name}")
         if self.response_interceptor:
+            logger.debug("Stopping response interceptor")
             self.response_interceptor.stop_interception()
         if self._browser:
+            logger.debug("Closing browser")
             await self._browser.close()
         if self._pw:
+            logger.debug("Stopping playwright")
             await self._pw.stop()
 
         logger.info(f"Browser session closed for {self.account.display_name}")
@@ -131,8 +144,10 @@ class BrowserSession:
         Returns:
             True if login successful or already logged in, False otherwise
         """
+        logger.debug(f"BrowserSession.login() for {self.account.display_name}")
         # Check if already logged in
         if await self.check_logged_in(timeout=5.0):
+            logger.debug("Already logged in")
             return True
 
         # Decline cookies popup
@@ -144,6 +159,7 @@ class BrowserSession:
             return False
 
         logger.info(f"Logging in to Facebook as {self.account.display_name}")
+        logger.debug("Login form is visible, proceeding with credentials")
 
         try:
             # Fill username with human-like typing
@@ -210,6 +226,7 @@ class BrowserSession:
         Returns:
             True if GraphQL activity detected (logged in), False otherwise
         """
+        logger.debug(f"check_logged_in() with timeout={timeout}s")
         # Create a temporary interceptor for this check
         temp_interceptor = ResponseInterceptor()
         temp_interceptor.setup_interception(self.page)
@@ -264,6 +281,7 @@ class BrowserSession:
         """
 
         self.endpoint = "UserTimeline"
+        logger.debug(f"user_timeline() starting for @{handle}, date range: {start_date} to {end_date}")
 
         base_url = "https://www.facebook.com/"
         target_url = f"{base_url}{handle}/"
@@ -274,7 +292,7 @@ class BrowserSession:
 
         # Create Query object for this scrape
         query = Query(
-            endpoint="user_page",
+            endpoint=self.endpoint,
             query={
                 "handle": handle,
                 "start_date": start_date,
@@ -296,17 +314,6 @@ class BrowserSession:
 
         while True:
             try:
-                # Check for error conditions
-                error = await self.check_error_conditions()
-                if error:
-                    return ScrapingResult(
-                        query=query,
-                        result=error,
-                        posts=self.response_interceptor.get_posts(),
-                        time_started=scrape_start_time,
-                        time_taken=datetime.now(timezone.utc) - scrape_start_time
-                    )
-
                 # Navigate to target page if needed
                 if not self.is_on_page(target_url):
                     logger.info(f"Navigating to {target_url}")
@@ -326,6 +333,17 @@ class BrowserSession:
                             time_taken=datetime.now(timezone.utc) - scrape_start_time
                         )
 
+                    # Check for error conditions after navigation
+                    error = await self.check_error_conditions()
+                    if error:
+                        return ScrapingResult(
+                            query=query,
+                            result=error,
+                            posts=self.response_interceptor.get_posts(),
+                            time_started=scrape_start_time,
+                            time_taken=datetime.now(timezone.utc) - scrape_start_time
+                        )
+
                 # Get currently intercepted posts
                 posts = self.response_interceptor.get_posts()
                 current_post_count = len(posts)
@@ -336,7 +354,19 @@ class BrowserSession:
                 if current_post_count == previous_post_count:
                     no_new_posts_count += 1
 
-                    if no_new_posts_count > 20:
+                    # Check for errors when stalled
+                    if no_new_posts_count == 3:
+                        error = await self.check_error_conditions()
+                        if error:
+                            return ScrapingResult(
+                                query=query,
+                                result=error,
+                                posts=self.response_interceptor.get_posts(),
+                                time_started=scrape_start_time,
+                                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                            )
+
+                    if no_new_posts_count > 10:
                         if current_post_count == 0:
                             return ScrapingResult(
                                 query=query,
@@ -381,11 +411,11 @@ class BrowserSession:
                 total_scrolls += 1
 
                 # Rate limiting
-                if total_scrolls % 20 == 0:
+                if total_scrolls % 50 == 0:
                     logger.info(f"@{handle}: {current_post_count} posts after {total_scrolls} scrolls - pausing 30s")
                     await asyncio.sleep(30)
 
-                await asyncio.sleep(2)  # Give time for GraphQL responses to arrive
+                await asyncio.sleep(random.uniform(1, 3))  # Give time for GraphQL responses to arrive
 
             except Exception as e:
                 logger.error(f"Error scraping @{handle}: {e}")
@@ -401,47 +431,54 @@ class BrowserSession:
         """
         Check for Facebook error conditions on current page.
 
+        Uses a combined locator for fast-path detection, then detailed checks
+        only if an error indicator is found.
+
         Returns:
             Error code string if error detected, None otherwise
         """
+        logger.debug("check_error_conditions()")
+
+        # Fast path: single query to check if ANY error indicator exists
+        error_indicators = (
+            self.page.get_by_role("button", name="Retry")
+            .or_(self.page.get_by_role("button", name="Reload page"))
+            .or_(self.page.get_by_text("Profile isn't available"))
+            .or_(self.page.get_by_text("Sorry, this page isn't available"))
+            .or_(self.page.get_by_text("No Posts Yet"))
+            .or_(self.page.get_by_text("This account is private"))
+        )
+        if await error_indicators.count() == 0:
+            return None  # No errors - fast exit
+
+        # Slow path: determine which specific error
+        logger.debug("Error indicator detected, checking specifics...")
+
         # Check for "Retry" button (multiple error cases)
         retry_button = self.page.get_by_role("button", name="Retry")
         if await retry_button.count() > 0:
-            # Case 1: Account is private
-            account_is_private = self.page.get_by_text("account is private")
-            if await account_is_private.count() > 0:
+            if await self.page.get_by_text("account is private").count() > 0:
                 return 'account is private'
-
-            # Case 2: Failed to load
-            failed_to_load = self.page.get_by_text("Failed to Load")
-            if await failed_to_load.count() > 0:
+            if await self.page.get_by_text("Failed to Load").count() > 0:
                 return 'failed to load'
 
         # Check for "Reload page" button
         reload_button = self.page.get_by_role('button', name='Reload page')
         if await reload_button.count() > 0:
-            something_went_wrong = self.page.get_by_text("Something went wrong")
-            if await something_went_wrong.count() > 0:
+            if await self.page.get_by_text("Something went wrong").count() > 0:
                 return 'something went wrong - reload'
 
-        # Check if profile is not available
-        profile_not_available = self.page.get_by_text("Profile isn't available")
-        if await profile_not_available.count() > 0:
+        # Direct text checks
+        if await self.page.get_by_text("Profile isn't available").count() > 0:
             return 'profile is not available'
 
-        # Check for "Sorry, this page isn't available"
-        page_not_available = self.page.get_by_text("Sorry, this page isn't available")
-        if await page_not_available.count() > 0:
+        if await self.page.get_by_text("Sorry, this page isn't available").count() > 0:
             return 'page not available'
 
-        # Check for "No Posts Yet"
-        no_posts = self.page.get_by_text("No Posts Yet")
-        if await no_posts.count() > 0:
+        if await self.page.get_by_text("No Posts Yet").count() > 0:
             return 'no posts'
 
-        # Check for "This account is private"
-        private_account = self.page.get_by_text("This account is private")
-        if await private_account.count() > 0:
+        if await self.page.get_by_text("This account is private").count() > 0:
             return 'account is private'
 
         return None
@@ -472,6 +509,7 @@ class BrowserSession:
 
     async def goto(self, url: str, timeout: int = 30000, wait_until: str = "domcontentloaded"):
         """Navigate to URL"""
+        logger.debug(f"goto({url})")
         await self.page.goto(url, timeout=timeout, wait_until=wait_until)
 
     def is_on_page(self, url: str) -> bool:
@@ -488,8 +526,9 @@ class BrowserSession:
 
     async def scroll(self, window_height_coefficient: float = 3):
         """Scroll window by window_height_coefficient * window.innerHeight"""
+        logger.debug(f"scroll(coeff={window_height_coefficient}) for endpoint={self.endpoint}")
         await self.page.evaluate(f"window.scrollBy(0, window.innerHeight * {window_height_coefficient})")
-        await self.record_scroll(endpoint=self.endpoint if self.endpoint else "general", count=1)
+        await self.record_scroll(endpoint=self.endpoint, count=1)
 
 
     # ==================== Private Helpers ====================
@@ -592,7 +631,10 @@ class BrowserSession:
                         if len(set(ts.values())) == 1:
                             ts = list(ts.values()).pop()
                         else:
-                            continue
+                            logger.warning(f"Post has multiple timestamps, "
+                                           f"taking the latest one - "
+                                           f"({[datetime.fromisoformat(ts) for ts in ts.values()]})")
+                            ts = max(ts.values())
 
                     # Handle both Unix timestamp and datetime string
                     if isinstance(ts, (int, float)):

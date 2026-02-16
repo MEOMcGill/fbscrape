@@ -6,12 +6,11 @@ return results via Futures.
 """
 
 import asyncio
-from typing import Optional
 
 from .accounts_pool import AccountsPool
 from .exceptions import NoAccountError
 from .logger import logger
-from .models import Query, ScrapingResult
+from .models import Query
 from .worker import Worker
 
 
@@ -31,7 +30,6 @@ class WorkerPool:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        queue_name: str = "general",
     ):
         """
         Initialize WorkerPool configuration.
@@ -42,14 +40,12 @@ class WorkerPool:
             scroll_threshold: Scrolls before rotating account
             headless: Run browsers in headless mode
             mobile: Use mobile browser emulation
-            queue_name: Queue name for account locking
         """
         self.pool = pool
         self.max_workers = max_workers
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
-        self.queue_name = queue_name
 
         # State
         self.workers: list[Worker] = []
@@ -57,13 +53,11 @@ class WorkerPool:
         self.task_queue: asyncio.Queue = asyncio.Queue()
         self._initialized: bool = False
         self._shutdown: bool = False
+        self._init_lock: asyncio.Lock = asyncio.Lock()
 
-    async def initialize(self, num_tasks: Optional[int] = None) -> int:
+    async def initialize(self) -> int:
         """
-        Initialize workers based on available accounts and pending tasks.
-
-        Args:
-            num_tasks: Optional number of pending tasks to optimize worker count
+        Initialize workers based on available accounts.
 
         Returns:
             Number of workers created
@@ -72,26 +66,22 @@ class WorkerPool:
             NoAccountError: If no active accounts available
         """
         if self._initialized:
+            logger.debug(f"WorkerPool already initialized with {len(self.workers)} workers")
             return len(self.workers)
 
+        logger.debug(f"WorkerPool initializing with config: max_workers={self.max_workers}, scroll_threshold={self.scroll_threshold}, headless={self.headless}")
         active_accounts = await self.pool.get_active_accounts()
         num_active = len(active_accounts)
 
         if num_active == 0:
             raise NoAccountError("No active accounts available in pool")
 
-        # Calculate optimal worker count
-        if num_tasks is not None:
-            num_workers = min(self.max_workers, num_active, num_tasks)
-        else:
-            num_workers = min(self.max_workers, num_active)
-
-        # Ensure at least 1 worker
-        num_workers = max(1, num_workers)
+        # Calculate worker count: min of max_workers and available accounts
+        num_workers = max(1, min(self.max_workers, num_active))
 
         logger.info(
             f"WorkerPool initializing {num_workers} workers "
-            f"(max={self.max_workers}, active_accounts={num_active}, tasks={num_tasks})"
+            f"(max={self.max_workers}, active_accounts={num_active})"
         )
 
         # Create workers
@@ -103,7 +93,6 @@ class WorkerPool:
                     scroll_threshold=self.scroll_threshold,
                     headless=self.headless,
                     mobile=self.mobile,
-                    queue=self.queue_name,
                 )
                 self.workers.append(worker)
 
@@ -179,14 +168,16 @@ class WorkerPool:
         Raises:
             NoAccountError: If no accounts available for initialization
         """
-        if not self._initialized:
-            await self.initialize()
+        async with self._init_lock:
+            if not self._initialized:
+                logger.debug("WorkerPool: first task submission, initializing...")
+                await self.initialize()
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         await self.task_queue.put((query, future))
-        logger.debug(f"WorkerPool: submitted task {query.endpoint} - {query.query}")
+        logger.debug(f"WorkerPool: submitted task {query.endpoint} - {query.query}, queue_size={self.task_queue.qsize()}")
 
         return future
 
@@ -209,7 +200,9 @@ class WorkerPool:
             await asyncio.gather(*self.worker_tasks, return_exceptions=True)
 
         # Close all workers (release accounts)
+        logger.debug(f"WorkerPool: closing {len(self.workers)} workers")
         for worker in self.workers:
+            logger.debug(f"WorkerPool: closing {worker.id}")
             await worker.close()
 
         # Reset state

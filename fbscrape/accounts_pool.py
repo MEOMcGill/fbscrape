@@ -113,9 +113,12 @@ class AccountsPool:
 
     async def get_active_accounts(self):
         """Fetch active accounts from the db where active is True"""
+        logger.debug("get_active_accounts()")
         qs = "SELECT * FROM accounts WHERE active = true"
         rs = await fetchall(self._db_file, qs)
-        return [Account.from_rs(x) for x in rs]
+        accounts = [Account.from_rs(x) for x in rs]
+        logger.debug(f"get_active_accounts() -> {len(accounts)} accounts")
+        return accounts
 
     async def get(self, identifier: str | list[str] | None) -> Account | list[Account]:
         """Fetch account(s) information from db by identifier (email or phone_number) or all accounts if None"""
@@ -229,20 +232,21 @@ class AccountsPool:
         logger.info(f"Set active={active} for {identifier if identifier else 'all accounts'}")
 
     async def lock_until(self, identifier: str | list[str] | None, until: str):
-        """Lock account(s) by identifier or all accounts if None until given time"""
+        """Lock account(s) until given time (for rate limiting)"""
+        logger.debug(f"lock_until({identifier}, {until})")
         identifiers = identifier if isinstance(identifier, list) else [identifier] if identifier else []
 
         if not identifiers:
             qs = f"""
             UPDATE accounts SET
-                locks = json_set(locks, '$.general', '{until}'),
+                locks = json_set(locks, '$.locked_until', {until}),
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE TRUE
             """
         else:
             qs = f"""
             UPDATE accounts SET
-                locks = json_set(locks, '$.general', '{until}'),
+                locks = json_set(locks, '$.locked_until', {until}),
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE {self._identifiers_condition(identifiers)}
             """
@@ -250,33 +254,33 @@ class AccountsPool:
         await execute(self._db_file, qs)
 
     async def unlock(self, identifier: str | list[str] | None):
-        """Unlock account(s) by identifier or all accounts if None"""
+        """Unlock account(s) - remove rate limit lock"""
+        logger.debug(f"unlock({identifier})")
         identifiers = identifier if isinstance(identifier, list) else [identifier] if identifier else []
 
         if not identifiers:
             qs = f"""
             UPDATE accounts SET
-                locks = json_object(),
+                locks = json_remove(locks, '$.locked_until'),
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE TRUE
             """
         else:
             qs = f"""
             UPDATE accounts SET
-                locks = json_object(),
+                locks = json_remove(locks, '$.locked_until'),
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE {self._identifiers_condition(identifiers)}
             """
 
         await execute(self._db_file, qs)
 
-    async def _get_and_lock(self, queue: str, condition: str):
-        """Internal method to get and lock an account"""
+    async def _get_and_mark_in_use(self, condition: str):
+        """Internal method to get an account and mark it as in_use"""
         # condition is a subquery that selects the identifier
         if int(sqlite3.sqlite_version_info[1]) >= 35:
             qs = f"""
             UPDATE accounts SET
-                locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
                 last_used = datetime({utc.ts()}, 'unixepoch'),
                 in_use = true
             WHERE COALESCE(email, phone_number) = ({condition})
@@ -287,7 +291,6 @@ class AccountsPool:
             tx = uuid.uuid4().hex
             qs = f"""
             UPDATE accounts SET
-                locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
                 last_used = datetime({utc.ts()}, 'unixepoch'),
                 in_use = true,
                 _tx = '{tx}'
@@ -300,37 +303,45 @@ class AccountsPool:
 
         return Account.from_rs(rs) if rs else None
 
-    async def get_for_queue(self, queue: str = "general"):
-        """Get an available account for the given queue"""
+    async def get_available(self) -> Account | None:
+        """Get an available account (active, not in use, not locked)"""
+        logger.debug("get_available() searching for active, not in-use, not locked account")
         q = f"""
         SELECT COALESCE(email, phone_number) FROM accounts
-        WHERE active = true AND in_use = false AND (
-            locks IS NULL
-            OR json_extract(locks, '$.{queue}') IS NULL
-            OR json_extract(locks, '$.{queue}') < datetime('now')
-        )
+        WHERE active = true
+            AND in_use = false
+            AND (
+                locks IS NULL
+                OR json_extract(locks, '$.locked_until') IS NULL
+                OR json_extract(locks, '$.locked_until') < datetime('now')
+            )
         ORDER BY {self._order_by}
         LIMIT 1
         """
+        account = await self._get_and_mark_in_use(q)
+        logger.debug(f"get_available() -> {account.display_name if account else 'None'}")
+        return account
 
-        return await self._get_and_lock(queue, q)
+    async def get_for_queue(self, queue: str = "general") -> Account | None:
+        """Alias for get_available() - queue parameter is ignored (backward compatibility)"""
+        return await self.get_available()
 
-    async def get_for_queue_or_wait(self, queue: str = "general") -> Account | None:
-        """Get an available account for the given queue, or wait until one is available"""
+    async def get_available_or_wait(self) -> Account | None:
+        """Get an available account, or wait until one is available"""
         msg_shown = False
         while True:
-            account = await self.get_for_queue(queue)
+            account = await self.get_available()
             if not account:
                 if self._raise_when_no_account or get_env_bool("FB_RAISE_WHEN_NO_ACCOUNT"):
-                    raise NoAccountError(f"No account available for queue {queue}")
+                    raise NoAccountError("No account available")
 
                 if not msg_shown:
-                    nat = await self.next_available_at(queue)
+                    nat = await self.next_available_at()
                     if not nat:
                         logger.warning("No active accounts. Stopping...")
                         return None
 
-                    msg = f'No account available for queue "{queue}". Next available at {nat}'
+                    msg = f'No account available. Next available at {nat}'
                     logger.info(msg)
                     msg_shown = True
 
@@ -338,22 +349,28 @@ class AccountsPool:
                 continue
             else:
                 if msg_shown:
-                    logger.info(f"Continuing with account {account.identifier} on queue {queue}")
+                    logger.info(f"Continuing with account {account.identifier}")
 
             return account
 
-    async def next_available_at(self, queue: str):
-        """Get the next available time for an account in the queue"""
-        qs = f"""
-        SELECT json_extract(locks, '$."{queue}"') as lock_until
+    async def get_for_queue_or_wait(self, queue: str = "general") -> Account | None:
+        """Alias for get_available_or_wait() - queue parameter is ignored (backward compatibility)"""
+        return await self.get_available_or_wait()
+
+    async def next_available_at(self):
+        """Get the next available time for a locked account"""
+        qs = """
+        SELECT json_extract(locks, '$.locked_until') as locked_until
         FROM accounts
-        WHERE active = true AND json_extract(locks, '$."{queue}"') IS NOT NULL
-        ORDER BY lock_until ASC
+        WHERE active = true
+            AND json_extract(locks, '$.locked_until') IS NOT NULL
+            AND json_extract(locks, '$.locked_until') > datetime('now')
+        ORDER BY locked_until ASC
         LIMIT 1
         """
         rs = await fetchone(self._db_file, qs)
-        if rs:
-            now, trg = utc.now(), utc.from_iso(rs[0])
+        if rs and rs["locked_until"]:
+            now, trg = utc.now(), utc.from_iso(rs["locked_until"])
             if trg < now:
                 return "now"
 
@@ -362,15 +379,15 @@ class AccountsPool:
 
         return None
 
-    async def release_account(self, identifier: str | list[str] | None, queue: str = "general"):
-        """Release account(s) after use by identifier or all accounts if None"""
+    async def release_account(self, identifier: str | list[str] | None):
+        """Release account(s) after use - sets in_use=false"""
+        logger.debug(f"release_account({identifier})")
         identifiers = identifier if isinstance(identifier, list) else [identifier] if identifier else []
 
         if not identifiers:
             # Release all accounts
             qs = f"""
             UPDATE accounts SET
-                locks = json_remove(locks, '$.{queue}'),
                 in_use = false,
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE TRUE
@@ -379,7 +396,6 @@ class AccountsPool:
             # Release specific account(s)
             qs = f"""
             UPDATE accounts SET
-                locks = json_remove(locks, '$.{queue}'),
                 in_use = false,
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE {self._identifiers_condition(identifiers)}
@@ -389,6 +405,7 @@ class AccountsPool:
 
     async def mark_inactive(self, identifier: str, error_msg: str | None):
         """Mark an account as inactive with an error message"""
+        logger.debug(f"mark_inactive({identifier}, {error_msg})")
         qs = f"""
         UPDATE accounts SET active = false, error_msg = :error_msg, in_use = false
         WHERE {self._identifier_condition(identifier)}
@@ -408,6 +425,7 @@ class AccountsPool:
             identifier: Account identifier (email or phone_number)
             cookies: Cookies in any format accepted by parse_cookies()
         """
+        logger.debug(f"update_cookies({identifier}, {len(cookies) if isinstance(cookies, list) else 'parsing'} cookies)")
         # Use parse_cookies to normalize to Playwright format
         if isinstance(cookies, str):
             cookies = parse_cookies(cookies)
@@ -443,6 +461,7 @@ class AccountsPool:
             endpoint: Endpoint name (e.g., 'user_page', 'search')
             increment: Number of scrolls to add (default 1)
         """
+        logger.debug(f"update_scroll_count({identifier}, {endpoint}, +{increment})")
         qs = f"""
         UPDATE accounts SET
             scroll_count_per_endpoint_total = json_set(
@@ -467,13 +486,16 @@ class AccountsPool:
         Returns:
             Scroll count
         """
+        logger.debug(f"get_scroll_count({identifier}, endpoint={endpoint})")
         if endpoint:
             qs = f"SELECT json_extract(scroll_count_per_endpoint_total, '$.{endpoint}') as count FROM accounts WHERE {self._identifier_condition(identifier)}"
         else:
             qs = f"SELECT scroll_count_overall_24h as count FROM accounts WHERE {self._identifier_condition(identifier)}"
 
         rs = await fetchone(self._db_file, qs)
-        return rs["count"] or 0 if rs else 0
+        count = rs["count"] or 0 if rs else 0
+        logger.debug(f"get_scroll_count() -> {count}")
+        return count
 
     async def reset_scroll_counts(self, identifier: str | None = None, endpoint: str | None = None):
         """
@@ -551,23 +573,16 @@ class AccountsPool:
 
     async def stats(self):
         """Get statistics about accounts"""
-        def locks_count(queue: str):
-            return f"""
-            SELECT COUNT(*) FROM accounts
-            WHERE json_extract(locks, '$.{queue}') IS NOT NULL
-                AND json_extract(locks, '$.{queue}') > datetime('now')
-            """
-
-        qs = "SELECT DISTINCT(f.key) as k from accounts, json_each(locks) f"
-        rs = await fetchall(self._db_file, qs)
-        queues = [x["k"] for x in rs]
-
         config = [
             ("total", "SELECT COUNT(*) FROM accounts"),
             ("active", "SELECT COUNT(*) FROM accounts WHERE active = true"),
             ("inactive", "SELECT COUNT(*) FROM accounts WHERE active = false"),
             ("in_use", "SELECT COUNT(*) FROM accounts WHERE in_use = true"),
-            *[(f"locked_{x}", locks_count(x)) for x in queues],
+            ("locked", """
+                SELECT COUNT(*) FROM accounts
+                WHERE json_extract(locks, '$.locked_until') IS NOT NULL
+                    AND json_extract(locks, '$.locked_until') > datetime('now')
+            """),
         ]
 
         qs = f"SELECT {','.join([f'({q}) as {k}' for k, q in config])}"

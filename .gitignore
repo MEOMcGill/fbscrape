@@ -1,9 +1,5 @@
 # Collected data
-data/images/*
-data/parts/*
-data/posts/*
-data/users/*
-data/videos/*
+data/*
 
 # Mac OS files
 */.DS_Store
@@ -16,3 +12,4 @@ __pycache__
 # Authentication
 auth/*
 #db/accounts.db
+tmp

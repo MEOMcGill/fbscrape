@@ -1,15 +1,16 @@
 # fbscrape
 
-A Python library for scraping Facebook user homepages using Playwright and Camoufox with account pooling and rotation.
+A Python library for scraping Facebook user timelines using Playwright and Camoufox with account pooling, rotation, and concurrent scraping.
 
 ## Features
 
-- Async-first design with GraphQL response interception
-- Account pool management with SQLite storage
-- Automatic account rotation based on scroll thresholds
-- Cookie persistence for session reuse
-- CLI for account management
-- Support for proxies and fingerprint customization
+- **High-level API** - Simple `FacebookScraper` class handles all complexity
+- **Concurrent scraping** - WorkerPool manages multiple browser sessions
+- **Account management** - SQLite-backed pool with automatic rotation
+- **Scroll threshold rotation** - Rotate accounts after N scrolls to avoid detection
+- **GraphQL interception** - Extracts data from Facebook's API responses
+- **Cookie persistence** - Reuse sessions across runs
+- **CLI tools** - Manage accounts from command line
 
 ## Installation
 
@@ -25,38 +26,21 @@ playwright install
 
 ## Quick Start
 
-### Python API
+### High-Level API (Recommended)
 
 ```python
-from fbscrape.browser_session import BrowserSession
-from fbscrape.accounts_pool import AccountsPool
+from fbscrape import FacebookScraper, gather
 import asyncio
 
 
 async def main():
-    # Initialize account pool
-    pool = AccountsPool("accounts.db")
-
-    # Get an available account
-    account = await pool.get_for_queue("user_page")
-
-    # Create browser session
-    async with BrowserSession(account, pool, headless=True) as session:
-        # Check if logged in
-        if await session.check_logged_in():
-            print(f"Logged in as {account.identifier}")
-
-            # Scrape a user's homepage
-            result = await session.user_timeline(
-                handle="zuck",
-                start_date="2024-01-01",
-                end_date="2025-01-01"
-            )
-
-            print(f"Scraped {len(result.posts)} posts")
-
-    # Release the account
-    await pool.release_account(account.identifier)
+    async with FacebookScraper(db="accounts.db", max_browser_sessions=3) as scraper:
+        result = await scraper.user_timeline(
+            handle="zuck",
+            start_date="2024-01-01",
+            end_date="2025-01-01"
+        )
+        print(f"Scraped {len(result.posts)} posts")
 
 
 if __name__ == "__main__":
@@ -66,55 +50,117 @@ if __name__ == "__main__":
 ### Concurrent Scraping
 
 ```python
-from fbscrape.utils import gather
+from fbscrape import FacebookScraper, gather
+import asyncio
 
 
-async def scrape_multiple():
-    pool = AccountsPool("accounts.db")
-    handles = ["handle1", "handle2", "handle3"]
+async def main():
+    async with FacebookScraper(db="accounts.db", max_browser_sessions=3) as scraper:
+        handles = ["zuck", "meta", "facebook"]
 
-    # Get accounts for each handle
-    sessions = []
-    for handle in handles:
-        account = await pool.get_for_queue("user_page")
-        session = BrowserSession(account, pool, headless=True)
-        await session.initialize()
-        sessions.append((session, handle))
+        # Results arrive as they complete (not in submission order)
+        async for result in gather(
+            scraper.user_timeline(h, "2024-01-01", "2025-01-01")
+            for h in handles
+        ):
+            handle = result.query.query["handle"]
+            print(f"{handle}: {len(result.posts)} posts")
 
-    # Scrape concurrently and yield results as they complete
-    async for result in gather(
-            session.user_timeline(handle, "2024-01-01", "2025-01-01")
-            for session, handle in sessions
-    ):
-        print(f"Completed: {result.query.query} - {len(result.posts)} posts")
-        # Save result immediately, don't accumulate in memory
-        save_to_db(result)
 
-    # Cleanup
-    for session, _ in sessions:
-        await session.close()
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-## Command Line Interface
+### Low-Level API (BrowserSession)
 
-The `fbscrape` CLI provides account management functionality.
+For more control, use `BrowserSession` directly:
+
+```python
+from fbscrape.browser_session import BrowserSession
+from fbscrape.accounts_pool import AccountsPool
+import asyncio
+
+
+async def main():
+    pool = AccountsPool("accounts.db")
+    account = await pool.get_available()
+
+    async with BrowserSession(account, pool, headless=True) as session:
+        result = await session.user_timeline(
+            handle="zuck",
+            start_date="2024-01-01",
+            end_date="2025-01-01"
+        )
+        print(f"Scraped {len(result.posts)} posts")
+
+    await pool.release_account(account.identifier)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     FacebookScraper                               │
+│  user_timeline(handle, start_date, end_date) → ScrapingResult    │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                       WorkerPool                                  │
+│  - Creates N workers (N = min(max_sessions, active_accounts))    │
+│  - Shared task queue with Future-based results                   │
+│  - Workers pull tasks and execute concurrently                   │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                         Worker                                    │
+│  - Owns ONE account from AccountsPool                            │
+│  - Tracks scroll count, rotates at threshold                     │
+│  - Creates fresh BrowserSession per task                         │
+│  - Handles errors: login failure, ban, rate limit → rotate       │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      BrowserSession                               │
+│  - Playwright browser with Camoufox                              │
+│  - Login, cookie management                                       │
+│  - Scrolling with GraphQL response interception                  │
+│  - Returns ScrapingResult with posts                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Layer Responsibilities
+
+| Layer | Responsibility |
+|-------|---------------|
+| **FacebookScraper** | User-facing API, hides complexity |
+| **WorkerPool** | Concurrency, task distribution via Futures |
+| **Worker** | Account lifecycle, scroll tracking, error recovery |
+| **BrowserSession** | Browser automation, GraphQL interception |
+| **AccountsPool** | SQLite storage, locking, account selection |
+
+## Command Line Interface
 
 ### Global Options
 
 ```bash
-fbscrape --db /path/to/accounts.db <command>  # Use custom database path
-fbscrape --help                                # Show help
+fbscrape --db /path/to/accounts.db <command>
+fbscrape --help
 ```
 
 ### Account Management
 
-#### Add Accounts
-
 ```bash
-# Add single account with email
+# Add account with email
 fbscrape add --email user@example.com --password secret123
 
-# Add single account with phone number
+# Add account with phone
 fbscrape add --phone +1234567890 --password secret123
 
 # Add with all options
@@ -122,93 +168,50 @@ fbscrape add \
     --email user@example.com \
     --password secret123 \
     --username fbusername \
-    --email-password emailpass \
-    --proxy http://proxy:8080 \
-    --proxy-user proxyuser \
-    --proxy-pass proxypass \
     --cookies /path/to/cookies.json \
-    --os macos
+    --proxy http://proxy:8080
 
 # Bulk add from file
 fbscrape add-from-file accounts.txt --format "email:password"
-fbscrape add-from-file accounts.txt --format "email:password:email_password"
-fbscrape add-from-file accounts.txt --format "phone:password"
-```
 
-**File format** (one account per line, `#` for comments):
-```
-user1@example.com:password123
-user2@example.com:password456:emailpass789
-# This is a comment
-user3@example.com:password789
-```
-
-#### List Accounts
-
-```bash
-# List all accounts
+# List accounts
 fbscrape list
-
-# List only active accounts
 fbscrape list --active
+fbscrape list -v  # verbose
 
-# List only inactive accounts
-fbscrape list --inactive
-
-# Verbose output with all fields
-fbscrape list -v
-```
-
-#### Account Details
-
-```bash
-# Show detailed info for an account
+# Show account details
 fbscrape info user@example.com
-```
 
-#### Delete Accounts
-
-```bash
-# Delete specific accounts
-fbscrape delete user@example.com user2@example.com
-
-# Delete all inactive accounts (with confirmation)
+# Delete accounts
+fbscrape delete user@example.com
 fbscrape delete --inactive
-
-# Delete all accounts (with confirmation)
 fbscrape delete --all
 ```
 
 ### Account Status
 
-#### Activate/Deactivate
-
 ```bash
-# Mark accounts as active
+# Activate/deactivate
 fbscrape activate user@example.com
-fbscrape activate --all
-
-# Mark accounts as inactive
 fbscrape deactivate user@example.com --error "Account banned"
-fbscrape deactivate --all
-```
 
-#### Unlock/Release
-
-```bash
-# Remove all locks from accounts
+# Unlock (remove rate limit locks)
 fbscrape unlock user@example.com
 fbscrape unlock --all
 
-# Release accounts from use (set in_use=false)
+# Release (set in_use=false)
 fbscrape release user@example.com
-fbscrape release --all --queue user_page
+fbscrape release --all
+
+# Reset scroll counts
+fbscrape reset-scrolls user@example.com
+fbscrape reset-scrolls --all
+fbscrape reset-scrolls --all --endpoint UserTimeline
 ```
 
 ### Statistics
 
 ```bash
-# Show pool statistics
 fbscrape stats
 ```
 
@@ -220,106 +223,66 @@ Account Pool Statistics
   Active:   8
   Inactive: 2
   In Use:   3
-  Locked (user_page): 2
-  Locked (general): 1
-```
-
-### Scroll Management
-
-```bash
-# Reset scroll counts for specific accounts
-fbscrape reset-scrolls user@example.com
-
-# Reset scroll counts for all accounts
-fbscrape reset-scrolls --all
-
-# Reset only specific endpoint
-fbscrape reset-scrolls --all --endpoint user_page
+  Locked:   1
 ```
 
 ### Cookie Management
 
 ```bash
-# Import cookies from file
 fbscrape set-cookies user@example.com cookies.json
-
-# Export cookies to file
 fbscrape export-cookies user@example.com output.json
 ```
 
 ### Field Management
 
-Update individual account fields directly from the CLI:
-
 ```bash
-# Set a field value for an account
-fbscrape set <identifier> <field> <value>
-
-# Examples
+# Update individual fields
 fbscrape set user@example.com username myusername
 fbscrape set user@example.com active true
 fbscrape set user@example.com proxy_server http://proxy:8080
-fbscrape set user@example.com error_msg null       # clears the field
 
-# List all updatable fields
+# List updatable fields
 fbscrape fields
 ```
 
-**Updatable fields:**
-`active`, `email`, `email_password`, `error_msg`, `fingerprint`, `os`, `password`, `phone_number`, `proxy_password`, `proxy_server`, `proxy_username`, `twofa_id`, `username`
-
-**Special values:**
-- `null` or `none` - sets the field to NULL
-- `true` / `false` - for boolean fields like `active`
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    FacebookScraper (API)                    │
-│  - scrape_user_homepage(handle, start_date, end_date)       │
-│  - close()                                                  │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-         ┌───────────┴───────────┐
-         │                       │
-┌────────▼─────────┐    ┌───────▼──────────┐
-│   WorkerPool     │    │  AccountsPool    │
-│  - N browsers    │◄───┤  - SQLite DB     │
-│  - Task queue    │    │  - Lock mgmt     │
-│  - Account       │    │  - Stats         │
-│    rotation      │    └──────────────────┘
-└────────┬─────────┘
-         │
-┌────────▼───────────────────────┐
-│       BrowserSession           │
-│  - Playwright/Camoufox context │
-│  - ResponseInterceptor         │
-│  - Account & cookies           │
-│  - scroll tracking             │
-└────────────────────────────────┘
-```
-
-### Key Components
-
-| Component | File | Description |
-|-----------|------|-------------|
-| `AccountsPool` | `accounts_pool.py` | Manages accounts in SQLite with locking, rotation |
-| `Account` | `account.py` | Account dataclass with email/phone identifier |
-| `BrowserSession` | `browser_session.py` | Browser lifecycle, login, scraping methods |
-| `ResponseInterceptor` | `response.py` | Intercepts GraphQL responses for data extraction |
-| `FacebookScraper` | `scraper.py` | High-level API (delegates to WorkerPool) |
-
 ## Configuration
+
+### FacebookScraper Options
+
+```python
+FacebookScraper(
+    db="accounts.db",           # Path to SQLite database
+    max_browser_sessions=5,     # Max concurrent browsers
+    scroll_threshold=500,       # Scrolls before rotating account
+    headless=True,              # Run browsers headlessly
+    mobile=False,               # Use mobile browser emulation
+)
+```
 
 ### Environment Variables
 
 ```bash
-FB_RAISE_WHEN_NO_ACCOUNT=false  # Raise error when no accounts available
-FB_LOG_LEVEL=INFO               # Logging level
+FB_RAISE_WHEN_NO_ACCOUNT=false  # Raise error vs wait when no accounts
+FB_LOG_LEVEL=INFO               # Logging level (TRACE, DEBUG, INFO, WARNING, ERROR, CRITICAL)
 ```
 
-### Account Fields
+### Debug Logging
+
+Enable debug logging to see detailed execution flow:
+
+```python
+from fbscrape.logger import set_log_level
+
+set_log_level("DEBUG")
+```
+
+Or via environment variable:
+
+```bash
+FB_LOG_LEVEL=DEBUG python your_script.py
+```
+
+## Account Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -327,85 +290,46 @@ FB_LOG_LEVEL=INFO               # Logging level
 | `phone_number` | str \| None | Account phone (identifier) |
 | `password` | str | Account password |
 | `username` | str \| None | Facebook username |
-| `email_password` | str \| None | Email account password (for 2FA) |
 | `cookies` | list[dict] | Playwright-format cookies |
 | `proxy_server` | str \| None | Proxy URL |
-| `proxy_username` | str \| None | Proxy auth username |
-| `proxy_password` | str \| None | Proxy auth password |
-| `os` | str | OS fingerprint (macos/windows/linux) |
 | `active` | bool | Whether account is usable |
-| `in_use` | bool | Whether account is currently in use |
+| `in_use` | bool | Whether currently in use |
+| `locks` | dict | Rate limit locks (`{"locked_until": "..."}`) |
 | `scroll_count_overall_24h` | int | Scrolls in last 24 hours |
-| `scroll_count_per_endpoint_total` | dict | Scrolls per endpoint |
-| `last_used` | datetime | Last usage timestamp |
+| `scroll_count_per_endpoint_total` | dict | Scrolls per endpoint (e.g., `{"UserTimeline": 150}`) |
 | `error_msg` | str \| None | Last error message |
-
-## Database
-
-Accounts are stored in SQLite. The database is automatically created and migrated.
-
-Default location: `~/.fbscrape/db/accounts.db`
-
-### Manual Database Access
-
-```python
-from fbscrape.accounts_pool import AccountsPool
-
-pool = AccountsPool("accounts.db")
-
-# Get all accounts
-accounts = await pool.get(None)
-
-# Get specific account
-account = await pool.get("user@example.com")
-
-# Get available account for scraping
-account = await pool.get_for_queue("user_page")
-
-# Save modified account
-await pool.save(account)
-```
 
 ## Error Handling
 
-The library defines custom exceptions in `fbscrape/exceptions.py`:
-
 ```python
 from fbscrape.exceptions import (
-    NoAccountError,      # No accounts available
-    AccountBannedError,  # Account was banned
-    LoginFailedError,    # Login attempt failed
-    RateLimitError,      # Hit rate limit
+    NoAccountError,       # No accounts available
+    FailedLoginError,     # Login attempt failed
+    AccountBannedError,   # Account was banned
+    RateLimitError,       # Hit rate limit
 )
 ```
 
-## Development
+Workers automatically handle these errors by rotating to a new account and retrying (up to 3 times).
 
-### Running Tests
-
-```bash
-python -m pytest examples/
-```
-
-### Project Structure
+## Project Structure
 
 ```
 fbscrape/
 ├── __init__.py          # Package exports
-├── cli.py               # Command-line interface
+├── scraper.py           # FacebookScraper (high-level API)
+├── worker_pool.py       # WorkerPool (concurrency)
+├── worker.py            # Worker (account lifecycle)
+├── browser_session.py   # BrowserSession (browser automation)
+├── accounts_pool.py     # AccountsPool (SQLite management)
 ├── account.py           # Account dataclass
-├── accounts_pool.py     # Account pool management
-├── browser_session.py   # Browser lifecycle & scraping
 ├── response.py          # GraphQL response interception
-├── scraper.py           # High-level API
-├── models.py            # ScrapingResult, Query, etc.
-├── db.py                # Database utilities & migrations
+├── models.py            # Query, ScrapingResult
+├── cli.py               # Command-line interface
+├── db.py                # Database migrations
 ├── utils.py             # Helpers (gather, cookies, etc.)
-├── logger.py            # Logging setup
 ├── exceptions.py        # Custom exceptions
-├── session.py           # Facebook auth (legacy)
-├── worker.py            # Worker for concurrent scraping
-└── worker_pool.py       # Worker pool management
+└── logger.py            # Logging setup
 ```
 
 ## License

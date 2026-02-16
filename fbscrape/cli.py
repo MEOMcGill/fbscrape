@@ -353,18 +353,17 @@ def unlock(ctx, identifier, reset_all):
 @cli.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'release_all', is_flag=True, help='Release all accounts')
-@click.option('--queue', default='general', help='Queue to release from')
 @click.pass_context
-def release(ctx, identifier, release_all, queue):
-    """Release account(s) from use"""
+def release(ctx, identifier, release_all):
+    """Release account(s) from use (set in_use=false)"""
     if not identifier and not release_all:
         raise click.UsageError("Provide identifier(s) or use --all")
 
     async def _release():
         pool = AccountsPool(ctx.obj['db'])
         target = None if release_all else list(identifier)
-        await pool.release_account(target, queue)
-        click.echo(f"Released {'all accounts' if release_all else len(identifier)} from queue '{queue}'")
+        await pool.release_account(target)
+        click.echo(f"Released {'all accounts' if release_all else len(identifier)}")
 
     run_async(_release())
 

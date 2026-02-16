@@ -32,10 +32,10 @@ class Worker:
 
     # Maps endpoint names to BrowserSession method names
     ENDPOINT_METHODS = {
-        "user_timeline": "user_timeline",
+        "UserTimeline": "user_timeline",
         # Add more as implemented:
-        # "search": "search",
-        # "group_posts": "group_posts",
+        # "Search": "search",
+        # "GroupTimeline": "group_timeline",
     }
 
     def __init__(
@@ -45,7 +45,6 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        queue: str = "general",
     ):
         """
         Initialize Worker with configuration only.
@@ -58,14 +57,12 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
-            queue: Queue name for account locking
         """
         self.id = id
         self.pool = pool
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
-        self.queue = queue
 
         # State set during initialize()
         self.current_account: Optional[Account] = None
@@ -80,7 +77,6 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        queue: str = "general",
     ) -> "Worker":
         """
         Factory method to create and initialize a Worker.
@@ -91,7 +87,6 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
-            queue: Queue name for account locking
 
         Returns:
             Initialized Worker instance
@@ -99,13 +94,13 @@ class Worker:
         Raises:
             NoAccountError: If no account available in pool
         """
+        logger.debug(f"Worker.create({id}): creating with scroll_threshold={scroll_threshold}, headless={headless}")
         instance = cls(
             id=id,
             pool=pool,
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
-            queue=queue,
         )
         success = await instance.initialize()
         if not success:
@@ -132,9 +127,10 @@ class Worker:
         Returns:
             True if account acquired successfully, False otherwise
         """
-        account = await self.pool.get_for_queue(queue=self.queue)
+        logger.debug(f"Worker {self.id}: initializing, requesting account from pool")
+        account = await self.pool.get_available()
         if not account:
-            logger.warning(f"Worker {self.id}: no account available for queue '{self.queue}'")
+            logger.warning(f"Worker {self.id}: no account available")
             return False
 
         self.current_account = account
@@ -146,8 +142,9 @@ class Worker:
 
     async def close(self):
         """Release current account back to the pool."""
+        logger.debug(f"Worker {self.id}: closing, scroll_count={self.scroll_count}")
         if self.current_account:
-            await self.pool.release_account(self.current_account.identifier, self.queue)
+            await self.pool.release_account(self.current_account.identifier)
             logger.info(f"Worker {self.id} released account {self.current_account.display_name}")
             self.current_account = None
 
@@ -166,8 +163,12 @@ class Worker:
         """
         results: list[ScrapingResult] = []
 
-        while not task_queue.empty():
-            task: Query = await task_queue.get()
+        while True:
+            try:
+                task: Query = task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
             logger.info(f"Worker {self.id} processing task: {task.endpoint} - {task.query}")
 
             try:
@@ -185,8 +186,8 @@ class Worker:
             except Exception as e:
                 logger.error(f"Worker {self.id} unexpected error: {e}")
                 # Continue with next task
-
-            task_queue.task_done()
+            finally:
+                task_queue.task_done()
 
         logger.info(f"Worker {self.id} finished, processed {len(results)} tasks")
         return results
@@ -218,7 +219,10 @@ class Worker:
         max_retries = 3
         retry_count = 0
 
+        logger.debug(f"Worker {self.id}: executing task {task.endpoint}, current scroll_count={self.scroll_count}")
+
         while retry_count < max_retries:
+            logger.debug(f"Worker {self.id}: attempt {retry_count + 1}/{max_retries} for {task.endpoint}")
             try:
                 # Create fresh BrowserSession for this task
                 async with BrowserSession(
@@ -238,6 +242,7 @@ class Worker:
                     # Update Worker's scroll count from session
                     endpoint_scrolls = await session.get_scroll_count(task.endpoint)
                     self.scroll_count += endpoint_scrolls
+                    logger.debug(f"Worker {self.id}: task complete, endpoint_scrolls={endpoint_scrolls}, total scroll_count={self.scroll_count}")
 
                     return result
 
@@ -284,13 +289,20 @@ class Worker:
         """
         Release current account and acquire a new one.
 
+        Adds a brief cooldown lock to prevent immediately re-acquiring the same account.
+
         Raises:
             NoAccountError: If no account available for rotation
         """
-        # Release current account
+        logger.debug(f"Worker {self.id}: rotating account, current={self.current_account.display_name if self.current_account else 'None'}")
+        # Release current account with cooldown to prevent immediate re-acquisition
         if self.current_account:
-            await self.pool.release_account(self.current_account.identifier, self.queue)
-            logger.info(f"Worker {self.id} released account {self.current_account.display_name}")
+            await self.pool.lock_until(
+                self.current_account.identifier,
+                "datetime('now', '+5 minutes')"
+            )
+            await self.pool.release_account(self.current_account.identifier)
+            logger.info(f"Worker {self.id} released account {self.current_account.display_name} (5s cooldown)")
             self.current_account = None
 
         # Reset state
@@ -308,7 +320,7 @@ class Worker:
 
         Args:
             session: BrowserSession instance
-            endpoint: Endpoint name (e.g., 'user_timeline')
+            endpoint: Endpoint name (e.g., 'UserTimeline')
 
         Returns:
             Bound method from BrowserSession
@@ -322,4 +334,5 @@ class Worker:
                 f"Supported endpoints: {list(self.ENDPOINT_METHODS.keys())}"
             )
         method_name = self.ENDPOINT_METHODS[endpoint]
+        logger.debug(f"Worker {self.id}: endpoint {endpoint} -> method {method_name}")
         return getattr(session, method_name)

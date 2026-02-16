@@ -7,16 +7,22 @@ from datetime import datetime, timedelta
 from typing import ClassVar
 import json
 
+
 @dataclass
 class JSONTrait:
-    def dict(self):
+    """Mixin for JSON serialization of dataclasses"""
+
+    def to_dict(self) -> dict:
+        """Convert to JSON-serializable dictionary"""
         return asdict(self)
 
-    def json(self):
-        return json.dumps(self.dict(), default=str)
+    def to_json(self) -> str:
+        """Convert to JSON string"""
+        return json.dumps(self.to_dict(), default=str)
+
 
 @dataclass
-class Query(JSONTrait):
+class Query:
     """
     Represents a scraping task with endpoint-specific query validation.
 
@@ -26,10 +32,10 @@ class Query(JSONTrait):
 
     # Maps endpoint names to required query fields
     ENDPOINT_REQUIRED_FIELDS: ClassVar[dict[str, list[str]]] = {
-        "user_timeline": ["handle", "start_date", "end_date"],
+        "UserTimeline": ["handle", "start_date", "end_date"],
         # Add more as implemented:
-        # "search": ["query", "start_date", "end_date"],
-        # "group_posts": ["group_id", "start_date", "end_date"],
+        # "Search": ["query", "start_date", "end_date"],
+        # "GroupTimeline": ["group_id", "start_date", "end_date"],
     }
 
     endpoint: str
@@ -61,14 +67,20 @@ class Query(JSONTrait):
                 f"Required: {required}"
             )
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
+        """Convert to JSON-serializable dictionary"""
         return {
             'endpoint': self.endpoint,
             'query': self.query,
             'params': self.params,
-            'start-date': str(self.start_date) if self.start_date else None,
-            'end-date': str(self.end_date) if self.end_date else None
+            'start_date': str(self.start_date) if self.start_date else None,
+            'end_date': str(self.end_date) if self.end_date else None,
         }
+
+    def to_json(self) -> str:
+        """Convert to JSON string"""
+        return json.dumps(self.to_dict())
+
 
 @dataclass
 class ScrapingResult:
@@ -80,14 +92,24 @@ class ScrapingResult:
     time_taken: timedelta
 
     def to_dict(self) -> dict:
-        """Convert to dictionary format"""
+        """Convert to JSON-serializable dictionary"""
         return {
-            'query': self.query.dict(),
+            'query': self.query.to_dict(),
             'result': self.result,
             'posts': self.posts,
             'time_started': str(self.time_started),
-            'time_taken': str(self.time_taken)
+            'time_taken': str(self.time_taken),
         }
 
+    def to_json(self) -> str:
+        """Convert to JSON string"""
+        return json.dumps(self.to_dict())
+
+    def save(self, path: str):
+        """Save to JSON file"""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
     def add_post(self, post: dict):
+        """Add a post to the results"""
         self.posts.append(post)

@@ -5,7 +5,10 @@ Provides a high-level interface for scraping Facebook that manages
 browser sessions and account rotation automatically.
 """
 
+import asyncio
+
 from .accounts_pool import AccountsPool
+from .logger import logger
 from .models import Query, ScrapingResult
 from .worker_pool import WorkerPool
 
@@ -59,17 +62,20 @@ class FacebookScraper:
         self.headless = headless
         self.mobile = mobile
         self.worker_pool: WorkerPool | None = None
+        self._init_lock = asyncio.Lock()
 
     async def _ensure_initialized(self):
-        """Lazy initialization of WorkerPool."""
-        if self.worker_pool is None:
-            self.worker_pool = WorkerPool(
-                pool=self.pool,
-                max_workers=self.max_browser_sessions,
-                scroll_threshold=self.scroll_threshold,
-                headless=self.headless,
-                mobile=self.mobile,
-            )
+        """Lazy initialization of WorkerPool with lock to prevent race conditions."""
+        async with self._init_lock:
+            if self.worker_pool is None:
+                logger.debug(f"Initializing WorkerPool with max_workers={self.max_browser_sessions}")
+                self.worker_pool = WorkerPool(
+                    pool=self.pool,
+                    max_workers=self.max_browser_sessions,
+                    scroll_threshold=self.scroll_threshold,
+                    headless=self.headless,
+                    mobile=self.mobile,
+                )
 
     async def user_timeline(
         self,
@@ -95,7 +101,7 @@ class FacebookScraper:
         await self._ensure_initialized()
 
         query = Query(
-            endpoint="user_timeline",
+            endpoint="UserTimeline",
             query={
                 "handle": handle,
                 "start_date": start_date,
@@ -104,14 +110,19 @@ class FacebookScraper:
             params={},
         )
 
+        logger.debug(f"Submitting user_timeline task for handle={handle}, date_range={start_date} to {end_date}")
         future = await self.worker_pool.submit_task(query)
-        return await future
+        result = await future
+        logger.debug(f"Completed user_timeline for handle={handle}, result={result.result}, posts={len(result.posts)}")
+        return result
 
     async def close(self):
         """Cleanup all browser sessions and release accounts."""
+        logger.debug("Closing FacebookScraper")
         if self.worker_pool:
             await self.worker_pool.close()
             self.worker_pool = None
+        logger.debug("FacebookScraper closed")
 
     async def __aenter__(self) -> "FacebookScraper":
         """Async context manager entry."""
