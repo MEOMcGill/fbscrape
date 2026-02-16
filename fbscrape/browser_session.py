@@ -76,7 +76,7 @@ class BrowserSession:
         self._browser: Browser = await AsyncNewBrowser(
             playwright=self._pw,
             humanize=True,
-            headless=self.headless,
+            headless="virtual" if self.headless else self.headless,
             proxy=proxy_settings,
             geoip=True if proxy_settings else False,
             os=self.account.os,
@@ -85,6 +85,13 @@ class BrowserSession:
                 "browser.startup.firstrunSkipsHomepage": True,
                 "browser.shell.checkDefaultBrowser": False,
                 "datareporting.policy.dataSubmissionEnabled": False,
+
+                # memory saving attributes - suggested by Claude
+                "browser.cache.disk.enable": False,
+                "browser.cache.memory.capacity": 0,
+                "browser.sessionhistory.max_entries": 2,
+                "browser.sessionhistory.max_total_viewers": 0,
+                "dom.ipc.processCount.webIsolated": 1,
             }
         )
 

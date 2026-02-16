@@ -9,7 +9,7 @@ import asyncio
 
 BASE_URL = "https://www.facebook.com"
 mobile: bool = False
-headless: bool = False
+headless: bool = True
 
 async def create_browser_context(headless: bool = headless, mobile: bool = mobile):
     # Work which will be done by Worker.py
