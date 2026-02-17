@@ -12,4 +12,4 @@ __pycache__
 # Authentication
 auth/*
 #db/accounts.db
-tmp
+#tmp
