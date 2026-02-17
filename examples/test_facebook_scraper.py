@@ -11,7 +11,7 @@ set_log_level("INFO")
 
 mobile: bool = False
 headless: bool = False
-max_browser_sessions: int = 3
+max_browser_sessions: int = 2
 
 handles: list[str] = [
     "AndrewScheerMP",
