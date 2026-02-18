@@ -14,8 +14,20 @@ from fbscrape.logger import logger
 import argparse
 import asyncio
 import json
+import platform
 from camoufox.async_api import AsyncCamoufox
 import os
+
+
+def get_camoufox_os() -> str:
+    """Detect the current OS and return the Camoufox os parameter value."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return "macos"
+    elif system == "windows":
+        return "windows"
+    else:
+        return "linux"
 
 
 async def main(output_path: str):
@@ -24,6 +36,7 @@ async def main(output_path: str):
     auth_path = os.path.join(get_home_dir_path(), "auth")
     if not os.path.exists(auth_path):
         os.makedirs(auth_path)
+        logger.info(f"Created {auth_path} since didn't exist")
 
     # ensure output path is good
     full_output_path = os.path.join(get_home_dir_path(), "auth", output_path)
@@ -33,7 +46,10 @@ async def main(output_path: str):
         raise FileExistsError(f"Output file {full_output_path} already exists.")
     logger.info(f"Saving storage state to {full_output_path}")
 
-    async with AsyncCamoufox(headless=False) as browser:
+    current_os = get_camoufox_os()
+    logger.info(f"Detected OS: {current_os}")
+
+    async with AsyncCamoufox(headless=False, os=current_os) as browser:
         context = await browser.new_context()
         page = await context.new_page()
         # To-do: Workaround for camoufox issue #473: br/zstd decompression broken
