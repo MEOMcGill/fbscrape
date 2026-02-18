@@ -3,12 +3,29 @@ Utility functions for Facebook scraping
 """
 import base64
 import os
+import platform
 from pathlib import Path
 import re
 import requests
 from datetime import datetime, timedelta, timezone
 import json
 import asyncio
+
+
+def get_device_os() -> str:
+    """
+    Detect the current OS and return the Camoufox os parameter value.
+
+    Returns:
+        "macos", "windows", or "linux"
+    """
+    system = platform.system().lower()
+    if system == "darwin":
+        return "macos"
+    elif system == "windows":
+        return "windows"
+    else:
+        return "linux"
 
 class utc:
     @staticmethod

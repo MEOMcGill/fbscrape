@@ -6,7 +6,7 @@ from .response import ResponseInterceptor
 from .account import Account
 from .logger import logger
 from .models import ScrapingResult, Query
-from .utils import recursively_get_dict_value
+from .utils import recursively_get_dict_value, get_device_os
 from .exceptions import FailedLoginError
 
 import asyncio
@@ -79,7 +79,7 @@ class BrowserSession:
             headless="virtual" if self.headless else self.headless,
             proxy=proxy_settings,
             geoip=True if proxy_settings else False,
-            os=self.account.os,
+            os=get_device_os(),
             firefox_user_prefs={
                 "browser.aboutwelcome.enabled": False,
                 "browser.startup.firstrunSkipsHomepage": True,

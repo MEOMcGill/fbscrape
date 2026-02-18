@@ -8,26 +8,14 @@ Set a breakpoint at the `breakpoint()` line, create your account in the browser,
 then continue execution to save cookies.
 """
 
-from fbscrape.utils import get_home_dir_path
+from fbscrape.utils import get_home_dir_path, get_device_os
 from fbscrape.logger import logger
 
 import argparse
 import asyncio
 import json
-import platform
 from camoufox.async_api import AsyncCamoufox
 import os
-
-
-def get_camoufox_os() -> str:
-    """Detect the current OS and return the Camoufox os parameter value."""
-    system = platform.system().lower()
-    if system == "darwin":
-        return "macos"
-    elif system == "windows":
-        return "windows"
-    else:
-        return "linux"
 
 
 async def main(output_path: str):
@@ -46,7 +34,7 @@ async def main(output_path: str):
         raise FileExistsError(f"Output file {full_output_path} already exists.")
     logger.info(f"Saving storage state to {full_output_path}")
 
-    current_os = get_camoufox_os()
+    current_os = get_device_os()
     logger.info(f"Detected OS: {current_os}")
 
     async with AsyncCamoufox(headless=False, os=current_os) as browser:
