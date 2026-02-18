@@ -20,6 +20,11 @@ import os
 
 async def main(output_path: str):
 
+    # ensure the auth is there
+    auth_path = os.path.join(get_home_dir_path(), "auth")
+    if not os.path.exists(auth_path):
+        os.makedirs(auth_path)
+
     # ensure output path is good
     full_output_path = os.path.join(get_home_dir_path(), "auth", output_path)
     if not output_path.endswith(".json"):
