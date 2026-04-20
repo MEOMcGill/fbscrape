@@ -52,7 +52,7 @@ async def scrape_scraper():
                 f"Time taken: {data.time_taken}"
             )
 
-            path_folder = os.path.join(get_home_dir_path(), "data", "posts", f"{data.query.start_date.date()}_{data.query.end_date.date()}")
+            path_folder = os.path.join(get_home_dir_path(), "data", "posts", f"{data.query.start_date.date().strftime("%Y-%m-%d")}_{data.query.end_date.date().strftime("%Y-%m-%d")}")
             os.makedirs(path_folder, exist_ok=True)
             data.save(
                 os.path.join(

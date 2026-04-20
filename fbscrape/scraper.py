@@ -45,6 +45,7 @@ class FacebookScraper:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        stall_timeout_seconds: int = 300,
     ):
         """
         Initialize Facebook scraper.
@@ -55,12 +56,14 @@ class FacebookScraper:
             scroll_threshold: Scrolls before rotating account
             headless: Run browsers in headless mode
             mobile: Use mobile browser emulation
+            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds (default 120)
         """
         self.pool = db if isinstance(db, AccountsPool) else AccountsPool(db)
         self.max_browser_sessions = max_browser_sessions
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
+        self.stall_timeout_seconds = stall_timeout_seconds
         self.worker_pool: WorkerPool | None = None
         self._init_lock = asyncio.Lock()
 
@@ -75,6 +78,7 @@ class FacebookScraper:
                     scroll_threshold=self.scroll_threshold,
                     headless=self.headless,
                     mobile=self.mobile,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
                 )
 
     async def user_timeline(

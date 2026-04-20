@@ -8,7 +8,7 @@ import os
 from tabulate import tabulate
 
 from .accounts_pool import AccountsPool
-from .utils import get_home_dir_path
+from .utils import gather, get_home_dir_path
 
 
 def get_default_db():
@@ -497,6 +497,243 @@ def export_cookies(ctx, identifier, output_file):
         click.echo(f"Exported {len(account.cookies)} cookies to {output_file}")
 
     run_async(_export())
+
+
+# ============== Scraping ==============
+
+@cli.group()
+def scrape():
+    """Run scraping jobs"""
+    pass
+
+
+@scrape.command(name='user-timeline')
+@click.argument('handles', nargs=-1, required=True)
+@click.option('--start-date', required=True, help='Start date YYYY-MM-DD (how far back to scrape)')
+@click.option('--end-date', required=True, help='End date YYYY-MM-DD (most recent date to scrape from)')
+@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
+@click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=500, type=int, help='Scrolls before rotating account')
+@click.option('--stall-timeout-seconds', default=300, type=int, help='Bail out if no GraphQL response for N seconds (default 300)')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.pass_context
+def scrape_user_timeline(ctx, handles, start_date, end_date, output_dir, max_sessions, scroll_threshold, stall_timeout_seconds, headless, mobile, log_level):
+    """Scrape a user's timeline between two dates.
+
+    \b
+    Examples:
+      fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
+      fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --end-date 2025-01-01 --headless
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "posts", f"{start_date}_{end_date}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            stall_timeout_seconds=stall_timeout_seconds,
+        ) as scraper:
+            async for result in gather(
+                scraper.user_timeline(handle=h, start_date=start_date, end_date=end_date)
+                for h in handles
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+                click.echo(f"{handle}: {data.result} ({len(data.posts)} posts, {data.time_taken})")
+
+                filename = (
+                    f"{handle.replace('.', '_')}"
+                    f"_{data.query.endpoint}"
+                    f"_{start_date}_{end_date}.json"
+                )
+                data.save(os.path.join(output_dir, filename))
+
+        click.echo(f"\nResults saved to: {output_dir}")
+
+    run_async(_scrape())
+
+
+# ============== Post-processing ==============
+
+@cli.command()
+@click.argument('input_path')
+@click.option('--output', default=None, help='Output file (default: alongside input with _flat suffix)')
+@click.option('--format', 'fmt', type=click.Choice(['csv', 'jsonl', 'parquet', 'all']), default='csv', help='Output format (default csv). "all" writes csv + jsonl + parquet.')
+def flatten(input_path, output, fmt):
+    """Flatten a scraped posts JSON (or a directory of them) into a tabular dataset.
+
+    \b
+    Uses FacebookGraphQLParser.flatten_post to extract post_id, url, created_at,
+    author_{id,name,url}, text, reactions, top_reactions, shares, attachments.
+
+    \b
+    Examples:
+      fbscrape flatten data/posts/foo.json
+      fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format jsonl
+      fbscrape flatten data/posts/foo.json --format all
+    """
+    import json
+    from .response import FacebookGraphQLParser
+
+    if not os.path.exists(input_path):
+        raise click.UsageError(f"Path not found: {input_path}")
+
+    if os.path.isdir(input_path):
+        files = sorted(
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if f.endswith('.json')
+        )
+        if not files:
+            raise click.UsageError(f"No .json files in {input_path}")
+        if output:
+            raise click.UsageError("--output cannot be used with a directory; outputs are written alongside each input")
+    else:
+        files = [input_path]
+
+    parser = FacebookGraphQLParser()
+    total_in = total_out = 0
+
+    fieldnames = ['post_id', 'story_id', 'url', 'permalink_url',
+                  'created_at', 'created_at_utc', 'privacy',
+                  'is_reel', 'is_live', 'video_duration_sec', 'video_views',
+                  'author_id', 'author_name', 'author_url', 'text', 'external_urls',
+                  'reactions', 'like', 'love', 'haha', 'wow', 'sad', 'angry', 'care',
+                  'shares', 'comments', 'top_comments',
+                  'shared_post_id', 'shared_post_url', 'shared_post_created_at',
+                  'shared_post_author_id', 'shared_post_author_name', 'shared_post_text',
+                  'attachments']
+
+    formats = ['csv', 'jsonl', 'parquet'] if fmt == 'all' else [fmt]
+    if output and len(formats) > 1:
+        raise click.UsageError('--output cannot be combined with --format all')
+
+    for f in files:
+        with open(f) as fh:
+            data = json.load(fh)
+
+        posts = data.get('posts', [])
+        rows = [r for p in posts if (r := parser.flatten_post(p))]
+        total_in += len(posts)
+        total_out += len(rows)
+
+        for active_fmt in formats:
+            if output and len(files) == 1:
+                out_path = output
+            else:
+                base = os.path.splitext(f)[0]
+                out_path = f"{base}_flat.{active_fmt}"
+
+            if active_fmt == 'csv':
+                import csv
+                with open(out_path, 'w', newline='') as out:
+                    w = csv.DictWriter(out, fieldnames=fieldnames)
+                    w.writeheader()
+                    for r in rows:
+                        row = {k: (json.dumps(v, default=str) if isinstance(v, (list, dict)) else v) for k, v in r.items()}
+                        w.writerow(row)
+            elif active_fmt == 'jsonl':
+                with open(out_path, 'w') as out:
+                    for r in rows:
+                        out.write(json.dumps(r, default=str) + '\n')
+            elif active_fmt == 'parquet':
+                import pandas as pd
+                df = pd.DataFrame(rows, columns=fieldnames)
+                # Nested list/dict cols are kept as Python objects — Parquet handles them natively.
+                df.to_parquet(out_path, index=False)
+
+            click.echo(f"{f} -> {out_path} ({len(rows)}/{len(posts)} posts)")
+
+    click.echo(f"\nTotal: {total_out}/{total_in} posts flattened")
+
+
+@cli.command(name='download-media')
+@click.argument('input_path')
+@click.option('--out-dir', default=None, help='Directory to save media (default: <input_dir>/media/<handle>/)')
+@click.option('--include-thumbnails', is_flag=True, help='Also download video thumbnails')
+@click.option('--concurrency', default=8, type=int, help='Concurrent downloads (default 8)')
+@click.option('--no-skip-existing', is_flag=True, help='Re-download files that already exist')
+@click.option('--timeout', default=60, type=int, help='Per-request timeout in seconds (default 60)')
+@click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
+def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip_existing, timeout, log_level):
+    """Download media (images and videos) from a scraped posts JSON or directory.
+
+    \b
+    fbcdn URLs are signed and expire ~30 days after scraping, so run this soon
+    after a scrape. No account cookies needed — URLs are self-authenticating.
+
+    \b
+    Filenames: {post_id}_img_00.jpg, {post_id}_vid_00.mp4, {post_id}_thumb_00.jpg
+
+    \b
+    Examples:
+      fbscrape download-media data/posts/foo.json
+      fbscrape download-media data/posts/2025-06-01_2026-02-17/ --include-thumbnails
+    """
+    import json as _json
+    from .downloaders import download_media_from_posts
+    from .logger import set_log_level
+
+    set_log_level(log_level)
+
+    if not os.path.exists(input_path):
+        raise click.UsageError(f"Path not found: {input_path}")
+
+    if os.path.isdir(input_path):
+        files = sorted(
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if f.endswith('.json')
+        )
+        if not files:
+            raise click.UsageError(f"No .json files in {input_path}")
+    else:
+        files = [input_path]
+
+    async def _run():
+        totals = {"total": 0, "saved": 0, "skipped": 0, "failed": 0}
+        for f in files:
+            with open(f) as fh:
+                data = _json.load(fh)
+            posts = data.get('posts', [])
+            handle = (data.get('query') or {}).get('query', {}).get('handle') or os.path.splitext(os.path.basename(f))[0]
+
+            if out_dir:
+                target_dir = out_dir if len(files) == 1 else os.path.join(out_dir, handle)
+            else:
+                target_dir = os.path.join(os.path.dirname(f), 'media', handle)
+
+            click.echo(f"{f} -> {target_dir}")
+            summary = await download_media_from_posts(
+                posts=posts,
+                out_dir=target_dir,
+                include_thumbnails=include_thumbnails,
+                concurrency=concurrency,
+                skip_existing=not no_skip_existing,
+                timeout_sec=timeout,
+            )
+            click.echo(f"  total={summary['total']} saved={summary['saved']} skipped={summary['skipped']} failed={summary['failed']}")
+            for k in totals:
+                totals[k] += summary[k]
+
+        if len(files) > 1:
+            click.echo(f"\nGrand total: {totals}")
+
+    run_async(_run())
 
 
 def main():

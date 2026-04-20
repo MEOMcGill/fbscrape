@@ -45,6 +45,7 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        stall_timeout_seconds: int = 300,
     ):
         """
         Initialize Worker with configuration only.
@@ -57,12 +58,14 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
+            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds
         """
         self.id = id
         self.pool = pool
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
+        self.stall_timeout_seconds = stall_timeout_seconds
 
         # State set during initialize()
         self.current_account: Optional[Account] = None
@@ -77,6 +80,7 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        stall_timeout_seconds: int = 300,
     ) -> "Worker":
         """
         Factory method to create and initialize a Worker.
@@ -87,6 +91,7 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
+            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds
 
         Returns:
             Initialized Worker instance
@@ -101,6 +106,7 @@ class Worker:
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
+            stall_timeout_seconds=stall_timeout_seconds,
         )
         success = await instance.initialize()
         if not success:
@@ -230,6 +236,7 @@ class Worker:
                     pool=self.pool,
                     headless=self.headless,
                     mobile=self.mobile,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
                 ) as session:
                     # Get scraping method
                     method = self._get_scraping_method(session, task.endpoint)

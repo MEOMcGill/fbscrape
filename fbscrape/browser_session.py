@@ -27,12 +27,14 @@ class BrowserSession:
             account: Account,
             pool: AccountsPool,
             headless: bool = False,
-            mobile: bool = False
+            mobile: bool = False,
+            stall_timeout_seconds: int = 300,
     ):
         self.account = account
         self.pool = pool
         self.headless = headless
         self.mobile = mobile
+        self.stall_timeout_seconds = stall_timeout_seconds
 
         # the endpoint we're scrolling (set by scraping methods like user_timeline)
         self.endpoint: str = ""
@@ -45,9 +47,9 @@ class BrowserSession:
         self.response_interceptor: Optional[ResponseInterceptor] = None
 
     @classmethod
-    async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False):
+    async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False, stall_timeout_seconds: int = 300):
         logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}")
-        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile)
+        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile, stall_timeout_seconds=stall_timeout_seconds)
         await instance.initialize()
         return instance
 
@@ -321,6 +323,9 @@ class BrowserSession:
 
         while True:
             try:
+                iter_start = datetime.now(timezone.utc)
+                logger.debug(f"@{handle} loop iter {total_scrolls}: start")
+
                 # Navigate to target page if needed
                 if not self.is_on_page(target_url):
                     logger.info(f"Navigating to {target_url}")
@@ -352,18 +357,40 @@ class BrowserSession:
                         )
 
                 # Get currently intercepted posts
+                t_get_posts = datetime.now(timezone.utc)
+                logger.debug(f"@{handle} iter {total_scrolls}: before get_posts()")
                 posts = self.response_interceptor.get_posts()
                 current_post_count = len(posts)
+                last_resp_dbg = self.response_interceptor.last_response_time
+                if last_resp_dbg is not None:
+                    silence_dbg = (datetime.now(timezone.utc) - last_resp_dbg).total_seconds()
+                    last_resp_str = f"{last_resp_dbg.strftime('%H:%M:%S')} ({silence_dbg:.1f}s ago, threshold={self.stall_timeout_seconds}s)"
+                else:
+                    last_resp_str = f"never (threshold={self.stall_timeout_seconds}s)"
+                logger.debug(
+                    f"@{handle} iter {total_scrolls}: after get_posts() "
+                    f"({(datetime.now(timezone.utc) - t_get_posts).total_seconds():.2f}s), "
+                    f"count={current_post_count} (prev={previous_post_count}), "
+                    f"graphql_responses={self.response_interceptor.get_graphql_request_count()}, "
+                    f"last_response={last_resp_str}"
+                )
 
                 logger.debug(f"Scrolled {total_scrolls} times, intercepted {current_post_count} posts")
 
                 # Check if we're making progress
                 if current_post_count == previous_post_count:
                     no_new_posts_count += 1
+                    logger.debug(f"@{handle} iter {total_scrolls}: no new posts (streak={no_new_posts_count})")
 
                     # Check for errors when stalled
                     if no_new_posts_count == 3:
+                        t_err = datetime.now(timezone.utc)
+                        logger.debug(f"@{handle} iter {total_scrolls}: before check_error_conditions()")
                         error = await self.check_error_conditions()
+                        logger.debug(
+                            f"@{handle} iter {total_scrolls}: after check_error_conditions() "
+                            f"({(datetime.now(timezone.utc) - t_err).total_seconds():.2f}s), error={error!r}"
+                        )
                         if error:
                             return ScrapingResult(
                                 query=query,
@@ -373,7 +400,7 @@ class BrowserSession:
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
 
-                    if no_new_posts_count > 10:
+                    if no_new_posts_count > 30:
                         if current_post_count == 0:
                             return ScrapingResult(
                                 query=query,
@@ -393,6 +420,7 @@ class BrowserSession:
                 else:
                     no_new_posts_count = 0
                     previous_post_count = current_post_count
+                    logger.debug(f"@{handle} iter {total_scrolls}: progress! new count={current_post_count}")
 
                 # Check timestamps if we have posts
                 if current_post_count > 0:
@@ -413,8 +441,30 @@ class BrowserSession:
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
 
+                # Watchdog: bail out if Facebook has stopped responding to GraphQL
+                last_resp = self.response_interceptor.last_response_time or scrape_start_time
+                silence_seconds = (datetime.now(timezone.utc) - last_resp).total_seconds()
+                if silence_seconds > self.stall_timeout_seconds:
+                    logger.warning(
+                        f"@{handle}: no GraphQL response for {silence_seconds:.0f}s "
+                        f"(threshold={self.stall_timeout_seconds}s) — returning partial results"
+                    )
+                    return ScrapingResult(
+                        query=query,
+                        result=f'stalled: no graphql response for {int(silence_seconds)}s',
+                        posts=self.response_interceptor.get_posts(),
+                        time_started=scrape_start_time,
+                        time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                    )
+
                 # Scroll to trigger loading more posts (also records scroll in database)
+                t_scroll = datetime.now(timezone.utc)
+                logger.debug(f"@{handle} iter {total_scrolls}: before scroll()")
                 await self.scroll()
+                logger.debug(
+                    f"@{handle} iter {total_scrolls}: after scroll() "
+                    f"({(datetime.now(timezone.utc) - t_scroll).total_seconds():.2f}s)"
+                )
                 total_scrolls += 1
 
                 # Rate limiting
@@ -422,7 +472,13 @@ class BrowserSession:
                     logger.info(f"@{handle}: {current_post_count} posts after {total_scrolls} scrolls - pausing 30s")
                     await asyncio.sleep(30)
 
-                await asyncio.sleep(random.uniform(1, 3))  # Give time for GraphQL responses to arrive
+                sleep_s = random.uniform(3, 6)
+                logger.debug(f"@{handle} iter {total_scrolls-1}: sleeping {sleep_s:.2f}s for GraphQL responses")
+                await asyncio.sleep(sleep_s)
+                logger.debug(
+                    f"@{handle} iter {total_scrolls-1}: iter total "
+                    f"{(datetime.now(timezone.utc) - iter_start).total_seconds():.2f}s"
+                )
 
             except Exception as e:
                 logger.error(f"Error scraping @{handle}: {e}")
