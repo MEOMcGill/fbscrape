@@ -126,6 +126,23 @@ class BrowserSession:
                 raise FailedLoginError(f"Failed to login for {self.account.display_name}")
 
         await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
+        pass
+
+        try:
+            await self.page.get_by_role('button', name='Continue').click(timeout=3000)
+            logger.debug("Clicked post-login 'Continue' button")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
+            pass  # button not shown this time — no-op
+
+        try:
+            await self.page.get_by_role('button', name=f'Continue as {self.account.display_name}').click(timeout=3000)
+            logger.debug(f"Clicked post-login 'Continue as {self.account.display_name}' button")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
+            pass  # button not shown this time — no-op
 
         logger.info(f"Browser session initialized for {self.account.display_name}")
 

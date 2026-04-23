@@ -15,7 +15,7 @@ Thank you for your interest in contributing to fbscrape. This document provides 
 1. Clone the repository:
    ```bash
    git clone https://github.com/MEOMcGill/dt-facebook-scraper.git
-   cd dt-facebook-scraper
+   cd fbscrape
    ```
 
 2. Install the package in editable mode:
@@ -181,7 +181,7 @@ state to `auth/my_account.json`.
    - Click "Create new account"
    - Fill in the required information
    - Complete any verification steps (phone)
-   - Ensure you are fully logged in
+   - Ensure you are fully logged in`
 
 4. Add a human touch to your Facebook profile. Facebook would rather you scrape than produce inauthentic activity and ruin people's experience. Build the profile without leaving too much of a trace by:
    - Add a profile and cover photo,
@@ -196,7 +196,7 @@ state to `auth/my_account.json`.
    ~/.fbscrape/auth/my_account.json
    ```
 
-6. Add the account to your database:
+6. ~~Add the account to your database:~~ (don't actually do this, just save it as JSON)
    ```bash
    fbscrape add \
        --phone phone_number \
@@ -208,7 +208,7 @@ state to `auth/my_account.json`.
        --proxy-pass proxy_password
    ```
 
-7. Verify the account was added:
+7. ~~Verify the account was added:~~
    ```bash
    fbscrape list -v
    ```

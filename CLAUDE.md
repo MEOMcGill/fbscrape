@@ -1,8 +1,46 @@
 # Project Context
 
-**Last Updated:** 2026-02-13
+**Last Updated:** 2026-04-19
 
 ## Summary of Recent Work
+
+### Session 3 (2026-04-19): Stall Watchdog, CLI Scrape/Flatten/Download, Richer Post Extraction
+
+Added production-quality scrape robustness + end-to-end CLI workflow (scrape → flatten → download media).
+
+#### Stall Watchdog (GraphQL silence detection)
+
+When Facebook throttles a long scraping session, the GraphQL endpoint goes *silent* — the browser keeps issuing pagination requests but responses never come back. The scroll loop kept running against a frozen feed (FB renders skeleton placeholders) because `scrollBy` is fire-and-forget and `no_new_posts_count > 10` is scroll-count based, not wall-clock based.
+
+**Fix:** added `ResponseInterceptor.last_response_time` (set in `intercept_response()` each time any GraphQL XHR lands, reset in `flush()`). Before each `self.scroll()` in `BrowserSession.user_timeline`, the loop checks wall-clock time since the last GraphQL response. If it exceeds `stall_timeout_seconds`, the scrape returns `ScrapingResult(result='stalled: no graphql response for Ns', posts=<partial>)` and exits cleanly — no data loss.
+
+`stall_timeout_seconds` (default **300s / 5 min**) is threaded through `BrowserSession` → `Worker` → `WorkerPool` → `FacebookScraper` and exposed as `--stall-timeout-seconds` on the CLI.
+
+#### CLI Additions
+
+- **`fbscrape scrape user-timeline <handles...> --start-date --end-date`** — launches scrapes from the shell. Supports multiple handles in parallel (via `gather`), `--max-sessions`, `--scroll-threshold`, `--stall-timeout-seconds`, `--headless`, `--mobile`, `--log-level`, `--output-dir`.
+- **`fbscrape flatten <input.json|dir> [--format csv|jsonl|parquet|all] [--output path]`** — flattens scraped post JSON(s) into tabular datasets. Directory mode writes one `_flat.<ext>` per input. Requires `pandas` + `pyarrow` for parquet.
+- **`fbscrape download-media <input.json|dir> [--include-thumbnails] [--concurrency N]`** — async downloader for images / videos / (optional) video thumbnails. Output path defaults to `<input_dir>/media/<handle>/`. Skip-existing on by default. Uses `aiohttp` + `asyncio.Semaphore` — no cookies (fbcdn URLs are self-signed, ~30-day expiry).
+
+#### Richer Post Extraction (`FacebookGraphQLParser.flatten_post`)
+
+Found a bug: `reactions` / `shares` / `top_reactions` were looked up inside each `adaptive_ufi_action_renderers[i].feedback`, but they actually live on the parent `comet_ufi_summary_and_actions_renderer.feedback`. Earlier flattened CSVs had None/empty for all engagement columns — now fixed.
+
+**All 7 reaction types** (Like, Love, Haha, Wow, Sad, Angry, Care) are returned per post. Exploded into individual integer columns (`like`, `love`, `haha`, `wow`, `sad`, `angry`, `care`) that sum to `reactions`. `top_reactions` JSON list removed.
+
+**New columns added:** `permalink_url`, `privacy`, `is_reel`, `is_live`, `video_duration_sec`, `video_views`, `external_urls` (links in post body), `comments` (total count), `top_comments` (list of `{text, author_id, author_name, author_url, created_at, reactions}`), `shared_post_{id,url,created_at,author_id,author_name,text}` (for reshares — from `node.attached_story`).
+
+Note: `privacy_scope` lives in metadata index 1, not 0 (creation_time is at 0) — flatten_post now scans all metadata entries.
+
+#### New Files / Modules
+
+- `fbscrape/downloaders.py` — `extract_media_from_post(post, include_thumbnails)` walks raw GraphQL to find `photo_image.uri`, `all_subattachments[].media.image.uri`, progressive video `.mp4` URLs, and `preferred_thumbnail.image.uri`. `download_media_from_posts(...)` orchestrates the async fetch.
+
+#### Expanded Debug Logging (scroll loop)
+
+Per-iteration `logger.debug` in `user_timeline`'s `while True` loop now shows: before/after `get_posts()` durations, before/after `check_error_conditions()` durations, before/after `scroll()` durations, sleep duration, total iter duration, and — critically — `last_response=HH:MM:SS (Xs ago, threshold=Ns)` so you can see stall onset in real time and calibrate the threshold.
+
+---
 
 ### Session 2 (2026-02-13): WorkerPool Implementation & Bug Fixes
 
@@ -116,6 +154,8 @@ Refactored the Facebook scraper library (`fbscrape`) to create a clean, well-org
 7. **wait_until="domcontentloaded"**: Prevents hangs on Facebook's infinite loading
 8. **Lock for Lazy Init**: Prevents race conditions when using `gather()`
 9. **Rotation Cooldown**: 5-minute lock prevents same account being re-acquired
+10. **Stall Watchdog on GraphQL silence, not post growth**: keyed off `ResponseInterceptor.last_response_time` so it fires whether FB silences the endpoint, returns empty responses, or something else goes wrong downstream. Scroll-count stall check (`no_new_posts_count > 10`) stays — it still correctly signals "end of feed."
+11. **Self-signed fbcdn URLs**: media download needs no cookies/auth. But URLs expire ~30 days post-scrape, so `download-media` should run soon after scraping.
 
 ---
 
@@ -132,7 +172,8 @@ fbscrape/
 ├── exceptions.py        # Custom exceptions
 ├── logger.py            # Loguru-based logging
 ├── models.py            # Query, ScrapingResult with JSON serialization
-├── response.py          # GraphQL interception and parsing
+├── downloaders.py       # Async media downloader (images, videos, thumbnails)
+├── response.py          # GraphQL interception, parsing, flatten_post
 ├── scraper.py           # FacebookScraper high-level API
 ├── utils.py             # Helpers (gather, cookies, etc.)
 ├── worker.py            # Worker for account lifecycle
@@ -177,6 +218,7 @@ await pool.release_account(account.identifier)
 
 ### CLI
 
+Account management:
 ```bash
 fbscrape add --phone +1234567890 --password secret123
 fbscrape add --email user@example.com --password secret123
@@ -184,11 +226,30 @@ fbscrape list -v
 fbscrape stats
 ```
 
+Scraping:
+```bash
+# Single or multiple handles, between two dates
+fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
+fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --end-date 2025-01-01 \
+  --headless --max-sessions 2 --stall-timeout-seconds 300
+```
+
+Post-processing:
+```bash
+# Flatten raw JSON into tabular dataset (csv/jsonl/parquet/all)
+fbscrape flatten data/posts/foo.json --format all
+fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
+
+# Download images/videos/thumbnails (run soon after scraping — URLs expire ~30 days)
+fbscrape download-media data/posts/foo.json --include-thumbnails
+fbscrape download-media data/posts/2025-06-01_2026-02-17/ --concurrency 12
+```
+
 ---
 
 ## TODO / Future Work
 
 - Add more scraping endpoints (Search, GroupTimeline)
-- Add scraping commands to CLI
 - Implement ban detection heuristics
 - Add proxy rotation support
+- Across-session dedupe / resume on stall: today, watchdog saves partial results but a fresh scrape starts from the top. Keep a `seen post_ids` set so a restart skips past known posts to the previous stall frontier.

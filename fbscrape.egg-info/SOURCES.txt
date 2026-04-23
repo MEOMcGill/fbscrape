@@ -1,4 +1,3 @@
-INSTRUCTIONS.md
 LICENSE
 README.md
 pyproject.toml
@@ -8,12 +7,12 @@ fbscrape/accounts_pool.py
 fbscrape/browser_session.py
 fbscrape/cli.py
 fbscrape/db.py
+fbscrape/downloaders.py
 fbscrape/exceptions.py
 fbscrape/logger.py
 fbscrape/models.py
 fbscrape/response.py
 fbscrape/scraper.py
-fbscrape/session.py
 fbscrape/utils.py
 fbscrape/worker.py
 fbscrape/worker_pool.py

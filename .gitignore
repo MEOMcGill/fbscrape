@@ -11,5 +11,6 @@ __pycache__
 
 # Authentication
 auth/*
-db/accounts.db
+db
+meo_facebook_scraper_config.cfg
 #tmp
