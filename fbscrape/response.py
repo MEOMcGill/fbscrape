@@ -267,6 +267,12 @@ class ResponseInterceptor:
         self.last_response_time: datetime | None = None
         self.parser = FacebookGraphQLParser()
         self.page = None
+        # True once any GraphQL response body carries a non-null `viewer` object
+        # (i.e., an authenticated-user context query resolved). Used to detect
+        # login without relying on scrolling or the home feed rendering.
+        self.viewer_seen: bool = False
+        # TEMP: debugging which GraphQL responses are logged-in-only. Remove when done.
+        self.graphql_responses: list[dict] = []
 
     def setup_interception(self, page: Page):
         """
@@ -312,6 +318,26 @@ class ResponseInterceptor:
 
         try:
             body = await response.body()
+            body_text = body.decode("utf-8", errors="replace")
+            # TEMP: capture every GraphQL response body for logged-in detection analysis. Remove when done.
+            self.graphql_responses.append({
+                "url": url,
+                "timestamp": datetime.now(timezone.utc),
+                "body": body_text,
+            })
+            # Detect non-null `data.viewer` — canonical logged-in marker.
+            if not self.viewer_seen:
+                try:
+                    for doc in parse_json_or_jsonl(body_text):
+                        if (
+                            isinstance(doc, dict)
+                            and isinstance(doc.get("data"), dict)
+                            and isinstance(doc["data"].get("viewer"), dict)
+                        ):
+                            self.viewer_seen = True
+                            break
+                except Exception:
+                    pass
             parsed = self.parser.parse_timeline_response(body, url)
             if parsed:
                 self.posts.extend(parsed['posts'])
@@ -330,6 +356,10 @@ class ResponseInterceptor:
         """Check if any GraphQL requests have been intercepted"""
         return self.graphql_request_count > 0
 
+    def has_viewer_response(self) -> bool:
+        """True if any intercepted response body contained a non-null `data.viewer` object."""
+        return self.viewer_seen
+
     def get_graphql_request_count(self) -> int:
         """Get the number of GraphQL requests intercepted"""
         return self.graphql_request_count
@@ -339,3 +369,32 @@ class ResponseInterceptor:
         self.posts = []
         self.graphql_request_count = 0
         self.last_response_time = None
+        self.viewer_seen = False
+        # TEMP: debugging which GraphQL responses are logged-in-only. Remove when done.
+        self.graphql_responses = []
+
+    # TEMP: debugging helper — dump captured GraphQL responses to JSONL. Remove when done.
+    def save_graphql_responses_to_jsonl(self, path: str) -> int:
+        """Write captured GraphQL responses to a JSONL file.
+
+        Each line is `{"url": str, "timestamp": iso8601 str, "body": str}`.
+
+        Args:
+            path: Destination file path. Parent dirs must exist.
+
+        Returns:
+            Number of records written.
+        """
+        count = 0
+        with open(path, "w", encoding="utf-8") as f:
+            for r in self.graphql_responses:
+                ts = r["timestamp"]
+                record = {
+                    "url": r["url"],
+                    "timestamp": ts.isoformat() if isinstance(ts, datetime) else ts,
+                    "body": r["body"],
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
+        logger.info(f"Wrote {count} GraphQL responses to {path}")
+        return count

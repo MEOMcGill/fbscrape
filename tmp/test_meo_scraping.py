@@ -55,9 +55,9 @@ def fetch_meo_facebook_seeds(only_actives: bool = True) -> list[dict]:
     return resp.json()
 
 
-START_DATE = "2024-10-01"
+START_DATE = "2026-04-01"
 END_DATE = "2026-04-17"
-MAX_SESSIONS = 2
+MAX_SESSIONS = 1
 SCROLL_THRESHOLD = 500
 HEADLESS = False
 MOBILE = False

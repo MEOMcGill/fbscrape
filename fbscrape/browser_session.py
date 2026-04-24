@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser, Locator
 from camoufox.async_api import AsyncNewBrowser
 from typing import Optional
+import re
 
 
 class BrowserSession:
@@ -66,85 +67,86 @@ class BrowserSession:
         return False  # Don't suppress exceptions
 
     async def initialize(self):
-        """Initialize browser session with playwright and camoufox"""
+        """Initialize browser session with playwright and camoufox.
+
+        If any step after playwright starts raises, we tear down whatever was
+        created so the caller isn't left with an orphaned browser / playwright
+        handle. (Python does NOT call `__aexit__` when `__aenter__` raises, so
+        the `async with BrowserSession(...) as s` pattern in Worker cannot clean
+        up after an init failure by itself.)
+        """
         logger.debug(f"BrowserSession.initialize() starting for {self.account.display_name}")
         self._pw = await async_playwright().start()
 
-        # Get proxy settings from account
-        proxy_settings = self._get_proxy_dict()
-        logger.debug(f"Proxy settings: {'configured' if proxy_settings else 'none'}")
+        try:
+            # Get proxy settings from account
+            proxy_settings = self._get_proxy_dict()
+            logger.debug(f"Proxy settings: {'configured' if proxy_settings else 'none'}")
 
-        # Create browser context using camoufox
-        self._browser: Browser = await AsyncNewBrowser(
-            playwright=self._pw,
-            humanize=True,
-            headless="virtual" if self.headless else self.headless,
-            proxy=proxy_settings,
-            geoip=True if proxy_settings else False,
-            os=get_device_os(),
-            firefox_user_prefs={
-                "browser.aboutwelcome.enabled": False,
-                "browser.startup.firstrunSkipsHomepage": True,
-                "browser.shell.checkDefaultBrowser": False,
-                "datareporting.policy.dataSubmissionEnabled": False,
+            # Create browser context using camoufox
+            self._browser: Browser = await AsyncNewBrowser(
+                playwright=self._pw,
+                humanize=True,
+                headless="virtual" if self.headless else self.headless,
+                proxy=proxy_settings,
+                geoip=True if proxy_settings else False,
+                os=get_device_os(),
+                firefox_user_prefs={
+                    "browser.aboutwelcome.enabled": False,
+                    "browser.startup.firstrunSkipsHomepage": True,
+                    "browser.shell.checkDefaultBrowser": False,
+                    "datareporting.policy.dataSubmissionEnabled": False,
 
-                # memory saving attributes - suggested by Claude
-                "browser.cache.disk.enable": False,
-                "browser.cache.memory.capacity": 0,
-                "browser.sessionhistory.max_entries": 2,
-                "browser.sessionhistory.max_total_viewers": 0,
-                "dom.ipc.processCount.webIsolated": 1,
-            }
-        )
+                    # memory saving attributes - suggested by Claude
+                    "browser.cache.disk.enable": False,
+                    "browser.cache.memory.capacity": 0,
+                    "browser.sessionhistory.max_entries": 2,
+                    "browser.sessionhistory.max_total_viewers": 0,
+                    "dom.ipc.processCount.webIsolated": 1,
+                }
+            )
 
-        self._context: BrowserContext = await self._browser.new_context()
-        logger.debug("Browser context created")
+            self._context: BrowserContext = await self._browser.new_context()
+            logger.debug("Browser context created")
 
-        # Create page
-        self.page = await self._context.new_page()
-        logger.debug("Page created")
+            # Create page
+            self.page = await self._context.new_page()
+            logger.debug("Page created")
 
-        # To-do: Workaround for camoufox issue #473: br/zstd decompression broken
-        await self.page.set_extra_http_headers({"Accept-Encoding": "gzip, deflate"})
+            # To-do: Workaround for camoufox issue #473: br/zstd decompression broken
+            await self.page.set_extra_http_headers({"Accept-Encoding": "gzip, deflate"})
 
-        # Set up a response interceptor
-        self.response_interceptor = ResponseInterceptor()
-        self.response_interceptor.setup_interception(self.page)
+            # Set up a response interceptor
+            self.response_interceptor = ResponseInterceptor()
+            self.response_interceptor.setup_interception(self.page)
 
-        # Inject cookies from account if available (already in Playwright format)
-        if self.account.cookies:
-            logger.debug(f"Account has {len(self.account.cookies)} cookies, injecting...")
+            # Inject cookies from account if available (already in Playwright format)
+            if self.account.cookies:
+                logger.debug(f"Account has {len(self.account.cookies)} cookies, injecting...")
+                try:
+                    await self._context.add_cookies(self.account.cookies)
+                    logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.display_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
+            else:
+                logger.debug("No cookies available, attempting login...")
+
+            # Fast happy-path: cookies worked, we're in.
+            if await self.check_logged_in(timeout=5.0):
+                await self._on_login_success()
+                logger.info(f"Browser session initialized for {self.account.display_name} (already logged in)")
+                return
+
+            # Not logged in — delegate to the full recovery flow (obstacle handlers + fallback).
+            await self._resolve_not_logged_in()
+            logger.info(f"Browser session initialized for {self.account.display_name}")
+        except BaseException:
+            logger.debug(f"BrowserSession.initialize() failed for {self.account.display_name}, cleaning up")
             try:
-                await self._context.add_cookies(self.account.cookies)
-                logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.display_name}")
-            except Exception as e:
-                logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
-        else:
-            logger.debug("No cookies available, attempting login...")
-            successful_login = await self.login()
-            if not successful_login:
-                raise FailedLoginError(f"Failed to login for {self.account.display_name}")
-
-        await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
-        pass
-
-        try:
-            await self.page.get_by_role('button', name='Continue').click(timeout=3000)
-            logger.debug("Clicked post-login 'Continue' button")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
-            pass  # button not shown this time — no-op
-
-        try:
-            await self.page.get_by_role('button', name=f'Continue as {self.account.display_name}').click(timeout=3000)
-            logger.debug(f"Clicked post-login 'Continue as {self.account.display_name}' button")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
-            pass  # button not shown this time — no-op
-
-        logger.info(f"Browser session initialized for {self.account.display_name}")
+                await self.close()
+            except Exception as cleanup_err:
+                logger.warning(f"Error during init-failure cleanup for {self.account.display_name}: {cleanup_err}")
+            raise
 
     async def close(self):
         """Close browser session and cleanup resources"""
@@ -162,6 +164,45 @@ class BrowserSession:
         logger.info(f"Browser session closed for {self.account.display_name}")
 
     # ==================== Authentication ====================
+    async def _continue_to_login_is_visible(self):
+        try:
+            await self.page.get_by_label("Continue", exact=False).wait_for(state="visible", timeout=3000)
+            logger.debug("Continue for login is visible")
+            return True
+        except Exception as e:
+            logger.debug(f"Continue for login is not visible: {e}")
+            return False
+
+    async def pass_continue_button(self):
+        # click on the 'Continue' button if it's there
+        try:
+            await self.page.get_by_label("Continue", exact=False).click(timeout=3000)
+            logger.debug("Clicked post-login 'Continue' button")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
+            return
+
+        # insert the password for the login
+        try:
+            await self._human_type(
+                self.page.get_by_role("textbox", name="Password"),
+                self.account.password
+            )
+            logger.debug("Filled post-login 'Password' field")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to fill post-login 'Password' field: {e}")
+            return
+
+        # press login button
+        try:
+            await self.page.get_by_role("button", name="Log in", exact=True).click(timeout=3000)
+            logger.debug("Clicked post-login 'Log in' button")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to click post-login 'Log in' button: {e}")
+            return
 
     async def login(self) -> bool:
         """
@@ -174,6 +215,7 @@ class BrowserSession:
         # Check if already logged in
         if await self.check_logged_in(timeout=5.0):
             logger.debug("Already logged in")
+            await self._on_login_success()
             return True
 
         # Decline cookies popup
@@ -190,14 +232,16 @@ class BrowserSession:
         try:
             # Fill username with human-like typing
             await self._human_type(
-                self.page.get_by_label('Email or phone number'),
+                self.page.get_by_role('textbox', name='Email or mobile number'), # they iterate between 'phone number' and 'mobile number'
                 self.account.identifier
             )
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-            # Fill password with human-like typing
+            # Fill password with human-like typing.
+            # Use role-based textbox selector: `get_by_label("Password")` also matches
+            # the "Show password" button (role=button) which shares the same label.
             await self._human_type(
-                self.page.get_by_label('Password'),
+                self.page.get_by_role("textbox", name="Password"),
                 self.account.password
             )
             await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -213,20 +257,7 @@ class BrowserSession:
 
             # Check if login was successful
             if await self.check_logged_in(timeout=10.0):
-                # Save cookies after successful login
-                await self.save_cookies()
-                # Mark account as active and clear any previous error message
-                await self.pool.set_active(self.account.identifier, True, None)
-                # Reset scroll_count_overall_24h if last_used was over 24h ago
-                if self.account.last_used:
-                    time_since_last_used = datetime.now(timezone.utc) - self.account.last_used.replace(tzinfo=timezone.utc)
-                    if time_since_last_used > timedelta(hours=24):
-                        await self.pool.reset_scroll_counts(self.account.identifier)
-                        logger.info(f"Reset scroll counts for {self.account.display_name} (last used {time_since_last_used} ago)")
-                # Update last_used timestamp
-                await self.pool.update_last_used(self.account.identifier)
-                # Clear any post-login popups
-                await self._clear_post_login_popups()
+                await self._on_login_success()
                 logger.info(f"Login successful for {self.account.display_name}")
                 return True
             else:
@@ -243,14 +274,18 @@ class BrowserSession:
 
     async def check_logged_in(self, timeout: float = 10.0) -> bool:
         """
-        Check if logged in by navigating to facebook.com and checking for GraphQL activity.
-        Updates last_used on successful login.
+        Check if logged in by navigating to facebook.com and waiting for a GraphQL
+        response whose body carries a non-null `data.viewer` object. `viewer` is
+        Facebook's authenticated-user context — queries referencing it only resolve
+        when a live session exists; the Continue/login pages don't answer them.
+        This is DOM-independent and, unlike post-bearing responses, doesn't require
+        the home feed to render (which may not fire without a scroll).
 
         Args:
-            timeout: Max seconds to wait for GraphQL responses
+            timeout: Max seconds to wait for a viewer-bearing GraphQL response
 
         Returns:
-            True if GraphQL activity detected (logged in), False otherwise
+            True if a viewer-bearing response was intercepted (logged in), False otherwise
         """
         logger.debug(f"check_logged_in() with timeout={timeout}s")
         # Create a temporary interceptor for this check
@@ -260,17 +295,23 @@ class BrowserSession:
         try:
             await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
 
-            # Wait for GraphQL activity in intercepted responses
+            # Wait for a viewer-bearing GraphQL response (authenticated user context)
             elapsed = 0.0
             interval = 0.5
             while elapsed < timeout:
-                if temp_interceptor.has_graphql_activity():
-                    logger.info(f"Logged in: intercepted {temp_interceptor.get_graphql_request_count()} GraphQL requests")
+                if temp_interceptor.has_viewer_response():
+                    logger.info(
+                        f"Logged in: viewer-bearing response intercepted "
+                        f"({temp_interceptor.get_graphql_request_count()} GraphQL responses seen)"
+                    )
                     return True
                 await asyncio.sleep(interval)
                 elapsed += interval
 
-            logger.warning(f"Not logged in: no GraphQL activity after {timeout}s")
+            logger.warning(
+                f"Not logged in: no viewer-bearing GraphQL response after {timeout}s "
+                f"({temp_interceptor.get_graphql_request_count()} generic GraphQL responses seen)"
+            )
             return False
         finally:
             temp_interceptor.stop_interception()
@@ -285,6 +326,67 @@ class BrowserSession:
         cookies = await self.get_cookies()
         await self.pool.update_cookies(self.account.identifier, cookies)
         logger.info(f"Saved cookies for {self.account.display_name}")
+
+    async def _on_login_success(self):
+        """Post-successful-login bookkeeping: persist cookies, mark account active,
+        reset stale scroll counts, update last_used, and clear post-login popups."""
+        # Save cookies after successful login
+        await self.save_cookies()
+        # Mark account as active and clear any previous error message
+        await self.pool.set_active(self.account.identifier, True, None)
+        # Reset scroll_count_overall_24h if last_used was over 24h ago
+        if self.account.last_used:
+            time_since_last_used = datetime.now(timezone.utc) - self.account.last_used.replace(tzinfo=timezone.utc)
+            if time_since_last_used > timedelta(hours=24):
+                await self.pool.reset_scroll_counts(self.account.identifier)
+                logger.info(f"Reset scroll counts for {self.account.display_name} (last used {time_since_last_used} ago)")
+        # Update last_used timestamp
+        await self.pool.update_last_used(self.account.identifier)
+        # Clear any post-login popups
+        await self._clear_post_login_popups()
+
+    async def _resolve_not_logged_in(self):
+        """Handle all known 'not-yet-logged-in' states after cookie injection.
+
+        Tries each registered obstacle handler in order. Each handler self-detects
+        its case and, if matched, performs the recovery action. After any match we
+        re-verify with `check_logged_in` (GraphQL-based, DOM-independent). If no
+        handler succeeds in getting us logged in, we fall back to the last resort:
+        wipe cookies and run the full `login()` form flow.
+
+        To add a new obstacle, define `_handle_<case>(self) -> bool` that returns
+        True iff it matched, and register it in `obstacle_handlers` below.
+
+        Raises:
+            FailedLoginError: if no handler and no fallback resulted in a login.
+        """
+        obstacle_handlers = [
+            self._handle_continue_interstitial,
+            # future: self._handle_2fa_challenge,
+            # future: self._handle_checkpoint,
+        ]
+
+        for handler in obstacle_handlers:
+            if not await handler():
+                continue
+            logger.info(f"Login obstacle matched by {handler.__name__}")
+            if await self.check_logged_in(timeout=10.0):
+                await self._on_login_success()
+                return
+            logger.warning(f"{handler.__name__} ran but login still not confirmed")
+
+        # Last resort: wipe cookies and run the full login form flow.
+        logger.warning(f"No obstacle handler succeeded — falling back to full login for {self.account.display_name}")
+        await self._context.clear_cookies()
+        if not await self.login():
+            raise FailedLoginError(f"Failed to login for {self.account.display_name}")
+
+    async def _handle_continue_interstitial(self) -> bool:
+        """Facebook 'Continue' re-auth screen: click Continue, submit password, click Log in."""
+        if not await self._continue_to_login_is_visible():
+            return False
+        await self.pass_continue_button()
+        return True
 
     # ==================== Scraping ====================
 
@@ -524,6 +626,7 @@ class BrowserSession:
             self.page.get_by_role("button", name="Retry")
             .or_(self.page.get_by_role("button", name="Reload page"))
             .or_(self.page.get_by_text("Profile isn't available"))
+            .or_(self.page.get_by_text("This content isn't available right now"))
             .or_(self.page.get_by_text("Sorry, this page isn't available"))
             .or_(self.page.get_by_text("No Posts Yet"))
             .or_(self.page.get_by_text("This account is private"))
@@ -560,6 +663,9 @@ class BrowserSession:
 
         if await self.page.get_by_text("This account is private").count() > 0:
             return 'account is private'
+
+        if await self.page.get_by_text("This content isn't available right now").count() > 0:
+            return 'content not available'
 
         return None
 
