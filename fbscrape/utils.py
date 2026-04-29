@@ -2,6 +2,7 @@
 Utility functions for Facebook scraping
 """
 import base64
+import dataclasses
 import os
 import platform
 from pathlib import Path
@@ -10,6 +11,9 @@ import requests
 from datetime import datetime, timedelta, timezone
 import json
 import asyncio
+
+from browserforge.fingerprints import Fingerprint, FingerprintGenerator
+from browserforge.fingerprints.generator import ScreenFingerprint, NavigatorFingerprint, VideoCard
 
 
 def get_device_os() -> str:
@@ -26,6 +30,53 @@ def get_device_os() -> str:
         return "windows"
     else:
         return "linux"
+
+
+def generate_fingerprint(os_name: str | None = None) -> Fingerprint:
+    """Generate a Firefox-based browserforge Fingerprint for the given OS.
+
+    Camoufox is Firefox-based and rejects non-Firefox fingerprints, so we
+    constrain `browser` to firefox. Defaults to the current host OS.
+    """
+    os_name = os_name or get_device_os()
+    return FingerprintGenerator(browser=("firefox",), os=(os_name,)).generate()
+
+
+def serialize_fingerprint(fp: Fingerprint) -> str:
+    """Serialize a Fingerprint to a JSON string (storable in SQLite TEXT)."""
+    return json.dumps(dataclasses.asdict(fp))
+
+
+def deserialize_fingerprint(s: str) -> Fingerprint:
+    """Rehydrate a Fingerprint from its serialized JSON.
+
+    Nested dataclass fields (`screen`, `navigator`, `videoCard`) must be
+    reconstructed explicitly — camoufox does attribute access on them
+    (e.g. `fingerprint.navigator.userAgent`), so leaving them as dicts
+    produces an AttributeError at launch time.
+    """
+    data = json.loads(s)
+    data["screen"] = ScreenFingerprint(**data["screen"])
+    data["navigator"] = NavigatorFingerprint(**data["navigator"])
+    if data.get("videoCard") is not None:
+        data["videoCard"] = VideoCard(**data["videoCard"])
+    return Fingerprint(**data)
+
+
+def fingerprint_os(fp: Fingerprint) -> str | None:
+    """Infer which OS a Fingerprint was generated for from `navigator.userAgent`.
+
+    Returns 'macos' / 'windows' / 'linux' or None if the UA is unrecognized.
+    """
+    ua = (fp.navigator.userAgent or "").lower()
+    if "macintosh" in ua or "mac os" in ua:
+        return "macos"
+    if "windows" in ua:
+        return "windows"
+    if "linux" in ua or "x11" in ua:
+        return "linux"
+    return None
+
 
 class utc:
     @staticmethod

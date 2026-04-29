@@ -157,6 +157,8 @@ Refactored the Facebook scraper library (`fbscrape`) to create a clean, well-org
 10. **Stall Watchdog on GraphQL silence, not post growth**: keyed off `ResponseInterceptor.last_response_time` so it fires whether FB silences the endpoint, returns empty responses, or something else goes wrong downstream. Scroll-count stall check (`no_new_posts_count > 10`) stays — it still correctly signals "end of feed."
 11. **Self-signed fbcdn URLs**: media download needs no cookies/auth. But URLs expire ~30 days post-scrape, so `download-media` should run soon after scraping.
 
+For account state, lifecycle, and exception → DB-write semantics, see [`docs/account_management.md`](docs/account_management.md).
+
 ---
 
 ## File Structure
@@ -253,3 +255,5 @@ fbscrape download-media data/posts/2025-06-01_2026-02-17/ --concurrency 12
 - Implement ban detection heuristics
 - Add proxy rotation support
 - Across-session dedupe / resume on stall: today, watchdog saves partial results but a fresh scrape starts from the top. Keep a `seen post_ids` set so a restart skips past known posts to the previous stall frontier.
+- **External watchdog task for hang detection.** Today the in-loop stall watchdog can't fire if an `await` itself is stuck — both the watchdog code and the hung await live in the same task. Current mitigation (`OPERATION_TIMEOUT_SECONDS = 30` in `BrowserSession`) wraps each known-risky await (`scroll()`, `check_error_conditions()`) in `asyncio.wait_for`, but it's a per-call patch — any *new* await we add in the loop is unprotected by default. Proper fix: run `user_timeline`'s loop as a child `asyncio.Task` with a sibling watchdog task that owns the GraphQL-silence + wall-clock checks and calls `task.cancel()` when conditions fire. Cancellation breaks any pending await regardless of where it's stuck. Convert the per-call timeouts into a single watchdog at the task boundary.
+- **Dedicated exception for renderer hangs.** The per-call `asyncio.wait_for` sites currently encode the hang as a `result='hang: ...'` string on the returned `ScrapingResult`. Stringly-typed — workers can't pattern-match on it without parsing prefixes. Add a `RendererHangError` (or similar) in `fbscrape/exceptions.py`, raise it from the timed-out call sites, and let `Worker` catch it explicitly to decide rotation/cooldown policy (e.g., this account's browser is wedged → close + rotate, distinct from a logged-out or rate-limited account). Pairs naturally with the external-watchdog refactor above: the watchdog raises this exception when it cancels the scrape task.

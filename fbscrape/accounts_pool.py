@@ -442,6 +442,13 @@ class AccountsPool:
         await execute(self._db_file, qs, {"cookies": cookies_json})
         logger.info(f"Updated cookies for {identifier} ({len(cookies)} cookies)")
 
+    async def update_fingerprint(self, identifier: str, fingerprint_json: str):
+        """Persist a serialized browserforge Fingerprint for an account."""
+        logger.debug(f"update_fingerprint({identifier}, {len(fingerprint_json)} bytes)")
+        qs = f"UPDATE accounts SET fingerprint = :fp WHERE {self._identifier_condition(identifier)}"
+        await execute(self._db_file, qs, {"fp": fingerprint_json})
+        logger.info(f"Updated fingerprint for {identifier}")
+
     async def update_last_used(self, identifier: str):
         """Update last_used timestamp for an account"""
         qs = f"UPDATE accounts SET last_used = datetime({utc.ts()}, 'unixepoch') WHERE {self._identifier_condition(identifier)}"

@@ -13,9 +13,12 @@ from .account import Account
 from .browser_session import BrowserSession
 from .exceptions import (
     AccountBannedError,
+    AccountDisabledError,
+    CheckpointError,
     FailedLoginError,
     NoAccountError,
     RateLimitError,
+    TransientLoginError,
 )
 from .logger import logger
 from .models import Query, ScrapingResult
@@ -214,6 +217,29 @@ class Worker:
         Raises:
             NoAccountError: If no account available after rotation attempt
         """
+        # A previous task's rotate_account() may have raised NoAccountError (pool
+        # empty at that moment) and left current_account = None. Recover by
+        # acquiring an account here. Use get_available_or_wait so we BLOCK while
+        # accounts exist but are merely locked (cooldown / rate-limit), and
+        # FAIL FAST only when there are no active accounts at all (everything
+        # banned or checkpointed — no point waiting in that case).
+        if self.current_account is None:
+            logger.warning(
+                f"Worker {self.id}: no current account; waiting for one to become available"
+            )
+            account = await self.pool.get_available_or_wait()
+            if account is None:
+                # No active accounts in the pool (all banned/checkpointed).
+                raise NoAccountError(
+                    f"Worker {self.id}: no active accounts available for task"
+                )
+            self.current_account = account
+            self.scroll_count = 0
+            self._initialized = True
+            logger.info(
+                f"Worker {self.id} resumed with account {self.current_account.display_name}"
+            )
+
         # Check scroll threshold BEFORE task
         if self.scroll_count >= self.scroll_threshold:
             logger.info(
@@ -253,7 +279,40 @@ class Worker:
 
                     return result
 
+            except AccountDisabledError as e:
+                # Detector (_wait_for_log_in_outcome) already wrote a specific error_msg
+                # and marked the account inactive. Rotate to a fresh account but do NOT
+                # increment retry_count — a dead account shouldn't burn our retry budget.
+                logger.error(
+                    f"Worker {self.id}: account {self.current_account.display_name} is "
+                    f"permanently disabled (url={e.url}); rotating without counting as retry"
+                )
+                await self.rotate_account()
+
+            except CheckpointError as e:
+                # Detector already wrote error_msg + marked inactive. Needs manual action
+                # to recover; try a different account for this task.
+                logger.warning(
+                    f"Worker {self.id}: checkpoint challenge on {self.current_account.display_name} "
+                    f"(url={e.url}); rotating"
+                )
+                await self.rotate_account()
+                retry_count += 1
+
+            except TransientLoginError as e:
+                # Unexpected error inside login() that both internal attempts couldn't recover.
+                # Probably a transient playwright / page issue — do NOT mark this account
+                # inactive. Rotate to a different account and count as a retry.
+                logger.warning(
+                    f"Worker {self.id}: transient login error on {self.current_account.display_name}: "
+                    f"{e} — rotating (account stays active)"
+                )
+                await self.rotate_account()
+                retry_count += 1
+
             except FailedLoginError as e:
+                # Generic login failure — detector may not have written DB (e.g. form
+                # submit silently failed), so mark inactive here as the safety net.
                 logger.warning(
                     f"Worker {self.id}: login failed for {self.current_account.display_name}, "
                     f"marking inactive and rotating"

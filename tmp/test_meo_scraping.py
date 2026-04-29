@@ -6,11 +6,8 @@ Equivalent of:
 """
 
 import asyncio
-import configparser
 import os
-from urllib.parse import urljoin
 import json
-import requests
 
 from fbscrape.accounts_pool import AccountsPool
 from fbscrape.logger import set_log_level
@@ -18,46 +15,43 @@ from fbscrape.models import ScrapingResult
 from fbscrape.scraper import FacebookScraper
 from fbscrape.utils import gather, get_home_dir_path
 
-MEO_CONFIG_PATH = os.path.join(
-    get_home_dir_path(), "meo_facebook_scraper_config.cfg"
+SEEDS_FILE = os.path.join(
+    get_home_dir_path(), "data", "seeds", "facebook_politicians.jsonl"
 )
 
 
-def fetch_meo_facebook_seeds(only_actives: bool = True) -> list[dict]:
+def load_facebook_seeds(only_actives: bool = True) -> list[dict]:
     """
-    Fetch MEO's Facebook seed list from the MEO API.
+    Load Facebook seeds from the local JSONL file produced by the elastic
+    export (see /Users/mikad/MEOMcGill/fbscrape/data/seeds/facebook_politicians.jsonl).
 
-    Credentials and base URL are read from the `[meo-api-credentials]` section
-    of `meo_facebook_scraper_config.cfg`.
+    The JSONL records have shape `{user_id, user_name, seed: {...}}` where
+    `seed` carries the same fields the MEO API's /phh/seedlist returned.
+    This function returns the flat `seed` dicts so downstream code that
+    reads `s["ID"]`, `s["Handle"]`, `s["MainType"]`, etc. keeps working.
 
-    Returns the raw seed records (list of dicts with ID, SeedName, Handle,
-    MainType, Collection, HandleStatus, InfoStartDate, InfoEndDate, etc.).
+    When only_actives=True, keep only rows where both SeedStatus and
+    HandleStatus equal 1 (matches the server-side `only_actives` filter).
     """
-    cfg = configparser.ConfigParser()
-    cfg.read(MEO_CONFIG_PATH)
-    username = cfg["meo-api-credentials"]["username"]
-    password = cfg["meo-api-credentials"]["password"]
-    base_url = cfg["meo-api-credentials"]["domain"]
-
-    login = requests.post(
-        urljoin(base_url, "/meologin"),
-        params={"username": username, "password": password},
-    )
-    login.raise_for_status()
-    token = login.json()["access_token"]
-
-    resp = requests.get(
-        urljoin(base_url, "/phh/seedlist"),
-        params={"query": "Platform:facebook", "only_actives": only_actives},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    resp.raise_for_status()
-    return resp.json()
+    seeds: list[dict] = []
+    with open(SEEDS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            seed = record.get("seed", {})
+            if only_actives and (
+                seed.get("SeedStatus") != 1 or seed.get("HandleStatus") != 1
+            ):
+                continue
+            seeds.append(seed)
+    return seeds
 
 
-START_DATE = "2026-04-01"
+START_DATE = "2024-10-01"
 END_DATE = "2026-04-17"
-MAX_SESSIONS = 1
+MAX_SESSIONS = 3
 SCROLL_THRESHOLD = 500
 HEADLESS = False
 MOBILE = False
@@ -83,7 +77,7 @@ async def main():
         id_str, _, handle = prefix.partition("_")
         if id_str.isdigit() and handle:
             already_scraped.add((int(id_str), handle))
-    SEEDS = fetch_meo_facebook_seeds()
+    SEEDS = load_facebook_seeds(only_actives=True)
     SEEDS = [
         s for s in SEEDS
         if s["MainType"] == "politician"

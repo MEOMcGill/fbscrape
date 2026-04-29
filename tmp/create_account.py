@@ -49,7 +49,7 @@ async def main(output_path: str):
         # Set breakpoint here - create your account manually, then continue
         logger.info("\n" + "="*60)
         logger.info("Browser is open. Create your account now.")
-        logger.info("When done, press Enter to save cookies and exit.")
+        logger.info("When done, press 'c' to save cookies and exit.")
         logger.info("="*60 + "\n")
 
         breakpoint()
