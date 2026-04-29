@@ -159,6 +159,10 @@ Refactored the Facebook scraper library (`fbscrape`) to create a clean, well-org
 
 For account state, lifecycle, and exception → DB-write semantics, see [`docs/account_management.md`](docs/account_management.md).
 
+For ideas to improve scrape speed and reduce memory footprint (date/year filters, GraphQL cursor replay, DOM cleanup, etc.), see [`docs/speed_and_memory.md`](docs/speed_and_memory.md).
+
+For the active investigation into whether direct GraphQL replay (Path B) is viable, see [`docs/path_b_investigation.md`](docs/path_b_investigation.md). The investigation requires a temporary network capture instrumentation in `response.py` + `browser_session.py` (search `# TEMP:` for the affected blocks); these should be removed when the investigation concludes.
+
 ---
 
 ## File Structure
@@ -222,10 +226,10 @@ await pool.release_account(account.identifier)
 
 Account management:
 ```bash
-fbscrape add --phone +1234567890 --password secret123
-fbscrape add --email user@example.com --password secret123
-fbscrape list -v
-fbscrape stats
+fbscrape account add --phone +1234567890 --password secret123
+fbscrape account add --email user@example.com --password secret123
+fbscrape account list -v
+fbscrape account stats
 ```
 
 Scraping:

@@ -18,6 +18,7 @@ from .utils import (
 from .exceptions import FailedLoginError, CheckpointError, AccountDisabledError, TransientLoginError
 
 import asyncio
+import os
 import random
 from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser, Locator
@@ -220,6 +221,20 @@ class BrowserSession:
         """Close browser session and cleanup resources"""
         logger.debug(f"BrowserSession.close() for {self.account.display_name}")
         if self.response_interceptor:
+            # TEMP: Path B investigation. If FB_NETWORK_CAPTURE_DIR is set, dump the
+            # captured XHR (request + response) to a JSONL file before tearing down.
+            # See docs/path_b_investigation.md. Remove this block when done.
+            capture_dir = os.environ.get("FB_NETWORK_CAPTURE_DIR")
+            if capture_dir and self.response_interceptor.network_capture:
+                try:
+                    os.makedirs(capture_dir, exist_ok=True)
+                    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", self.account.identifier or "unknown")
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    out_path = os.path.join(capture_dir, f"network_{ts}_{safe_id}.jsonl")
+                    n = self.response_interceptor.save_network_capture_to_jsonl(out_path)
+                    logger.info(f"[CAPTURE] Wrote {n} XHR records to {out_path}")
+                except Exception as e:
+                    logger.warning(f"[CAPTURE] Failed to dump network capture: {e}")
             logger.debug("Stopping response interceptor")
             self.response_interceptor.stop_interception()
         if self._browser:
@@ -859,7 +874,7 @@ class BrowserSession:
             self.page.get_by_role("button", name="Retry")
             .or_(self.page.get_by_role("button", name="Reload page"))
             .or_(self.page.get_by_text("Profile isn't available"))
-            .or_(self.page.get_by_text("This content isn't available right now"))
+            .or_(self.page.get_by_text("This content isn't available"))
             .or_(self.page.get_by_text("Sorry, this page isn't available"))
             .or_(self.page.get_by_text("No Posts Yet"))
             .or_(self.page.get_by_text("This account is private"))

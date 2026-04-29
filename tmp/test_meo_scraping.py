@@ -51,7 +51,7 @@ def load_facebook_seeds(only_actives: bool = True) -> list[dict]:
 
 START_DATE = "2024-10-01"
 END_DATE = "2026-04-17"
-MAX_SESSIONS = 3
+MAX_SESSIONS = 5
 SCROLL_THRESHOLD = 500
 HEADLESS = False
 MOBILE = False

@@ -29,9 +29,15 @@ def cli(ctx, db):
     ctx.obj['db'] = db or get_default_db()
 
 
+@cli.group()
+def account():
+    """Manage scraper accounts"""
+    pass
+
+
 # ============== Account Management ==============
 
-@cli.command()
+@account.command()
 @click.option('--email', default=None, help='Account email')
 @click.option('--phone', default=None, help='Account phone number')
 @click.option('--password', required=True, help='Account password')
@@ -75,7 +81,7 @@ def add(ctx, email, phone, password, username, email_password, proxy, proxy_user
     run_async(_add())
 
 
-@cli.command()
+@account.command(name='add-from-file')
 @click.argument('filepath')
 @click.option('--format', 'fmt', default='email:password',
               help='Line format (e.g., "email:password" or "phone:password:email_password")')
@@ -141,7 +147,7 @@ def add_from_file(ctx, filepath, fmt):
     run_async(_add())
 
 
-@cli.command()
+@account.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'delete_all', is_flag=True, help='Delete all accounts')
 @click.option('--inactive', is_flag=True, help='Delete only inactive accounts')
@@ -181,7 +187,7 @@ def delete(ctx, identifier, delete_all, inactive):
     run_async(_delete())
 
 
-@cli.command(name='list')
+@account.command(name='list')
 @click.option('--active', is_flag=True, help='Show only active accounts')
 @click.option('--inactive', is_flag=True, help='Show only inactive accounts')
 @click.option('--verbose', '-v', is_flag=True, help='Show all fields')
@@ -234,7 +240,7 @@ def list_accounts(ctx, active, inactive, verbose):
     run_async(_list())
 
 
-@cli.command()
+@account.command()
 @click.argument('identifier')
 @click.pass_context
 def info(ctx, identifier):
@@ -265,7 +271,7 @@ def info(ctx, identifier):
     run_async(_info())
 
 
-@cli.command()
+@account.command()
 @click.pass_context
 def stats(ctx):
     """Show account pool statistics"""
@@ -295,7 +301,7 @@ def stats(ctx):
 
 # ============== Account Status ==============
 
-@cli.command()
+@account.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'set_all', is_flag=True, help='Set all accounts')
 @click.pass_context
@@ -313,7 +319,7 @@ def activate(ctx, identifier, set_all):
     run_async(_activate())
 
 
-@cli.command()
+@account.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'set_all', is_flag=True, help='Set all accounts')
 @click.option('--error', default=None, help='Error message to set')
@@ -332,7 +338,7 @@ def deactivate(ctx, identifier, set_all, error):
     run_async(_deactivate())
 
 
-@cli.command()
+@account.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'reset_all', is_flag=True, help='Reset all accounts')
 @click.pass_context
@@ -350,7 +356,7 @@ def unlock(ctx, identifier, reset_all):
     run_async(_unlock())
 
 
-@cli.command()
+@account.command()
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'release_all', is_flag=True, help='Release all accounts')
 @click.pass_context
@@ -370,7 +376,7 @@ def release(ctx, identifier, release_all):
 
 # ============== Field Management ==============
 
-@cli.command(name='set')
+@account.command(name='set')
 @click.argument('identifier')
 @click.argument('field')
 @click.argument('value')
@@ -391,10 +397,10 @@ def set_field(ctx, identifier, field, value):
 
     \b
     Examples:
-      fbscrape set user@example.com username myusername
-      fbscrape set user@example.com active true
-      fbscrape set user@example.com proxy_server http://proxy:8080
-      fbscrape set user@example.com error_msg null
+      fbscrape account set user@example.com username myusername
+      fbscrape account set user@example.com active true
+      fbscrape account set user@example.com proxy_server http://proxy:8080
+      fbscrape account set user@example.com error_msg null
     """
     async def _set():
         pool = AccountsPool(ctx.obj['db'])
@@ -416,11 +422,11 @@ def set_field(ctx, identifier, field, value):
     run_async(_set())
 
 
-@cli.command(name='fields')
+@account.command(name='fields')
 def list_fields():
     """List all updatable fields for the 'set' command"""
     fields = sorted(AccountsPool._updatable_fields)
-    click.echo("Updatable fields for 'fbscrape set':")
+    click.echo("Updatable fields for 'fbscrape account set':")
     click.echo("-" * 35)
     for f in fields:
         click.echo(f"  {f}")
@@ -428,7 +434,7 @@ def list_fields():
 
 # ============== Scroll Management ==============
 
-@cli.command()
+@account.command(name='reset-scrolls')
 @click.argument('identifier', nargs=-1)
 @click.option('--all', 'reset_all', is_flag=True, help='Reset all accounts')
 @click.option('--endpoint', default=None, help='Reset only specific endpoint')
@@ -454,7 +460,7 @@ def reset_scrolls(ctx, identifier, reset_all, endpoint):
 
 # ============== Cookie Management ==============
 
-@cli.command()
+@account.command(name='set-cookies')
 @click.argument('identifier')
 @click.argument('cookies_file')
 @click.pass_context
@@ -475,7 +481,7 @@ def set_cookies(ctx, identifier, cookies_file):
     run_async(_set())
 
 
-@cli.command()
+@account.command(name='export-cookies')
 @click.argument('identifier')
 @click.argument('output_file')
 @click.pass_context
