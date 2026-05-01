@@ -51,6 +51,7 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        raise_when_no_account: bool = True,
     ):
         """
         Initialize Worker with configuration only.
@@ -63,12 +64,19 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
+            raise_when_no_account: If True (default), `initialize()` uses
+                `get_available()` and returns False on empty pool so callers
+                raise NoAccountError. If False, `initialize()` uses
+                `get_available_or_wait()` and blocks (polling every 5s) until
+                an account frees up; only returns False when the pool has zero
+                active accounts (everything banned/inactive).
         """
         self.id = id
         self.pool = pool
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
+        self.raise_when_no_account = raise_when_no_account
 
         # State set during initialize()
         self.current_account: Optional[Account] = None
@@ -83,6 +91,8 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        raise_when_no_account: bool = True,
+        raise_at_startup: bool | None = None,
     ) -> "Worker":
         """
         Factory method to create and initialize a Worker.
@@ -93,6 +103,13 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
+            raise_when_no_account: persistent flag — see Worker.__init__. Used
+                for *future* initialize() calls (e.g. during rotation).
+            raise_at_startup: one-shot override for THIS create's initialize()
+                call only. Defaults to `raise_when_no_account`. Used by
+                WorkerPool to fail-fast on extra workers at startup while
+                still letting the persistent flag honor user wait preference
+                during rotations.
 
         Returns:
             Initialized Worker instance
@@ -100,15 +117,20 @@ class Worker:
         Raises:
             NoAccountError: If no account available in pool
         """
-        logger.debug(f"Worker.create({id}): creating with scroll_threshold={scroll_threshold}, headless={headless}")
+        logger.debug(
+            f"Worker.create({id}): creating with scroll_threshold={scroll_threshold}, "
+            f"headless={headless}, raise_when_no_account={raise_when_no_account}, "
+            f"raise_at_startup={raise_at_startup}"
+        )
         instance = cls(
             id=id,
             pool=pool,
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
+            raise_when_no_account=raise_when_no_account,
         )
-        success = await instance.initialize()
+        success = await instance.initialize(raise_override=raise_at_startup)
         if not success:
             raise NoAccountError(f"Worker {id}: no account available")
         return instance
@@ -126,15 +148,33 @@ class Worker:
         await self.close()
         return False  # Don't suppress exceptions
 
-    async def initialize(self) -> bool:
+    async def initialize(self, raise_override: bool | None = None) -> bool:
         """
         Initialize worker by acquiring an account from the pool.
+
+        With `raise_when_no_account=False`, blocks (polling every 5s) until an
+        account frees up. Returns False only when the pool has zero active
+        accounts (everything banned) — that's not a transient state.
+
+        Args:
+            raise_override: one-shot override for `self.raise_when_no_account`.
+                If None (default), use the persistent flag. WorkerPool passes
+                True at startup for extra workers so they fail-fast even when
+                the user has globally requested wait mode (rotations still
+                wait, since they call initialize() with no override).
 
         Returns:
             True if account acquired successfully, False otherwise
         """
-        logger.debug(f"Worker {self.id}: initializing, requesting account from pool")
-        account = await self.pool.get_available()
+        flag = self.raise_when_no_account if raise_override is None else raise_override
+        logger.debug(
+            f"Worker {self.id}: initializing, requesting account from pool "
+            f"(raise_when_no_account={flag}, persistent={self.raise_when_no_account})"
+        )
+        if flag:
+            account = await self.pool.get_available()
+        else:
+            account = await self.pool.get_available_or_wait()
         if not account:
             logger.warning(f"Worker {self.id}: no account available")
             return False

@@ -45,6 +45,7 @@ class FacebookScraper:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        raise_when_no_account: bool = True,
     ):
         """
         Initialize Facebook scraper.
@@ -55,6 +56,10 @@ class FacebookScraper:
             scroll_threshold: Scrolls before rotating account
             headless: Run browsers in headless mode
             mobile: Use mobile browser emulation
+            raise_when_no_account: If True (default), raise NoAccountError when
+                no account is available. If False, block (polling every 5s)
+                until an account frees up — useful for long-running scrapes
+                where you'd rather idle than abort. Threaded down to Worker.
 
         Note: per-call knobs like `stall_timeout_seconds` are passed to
         `user_timeline()` (see Query.ENDPOINT_REGISTRY), not here.
@@ -64,6 +69,7 @@ class FacebookScraper:
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
+        self.raise_when_no_account = raise_when_no_account
         self.worker_pool: WorkerPool | None = None
         self._init_lock = asyncio.Lock()
 
@@ -78,6 +84,7 @@ class FacebookScraper:
                     scroll_threshold=self.scroll_threshold,
                     headless=self.headless,
                     mobile=self.mobile,
+                    raise_when_no_account=self.raise_when_no_account,
                 )
 
     async def user_timeline(

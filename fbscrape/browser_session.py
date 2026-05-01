@@ -120,15 +120,22 @@ class BrowserSession:
 
             # Resolve a stable per-account fingerprint (loaded or generated+persisted)
             fingerprint = await self._resolve_fingerprint()
+            device_os = get_device_os()
+            device_headless = self._resolve_headless(os=device_os, headless=self.headless)
+            logger.debug(
+                f"Fingerprint: {fingerprint}, "
+                f"OS: {device_os}, "
+                f"Headless: {device_headless}"
+            )
 
             # Create browser context using camoufox
             self._browser: Browser = await AsyncNewBrowser(
                 playwright=self._pw,
                 humanize=True,
-                headless="virtual" if self.headless else self.headless,
+                headless=device_headless,
                 proxy=proxy_settings,
                 geoip=True if proxy_settings else False,
-                os=get_device_os(),
+                os=device_os,
                 fingerprint=fingerprint,
                 i_know_what_im_doing=True,  # custom per-account fingerprint is intentional
                 firefox_user_prefs={
@@ -1274,10 +1281,15 @@ class BrowserSession:
             cursor = end_cursor
 
             elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
+            oldest_iso = (
+                datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()
+                if oldest_in_batch is not None else "n/a"
+            )
             logger.debug(
                 f"[hybrid] @{handle} pagination {total_paginations}: "
                 f"{response.status} in {elapsed_iter:.2f}s, "
-                f"posts now={current_post_count} (+{new_posts_in_iter})"
+                f"posts now={current_post_count} (+{new_posts_in_iter}), "
+                f"oldest_in_batch={oldest_iso}"
             )
 
             if (total_paginations % scroll_burst_every) == 0:
@@ -1446,6 +1458,12 @@ class BrowserSession:
             f"Generated + persisted new fingerprint for {self.account.display_name} (os={host_os})"
         )
         return fp
+
+    def _resolve_headless(self, os: str, headless: bool):
+        """Determine the headless mode to use for this session."""
+        if headless and (os == "linux"):
+            return "virtual"
+        return headless
 
     def _get_proxy_dict(self) -> dict | None:
         """Build proxy configuration dict from account settings"""

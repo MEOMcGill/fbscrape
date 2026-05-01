@@ -1,0 +1,30 @@
+{
+  "page_title": "CreepJS",
+  "url": "https://abrahamjuliot.github.io/creepjs/",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0",
+  "webdriver": false,
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "platform": "MacIntel",
+  "hardware_concurrency": 11,
+  "device_memory": null,
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "screen": {
+    "width": 1512,
+    "height": 982,
+    "colorDepth": 30
+  },
+  "creepjs": {
+    "trust_score": null,
+    "fingerprint_id": null,
+    "bot": null,
+    "lies": [],
+    "headless_flag": "0% headless: \n\t\t\n\t\t.modal-creep-headless:checked ~ .modal-container {\n\t\t\tvisibility: visible;\n\t\t\topacity: 1;\n\t\t\tanimation: show 0.1s linear both;\n\t\t}\n\t\t.modal-creep-headless:checked ~ .modal-container .modal-content {\n\t\t\tanimation: enter 0.2s ease both\n\t\t}\n\t\t.modal-creep-headless:not(:checked) ~ .modal-container {\n\t\t\tvisibility: hidden;\n\t\t}\n\t\t\n\t\t\n\t\t52defe05\n\t\t\n\t\t\t\n\t\t\t\t\n\t\t\t\t\u00d7\n\t\t\t\tHeadlesswebDriverIsOn: falsehasHeadlessUA: falsehasHeadlessWorkerUA: false",
+    "body_text_first_2k": "FP ID: f712f2b09e909db2266155ae605bc8200bf25aa937eb9e10820af9e069cb4470\nFuzzy: b54a4814e2edd0b08d1b74c94f5d6d2d5f037defff5d7f5fadee000000000000\n1326.00 ms\nWebRTCc4f93f08\nhost connection:\ncandidate:1 1 UDP 1686052607 2607:fa49:1c3a:6b00:1d86:88e7:b69d:e485 57614 typ srflx raddr 0.0.0.0 rport 0\nfoundation/ip:\ntype & base ip: 1\nip: 2607:fa49:1c3a:6b00:1d86:88e7:b69d:e485\nsdp capabilities: 07fe54f4\nstun connection:\ncandidate:1 1 UDP 1686052607 2607:fa49:1c3a:6b00:1d86:88e7:b69d:e485 57614 typ srflx raddr 0.0.0.0 rport 0\ndevices (2):\nmic, webcam\n10.00ms\nTimezone3f486336\nEastern Daylight Saving Time\n\n\nAmerica, Toronto\n\n\n-27028665748000\n\n\n240\n2.00ms\nIntld2f56664\nen-CA\n\n\nJuly at Eastern Daylight Saving Time\n\n\nAmerican English\n\n\n21 million\n\n\nnext year\n\n\n0 or 1\n\n\none\n8.00ms\nHeadlesscd81633b\nchromium: false\n6% like headless: 7bca6f28\n0% headless: 52defe05\n0% stealth: 0c019315\nplatform hints:\n-apple-system:Mac\n854.00ms\nResistancebfd6ca31\nprivacy: unknown\nsecurity: unknown\nmode: unknown\nextension: unknown\n435.00ms\nServiceWorkerGlobalScope\nWorker7506a4bc\nlang/timezone:\nen-US (1 US dollar)\nen-CA\n\n\nAmerica/Toronto (240)\nconfidence: high\ngpu:\nApple\n\n\nApple M1, or similar\nuserAgent:\nMozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0\ndevice:\nMac (MacIntel)\n\n\nmacOS Catalina\n\n\ncores: 8\nuserAgentData:\nunsupported\n550.00ms\nWebGL19011ade\nimages:598f7ef3\npixels:4c72f7ab\nparams (78): a4e6c37b\nexts (40): 05f47c39\ngpu:\nconfidence: high\nApple\nApple M1, or similar\n0.00ms\nScreenb38d4507\n...screen: 1512 x 982\n....avail: 1512 x 949\ntouch: false\ndepth: 30|30\nviewport:\n1512\n1280\n1280\n949\n720\n720\nbrowser\nlandscape\nlandscape-primary\n1\n202.00ms\nCanvas 2dce85d9cd\ndata: 1b266d28\nrendering:\ntextMetrics:\n0.030238485517183944\n\ud83d\ude00\u263a\u2668...\u2734\ud83c\udd70\ud83c\udd7f\n273.00ms\nFonts225b2671\nload (5/51): Like undefined\napps: unsupported\nGalvji, Geneva, Helvetica Neue, Luminari, MuktaMahee Regular\n\n0.2684278029999999\n\ud83d\ude00\u263a\u2668...\u2734\ud83c\udd70\ud83c\udd7f\n1.00ms\nDOMRectcc7c2ab7\nelems A: 0.4950627700024415\nelems B: 0.495062770002441"
+  }
+}

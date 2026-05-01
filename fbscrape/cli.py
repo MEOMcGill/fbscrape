@@ -8,11 +8,34 @@ import os
 from tabulate import tabulate
 
 from .accounts_pool import AccountsPool
-from .utils import gather, get_home_dir_path
+from .utils import gather, get_home_dir_path, utc
 
 
 def get_default_db():
     return os.path.join(get_home_dir_path(), "db", "accounts.db")
+
+
+def _format_locks(locks: dict) -> str:
+    """Render an Account.locks dict as 'queue:<timestamp> (<relative>)' entries."""
+    if not locks:
+        return '-'
+    now = utc.now()
+    parts = []
+    for queue, expiry in locks.items():
+        delta = (expiry - now).total_seconds()
+        ts = str(expiry)[:19]
+        abs_delta = abs(delta)
+        if abs_delta < 60:
+            rel = f"{int(abs_delta)}s"
+        elif abs_delta < 3600:
+            rel = f"{int(abs_delta / 60)}m"
+        else:
+            hours = int(abs_delta // 3600)
+            mins = int((abs_delta % 3600) // 60)
+            rel = f"{hours}h{mins}m"
+        suffix = f"in {rel}" if delta > 0 else f"{rel} ago"
+        parts.append(f"{queue}:{ts} ({suffix})")
+    return ', '.join(parts)
 
 
 def run_async(coro):
@@ -209,7 +232,7 @@ def list_accounts(ctx, active, inactive, verbose):
             return
 
         if verbose:
-            headers = ['Identifier', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Error', 'Proxy']
+            headers = ['Identifier', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks', 'Error', 'Proxy']
             rows = []
             for a in accounts:
                 rows.append([
@@ -219,19 +242,22 @@ def list_accounts(ctx, active, inactive, verbose):
                     'Y' if a.in_use else 'N',
                     str(a.last_used)[:19] if a.last_used else '-',
                     a.scroll_count_overall_24h,
+                    _format_locks(a.locks),
                     (a.error_msg[:30] + '...') if a.error_msg and len(a.error_msg) > 30 else (a.error_msg or '-'),
                     a.proxy_server or '-',
                 ])
         else:
-            headers = ['Identifier', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)']
+            headers = ['Identifier', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks']
             rows = []
             for a in accounts:
                 rows.append([
                     a.identifier,
+                    a.username or '-',
                     'Y' if a.active else 'N',
                     'Y' if a.in_use else 'N',
                     str(a.last_used)[:19] if a.last_used else '-',
                     a.scroll_count_overall_24h,
+                    _format_locks(a.locks),
                 ])
 
         click.echo(tabulate(rows, headers=headers, tablefmt='simple'))
@@ -265,7 +291,7 @@ def info(ctx, identifier):
         click.echo(f"  Cookies:       {len(account.cookies)} stored")
         click.echo(f"  Scrolls (24h): {account.scroll_count_overall_24h}")
         click.echo(f"  Scrolls/endpoint: {account.scroll_count_per_endpoint_total or '-'}")
-        click.echo(f"  Locks:         {account.locks or '-'}")
+        click.echo(f"  Locks:         {_format_locks(account.locks)}")
         click.echo(f"  Error:         {account.error_msg or '-'}")
 
     run_async(_info())
@@ -552,6 +578,10 @@ def scrape():
               help='[hybrid] bail after N consecutive paginations with no new posts (default 5)')
 @click.option('--operation-timeout-seconds', type=float, default=None,
               help='[hybrid] per-await safety timeout for hangs (default 900)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up instead of '
+                   'raising NoAccountError when the pool is empty/locked. Useful for '
+                   'long-running scrapes — only aborts if the pool has zero active accounts.')
 @click.pass_context
 def scrape_user_timeline(
     ctx, handles, start_date, end_date, output_dir, max_sessions,
@@ -559,7 +589,7 @@ def scrape_user_timeline(
     mode, pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
     max_paginations, pagination_sleep_mean, pagination_sleep_std,
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
-    max_no_progress_streak, operation_timeout_seconds,
+    max_no_progress_streak, operation_timeout_seconds, wait_for_account,
 ):
     """Scrape a user's timeline between two dates.
 
@@ -620,6 +650,7 @@ def scrape_user_timeline(
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
+            raise_when_no_account=not wait_for_account,
         ) as scraper:
             async for result in gather(
                 scraper.user_timeline(

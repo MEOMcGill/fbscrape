@@ -53,9 +53,12 @@ START_DATE = "2024-10-01"
 END_DATE = "2026-04-29"
 MAX_SESSIONS = 5
 SCROLL_THRESHOLD = 500
-HEADLESS = False
+HEADLESS = True
 MOBILE = False
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
+# False = block (polling every 5s) until an account is available, instead of
+# raising NoAccountError. Aborts only if the pool has zero active accounts.
+RAISE_WHEN_NO_ACCOUNT = False
 
 # "manual" = scroll-driven path. "hybrid" = page.request-driven (formerly
 # path_b_lite), no scroll DOM growth. See docs/hybrid/overview.md.
@@ -64,7 +67,7 @@ MODE = "hybrid"
 # (or set to None) inherits the default from Query.ENDPOINT_REGISTRY.
 MODE_KWARGS: dict = {
     "pagination_count": 3,
-    "scroll_burst_every": 10,
+    "scroll_burst_every": 30,
     "max_paginations": 10000,
     "pagination_sleep_mean": 2.5,
     "template_capture_timeout": 20.0,
@@ -107,6 +110,7 @@ async def main():
         scroll_threshold=SCROLL_THRESHOLD,
         headless=HEADLESS,
         mobile=MOBILE,
+        raise_when_no_account=RAISE_WHEN_NO_ACCOUNT,
     ) as scraper:
         async for result in gather(
             scraper.user_timeline(

@@ -1,0 +1,27 @@
+{
+  "page_title": "Antibot",
+  "url": "https://bot.sannysoft.com/",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0",
+  "webdriver": false,
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "platform": "MacIntel",
+  "hardware_concurrency": 11,
+  "device_memory": null,
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "screen": {
+    "width": 1512,
+    "height": 982,
+    "colorDepth": 30
+  },
+  "sannysoft": {
+    "fp_table": null,
+    "fp2_table": null,
+    "body_text_first_4k": "Intoli.com tests + additions\nTest Name\tResult\nUser Agent\n(Old)\n\tMozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0\nWebDriver\n(New)\n\tmissing (passed)\nWebDriver Advanced\tpassed\nChrome\n(New)\n\tmissing (failed)\nPermissions\n(New)\n\tprompt\nPlugins Length\n(Old)\n\t5\nPlugins is of type PluginArray\tpassed\nLanguages\n(Old)\n\ten-US,en\nWebGL Vendor\tApple\nWebGL Renderer\tApple M1, or similar\nBroken Image Dimensions\t24x24\nFingerprint Scanner tests\nSome details\nnavigator.cookieEnabled\ttrue\nnavigator.doNotTrack\tunspecified\nnavigator.msDoNotTrack\tundefined\nnavigator.sendBeacon\t\nnavigator.cookieEnabled\ttrue\nnavigator.userAgent\tMozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0\nnavigator.appName\tNetscape\nnavigator.vendor\t\nnavigator.appCodeName\tMozilla\nnavigator.getUserMedia\t\nnavigator.sayswho\tundefined\nnavigator.javaEnabled\tfalse\nnavigator.plugins\t{\"0\":{\"0\":{},\"1\":{}},\"1\":{\"0\":{},\"1\":{}},\"2\":{\"0\":{},\"1\":{}},\"3\":{\"0\":{},\"1\":{}},\"4\":{\"0\":{},\"1\":{}}}\nscreen.width\t1512\nscreen.height\t982\nscreen.colorDepth\t30\nnavigator.language\ten-US\nnavigator.loadPurpose\tundefined\nnavigator.platform\tMacIntel\nnavigator.mediaDevices\t\n\nnavigator.getBattery details\t\nCanvas1\t\nHash: -1347834760\n\nCanvas2\t\nHash: -1347834760\n\nCanvas3 (iframe sandbox)\t\nHash: -1581723250\n\nCanvas4 (iframe sandbox)\t\nHash: -1581723250\n\nCanvas5 (iframe)\t\nHash: -1581723250\nFp-collect info\n  "
+  }
+}

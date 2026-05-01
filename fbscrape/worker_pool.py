@@ -30,6 +30,7 @@ class WorkerPool:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
+        raise_when_no_account: bool = True,
     ):
         """
         Initialize WorkerPool configuration.
@@ -40,12 +41,18 @@ class WorkerPool:
             scroll_threshold: Scrolls before rotating account
             headless: Run browsers in headless mode
             mobile: Use mobile browser emulation
+            raise_when_no_account: If True (default), startup raises
+                NoAccountError when the pool is empty/locked. If False, the
+                first worker blocks until an account frees up; subsequent
+                workers still fail-fast (otherwise we'd deadlock waiting for
+                more accounts than the pool can ever supply at once).
         """
         self.pool = pool
         self.max_workers = max_workers
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
+        self.raise_when_no_account = raise_when_no_account
 
         # State
         self.workers: list[Worker] = []
@@ -69,23 +76,36 @@ class WorkerPool:
             logger.debug(f"WorkerPool already initialized with {len(self.workers)} workers")
             return len(self.workers)
 
-        logger.debug(f"WorkerPool initializing with config: max_workers={self.max_workers}, scroll_threshold={self.scroll_threshold}, headless={self.headless}")
+        logger.debug(
+            f"WorkerPool initializing with config: max_workers={self.max_workers}, "
+            f"scroll_threshold={self.scroll_threshold}, headless={self.headless}, "
+            f"raise_when_no_account={self.raise_when_no_account}"
+        )
         active_accounts = await self.pool.get_active_accounts()
         num_active = len(active_accounts)
 
-        if num_active == 0:
+        if num_active == 0 and self.raise_when_no_account:
             raise NoAccountError("No active accounts available in pool")
 
-        # Calculate worker count: min of max_workers and available accounts
-        num_workers = max(1, min(self.max_workers, num_active))
+        # In wait mode with 0 active accounts, give the first worker a shot —
+        # get_available_or_wait() will return None right away (nothing to wait
+        # for) and we'll hit the post-loop NoAccountError below.
+        num_workers = max(1, min(self.max_workers, num_active)) if num_active > 0 else self.max_workers
 
         logger.info(
-            f"WorkerPool initializing {num_workers} workers "
-            f"(max={self.max_workers}, active_accounts={num_active})"
+            f"WorkerPool initializing up to {num_workers} workers "
+            f"(max={self.max_workers}, active_accounts={num_active}, "
+            f"raise_when_no_account={self.raise_when_no_account})"
         )
 
-        # Create workers
+        # Create workers. Every worker gets the user's persistent
+        # raise_when_no_account flag (so rotations honor wait mode). At
+        # STARTUP only, the FIRST worker uses the user's flag; subsequent
+        # workers always fail-fast via raise_at_startup=True so we don't
+        # block forever waiting for more accounts than the pool has free
+        # right now. After startup, all workers behave identically.
         for i in range(num_workers):
+            startup_raise = True if i > 0 else self.raise_when_no_account
             try:
                 worker = await Worker.create(
                     id=f"worker-{i}",
@@ -93,6 +113,8 @@ class WorkerPool:
                     scroll_threshold=self.scroll_threshold,
                     headless=self.headless,
                     mobile=self.mobile,
+                    raise_when_no_account=self.raise_when_no_account,
+                    raise_at_startup=startup_raise,
                 )
                 self.workers.append(worker)
 
