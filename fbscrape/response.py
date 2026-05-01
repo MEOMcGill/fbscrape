@@ -6,8 +6,9 @@ import json
 import os
 import traceback
 from datetime import datetime, timezone
+from urllib.parse import parse_qs
 from playwright.async_api import Page, Response
-from fbscrape.utils import parse_json_or_jsonl, flatten_dict, recursively_get_dict_value
+from fbscrape.utils import parse_json_or_jsonl
 from .logger import logger
 
 
@@ -235,33 +236,34 @@ class FacebookGraphQLParser:
 
     def is_post_node(self, node: dict) -> bool | None:
         """
-        Determine if a node is a Facebook post
+        Determine if a node is a Facebook post.
 
-        Args:
-            node: Post node from GraphQL response
+        Two response shapes are recognized:
+          A) initial page load — `data.node` is a User containing
+             `timeline_list_feed_units.edges[].node` with `__typename: Story`.
+          B) pagination — `data.node` IS the Story directly, carrying a
+             top-level `post_id` and `__isFeedUnit: "Story"`.
 
         Returns:
-            bool indicating if node is a post, or None if parsing fails
+            bool indicating if node is a post, or None if parsing fails.
         """
         try:
-            # if there's the link to a post 'https://www.facebook.com/reel/893086710220638/'
-            post_data = flatten_dict(node)
-            post_url = [
-                v for k, v in post_data.items()
-                if isinstance(v, str) and (("/reel/" in v) or ("/posts/" in v)) and "comment_id" not in v
-            ]
-            # text in:
-            # A: 'timeline_list_feed_units.edges.0.node.comet_sections.content.story.message.text'
-            # A: 'timeline_list_feed_units.edges.0.node.comet_sections.content.story.comet_sections.message.story.message.text'
-            # B: 'comet_sections.content.story.comet_sections.message.story.message.text'
-            # B: 'comet_sections.content.story.comet_sections.message_container.story.message.text'
-            # B: 'comet_sections.content.story.message.text'
-            has_post_url = len(post_url) > 0
-
-            # if has isFeedUnit, my hunch is it needs to be 'Story' but unsure
-            is_feed_unit = 'Story' in set(recursively_get_dict_value(post_data, '__isFeedUnit').values())
-            is_post: bool = has_post_url and is_feed_unit
-            return is_post
+            if not isinstance(node, dict):
+                return False
+            # Shape B: paginated Story node delivered as data.node directly.
+            if (node.get('__typename') == 'Story'
+                    and node.get('__isFeedUnit') == 'Story'
+                    and isinstance(node.get('post_id'), str)
+                    and node['post_id']):
+                return True
+            # Shape A: initial User node carrying the first batch of stories.
+            tlfu = node.get('timeline_list_feed_units')
+            if isinstance(tlfu, dict):
+                for edge in (tlfu.get('edges') or []):
+                    inner = edge.get('node') if isinstance(edge, dict) else None
+                    if isinstance(inner, dict) and inner.get('__typename') == 'Story':
+                        return True
+            return False
 
         except Exception as e:
             logger.error(f"Failed to parse post node: {e}")
@@ -280,10 +282,35 @@ class ResponseInterceptor:
         # (i.e., an authenticated-user context query resolved). Used to detect
         # login without relying on scrolling or the home feed rendering.
         self.viewer_seen: bool = False
-        # TEMP: capture full request+response of every XHR (GraphQL and otherwise) for
-        # Path B investigation (see docs/path_b_investigation.md). Each entry has
-        # `is_graphql`, full request (method/headers/post_data), and full response
-        # (status/headers/body). Cleared on flush(). Remove when investigation is done.
+        # Latest fresh per-session GraphQL tokens, parsed from natural
+        # browser-issued GraphQL POST bodies. Used by hybrid mode to splice
+        # fresh tokens into spliced-replay bodies (so replays don't drift
+        # against FB's rotating __csr / __dyn). None until first natural
+        # GraphQL POST with these fields lands.
+        # NOTE: page.request.post() requests do NOT trigger this listener,
+        # so manual replays will not pollute these values.
+        self.latest_csr: str | None = None
+        self.latest_dyn: str | None = None
+        # When False, posts parsed from auto-intercepted GraphQL responses are
+        # NOT appended to self.posts. Hybrid mode flips this off so its
+        # natural bootstrap-scroll + organic-burst responses (which do not
+        # carry beforeTime/afterTime filters) cannot pollute the result with
+        # off-date-range posts. Manual mode keeps it True — auto-extraction is
+        # how it collects posts. Token tracking, viewer detection, and the
+        # network_capture all keep working regardless of this flag.
+        self.extract_posts: bool = True
+        # Latest captured ProfileCometTimelineFeedRefetchQuery request, if any.
+        # Used by hybrid mode to grab a replay template (form body + headers)
+        # without holding the full network_capture in memory. Updated whenever
+        # a natural PCTFRQ request is observed; reset on flush().
+        # Shape: {"post_data": str | None, "headers": dict[str, str]}
+        self.latest_pctfrq_request: dict | None = None
+        # Capture full request+response of every response, opt-in only.
+        # Off by default (production hybrid does not need it). Enable with
+        # FB_NETWORK_CAPTURE_ALL=1 for offline forensic analysis. When off,
+        # nothing is appended; when on, every response (XHR + others) is
+        # recorded — body kept verbatim for textual types, metadata+size for
+        # binaries. See docs/hybrid/overview.md.
         self.network_capture: list[dict] = []
 
     def setup_interception(self, page: Page):
@@ -321,18 +348,19 @@ class ResponseInterceptor:
         is_graphql = is_xhr and any(url.startswith(ep) for ep in graphql_endpoints)
 
         # GraphQL-specific bookkeeping: counter for diagnostics, last-response
-        # timestamp drives the stall watchdog in user_timeline.
+        # timestamp drives the stall watchdog in user_timeline; the PCTFRQ
+        # template hook feeds hybrid mode's replay-template capture.
         if is_graphql:
             self.graphql_request_count += 1
             self.last_response_time = datetime.now(timezone.utc)
+            self._track_request_tokens(response.request)
+            await self._track_pctfrq_template(response.request)
 
-        # TEMP: capture network traffic for Path B investigation.
-        # Default scope: XHR only (preserves prior behavior).
-        # If FB_NETWORK_CAPTURE_ALL=1, capture every response (CSS/JS/images/etc.)
-        # — body is kept verbatim only for textual resource types; binaries get
-        # metadata + size. See docs/path_b_investigation.md. Remove when done.
-        capture_all = os.environ.get("FB_NETWORK_CAPTURE_ALL") == "1"
-        if is_xhr or capture_all:
+        # Full network capture is opt-in via FB_NETWORK_CAPTURE_ALL=1. Off by
+        # default to keep production memory tight. When on, every response is
+        # recorded (textual bodies verbatim, binaries metadata-only). See
+        # docs/hybrid/overview.md.
+        if os.environ.get("FB_NETWORK_CAPTURE_ALL") == "1":
             try:
                 await self._capture_response(response, url, resource_type, is_xhr, is_graphql)
             except Exception as e:
@@ -358,11 +386,12 @@ class ResponseInterceptor:
                             break
                 except Exception:
                     pass
-            parsed = self.parser.parse_timeline_response(body, url)
-            if parsed:
-                self.posts.extend(parsed['posts'])
-            else:
-                logger.warning(f"[PARSER] Returned None - parser needs implementation")
+            if self.extract_posts:
+                parsed = self.parser.parse_timeline_response(body, url)
+                if parsed:
+                    self.posts.extend(parsed['posts'])
+                else:
+                    logger.warning(f"[PARSER] Returned None - parser needs implementation")
 
         except Exception as e:
             logger.error(f"[ERROR] Error intercepting response: {e}")
@@ -471,6 +500,83 @@ class ResponseInterceptor:
         """Get collected posts"""
         return self.posts
 
+    def add_posts(self, posts: list[dict]):
+        """Append posts parsed elsewhere (e.g. by a hybrid replay path)
+        to the same accumulator that auto-intercepted posts populate.
+        Preferred over directly mutating `self.posts`."""
+        self.posts.extend(posts)
+
+    def _track_request_tokens(self, request):
+        """Parse `__csr` and `__dyn` from a natural GraphQL POST body and
+        update `latest_csr` / `latest_dyn`. Called from intercept_response
+        only on browser-issued GraphQL XHRs — page.request.post replays
+        bypass the page event stream, so they cannot self-pollute these.
+
+        Best-effort: any parse / decode failure silently leaves the cached
+        values alone.
+        """
+        try:
+            post_data = request.post_data
+        except Exception:
+            return
+        if not post_data:
+            return
+        try:
+            form = parse_qs(post_data, keep_blank_values=True)
+        except Exception:
+            return
+        # parse_qs returns lists; take last value
+        csr = form.get("__csr")
+        if csr and csr[-1]:
+            self.latest_csr = csr[-1]
+        dyn = form.get("__dyn")
+        if dyn and dyn[-1]:
+            self.latest_dyn = dyn[-1]
+
+    async def _track_pctfrq_template(self, request):
+        """If this request is a `ProfileCometTimelineFeedRefetchQuery`, save
+        a small replay-template snapshot (post_data + headers) to
+        `self.latest_pctfrq_request`. Hybrid mode polls this attr to grab
+        the form template without holding a full network capture in memory.
+
+        Friendly name lives in two places — the `x-fb-friendly-name` request
+        header, or `fb_api_req_friendly_name` inside the urlencoded body.
+        Check both so we don't miss either fronted.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+
+        is_pctfrq = headers.get("x-fb-friendly-name") == "ProfileCometTimelineFeedRefetchQuery"
+        post_data = None
+        if not is_pctfrq:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            if post_data:
+                try:
+                    form = parse_qs(post_data, keep_blank_values=True)
+                    name = form.get("fb_api_req_friendly_name") or []
+                    if name and name[-1] == "ProfileCometTimelineFeedRefetchQuery":
+                        is_pctfrq = True
+                except Exception:
+                    pass
+        if not is_pctfrq:
+            return
+
+        # Only fetch post_data if we haven't already (header-fast-path skips it).
+        if post_data is None:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+        self.latest_pctfrq_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
     def has_graphql_activity(self) -> bool:
         """Check if any GraphQL requests have been intercepted"""
         return self.graphql_request_count > 0
@@ -489,11 +595,13 @@ class ResponseInterceptor:
         self.graphql_request_count = 0
         self.last_response_time = None
         self.viewer_seen = False
-        # TEMP: clear Path B network capture between scrapes. Remove when done.
+        self.latest_csr = None
+        self.latest_dyn = None
+        self.latest_pctfrq_request = None
+        # network_capture is opt-in (FB_NETWORK_CAPTURE_ALL=1); reset anyway
+        # so a fresh scrape starts with a clean slate when capture is enabled.
         self.network_capture = []
 
-    # TEMP: dump captured XHR (GraphQL + others) to JSONL for Path B investigation.
-    # Remove when investigation is done. See docs/path_b_investigation.md.
     def save_network_capture_to_jsonl(self, path: str) -> int:
         """Write captured XHR (request + response) to a JSONL file.
 

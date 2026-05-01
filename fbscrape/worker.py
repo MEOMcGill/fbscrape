@@ -33,12 +33,15 @@ class Worker:
     when thresholds are reached or errors occur.
     """
 
-    # Maps endpoint names to BrowserSession method names
-    ENDPOINT_METHODS = {
-        "UserTimeline": "user_timeline",
-        # Add more as implemented:
-        # "Search": "search",
-        # "GroupTimeline": "group_timeline",
+    # Maps (endpoint, mode) -> BrowserSession method name. Endpoints describe
+    # *what* to scrape (UserTimeline, GroupTimeline, ...); modes describe *how*
+    # (manual = scroll-driven, hybrid = page.request driven, api = pure replay).
+    # Allowed (endpoint, mode) pairs and their params live in Query.ENDPOINT_REGISTRY.
+    ENDPOINT_MODE_METHODS = {
+        ("UserTimeline", "manual"): "user_timeline_manual",
+        ("UserTimeline", "hybrid"): "user_timeline_hybrid",
+        # ("UserTimeline", "api"): "user_timeline_api",  -- future
+        # ("GroupTimeline", "manual"): "group_timeline_manual",
     }
 
     def __init__(
@@ -48,7 +51,6 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        stall_timeout_seconds: int = 300,
     ):
         """
         Initialize Worker with configuration only.
@@ -61,14 +63,12 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
-            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds
         """
         self.id = id
         self.pool = pool
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
-        self.stall_timeout_seconds = stall_timeout_seconds
 
         # State set during initialize()
         self.current_account: Optional[Account] = None
@@ -83,7 +83,6 @@ class Worker:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        stall_timeout_seconds: int = 300,
     ) -> "Worker":
         """
         Factory method to create and initialize a Worker.
@@ -94,7 +93,6 @@ class Worker:
             scroll_threshold: Scroll count before rotating account
             headless: Run browser in headless mode
             mobile: Use mobile browser emulation
-            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds
 
         Returns:
             Initialized Worker instance
@@ -109,7 +107,6 @@ class Worker:
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
-            stall_timeout_seconds=stall_timeout_seconds,
         )
         success = await instance.initialize()
         if not success:
@@ -178,13 +175,13 @@ class Worker:
             except asyncio.QueueEmpty:
                 break
 
-            logger.info(f"Worker {self.id} processing task: {task.endpoint} - {task.query}")
+            logger.info(f"Worker {self.id} processing task: {task.endpoint}/{task.mode} - {task.query}")
 
             try:
                 result = await self.execute_task(task)
                 results.append(result)
                 logger.info(
-                    f"Worker {self.id} completed task: {task.endpoint} - "
+                    f"Worker {self.id} completed task: {task.endpoint}/{task.mode} - "
                     f"{len(result.posts)} posts, result='{result.result}'"
                 )
             except NoAccountError:
@@ -262,22 +259,23 @@ class Worker:
                     pool=self.pool,
                     headless=self.headless,
                     mobile=self.mobile,
-                    stall_timeout_seconds=self.stall_timeout_seconds,
                 ) as session:
-                    # Get scraping method
-                    method = self._get_scraping_method(session, task.endpoint)
-
-                    # Execute scraping
-                    result = await method(
-                        **task.query
-                    )
+                    method = self._get_scraping_method(session, task.endpoint, task.mode)
+                    # Query.params is fully populated with registry defaults at
+                    # Query construction, so a single spread covers everything
+                    # the BrowserSession method expects. The method returns a
+                    # ScrapeOutcome (Query-agnostic); we attach the canonical
+                    # `task` here so the rebuild that used to happen inside
+                    # BrowserSession is gone — the Query is constructed exactly
+                    # once, in scraper.user_timeline.
+                    outcome = await method(**task.query, **task.params)
 
                     # Update Worker's scroll count from session
                     endpoint_scrolls = await session.get_scroll_count(task.endpoint)
                     self.scroll_count += endpoint_scrolls
                     logger.debug(f"Worker {self.id}: task complete, endpoint_scrolls={endpoint_scrolls}, total scroll_count={self.scroll_count}")
 
-                    return result
+                    return ScrapingResult.from_outcome(task, outcome)
 
             except AccountDisabledError as e:
                 # Detector (_wait_for_log_in_outcome) already wrote a specific error_msg
@@ -380,25 +378,27 @@ class Worker:
         if not success:
             raise NoAccountError(f"Worker {self.id}: no account available for rotation")
 
-    def _get_scraping_method(self, session: BrowserSession, endpoint: str) -> Callable:
+    def _get_scraping_method(self, session: BrowserSession, endpoint: str, mode: str) -> Callable:
         """
-        Get the BrowserSession method for a given endpoint.
+        Get the BrowserSession method for a given (endpoint, mode) pair.
 
         Args:
             session: BrowserSession instance
             endpoint: Endpoint name (e.g., 'UserTimeline')
+            mode: Mode name (e.g., 'manual', 'hybrid')
 
         Returns:
             Bound method from BrowserSession
 
         Raises:
-            ValueError: If endpoint is not supported
+            ValueError: If (endpoint, mode) is not supported
         """
-        if endpoint not in self.ENDPOINT_METHODS:
+        key = (endpoint, mode)
+        if key not in self.ENDPOINT_MODE_METHODS:
             raise ValueError(
-                f"Unsupported endpoint: {endpoint}. "
-                f"Supported endpoints: {list(self.ENDPOINT_METHODS.keys())}"
+                f"Unsupported (endpoint, mode): {key}. "
+                f"Supported: {list(self.ENDPOINT_MODE_METHODS.keys())}"
             )
-        method_name = self.ENDPOINT_METHODS[endpoint]
-        logger.debug(f"Worker {self.id}: endpoint {endpoint} -> method {method_name}")
+        method_name = self.ENDPOINT_MODE_METHODS[key]
+        logger.debug(f"Worker {self.id}: ({endpoint}, {mode}) -> method {method_name}")
         return getattr(session, method_name)

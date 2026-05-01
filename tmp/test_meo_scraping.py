@@ -50,12 +50,25 @@ def load_facebook_seeds(only_actives: bool = True) -> list[dict]:
 
 
 START_DATE = "2024-10-01"
-END_DATE = "2026-04-17"
+END_DATE = "2026-04-29"
 MAX_SESSIONS = 5
 SCROLL_THRESHOLD = 500
 HEADLESS = False
 MOBILE = False
-LOG_LEVEL = "DEBUG"
+LOG_LEVEL = "INFO"
+
+# "manual" = scroll-driven path. "hybrid" = page.request-driven (formerly
+# path_b_lite), no scroll DOM growth. See docs/hybrid/overview.md.
+MODE = "hybrid"
+# Mode-specific tuning knobs (only used when MODE == "hybrid"). Any key omitted
+# (or set to None) inherits the default from Query.ENDPOINT_REGISTRY.
+MODE_KWARGS: dict = {
+    "pagination_count": 3,
+    "scroll_burst_every": 10,
+    "max_paginations": 10000,
+    "pagination_sleep_mean": 2.5,
+    "template_capture_timeout": 20.0,
+}
 
 
 async def main():
@@ -66,10 +79,12 @@ async def main():
         get_home_dir_path(), "data", "posts", f"{START_DATE}_{END_DATE}"
     )
     os.makedirs(output_dir, exist_ok=True)
-    # Filenames look like "{ID}_{handle}_UserTimeline_{START}_{END}.json".
-    # Dedup on (ID, handle) parsed from the filename prefix.
+    # Filenames look like "{ID}_{handle}_{Endpoint}_{Mode}_{START}_{END}.json".
+    # Endpoint is now always "UserTimeline" — mode segment ("manual"/"hybrid")
+    # disambiguates re-runs across strategies. Dedup against the current mode's
+    # suffix so a re-run with a different mode re-scrapes rather than skipping.
     already_scraped = set()
-    suffix = f"_UserTimeline_{START_DATE}_{END_DATE}.json"
+    suffix = f"_UserTimeline_{MODE}_{START_DATE}_{END_DATE}.json"
     for f in os.listdir(output_dir):
         if not f.endswith(suffix):
             continue
@@ -94,7 +109,13 @@ async def main():
         mobile=MOBILE,
     ) as scraper:
         async for result in gather(
-            scraper.user_timeline(handle=h["Handle"], start_date=START_DATE, end_date=END_DATE)
+            scraper.user_timeline(
+                handle=h["Handle"],
+                start_date=START_DATE,
+                end_date=END_DATE,
+                mode=MODE,
+                **MODE_KWARGS,
+            )
             for h in SEEDS
         ):
             data: ScrapingResult = result
@@ -110,7 +131,7 @@ async def main():
             filename = (
                 f"{seed_info['ID']}"
                 f"_{handle.replace('.', '_')}"
-                f"_{data.query.endpoint}"
+                f"_{data.query.endpoint}_{data.query.mode}"
                 f"_{START_DATE}_{END_DATE}.json"
             )
 

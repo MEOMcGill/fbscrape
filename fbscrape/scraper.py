@@ -45,7 +45,6 @@ class FacebookScraper:
         scroll_threshold: int = 500,
         headless: bool = False,
         mobile: bool = False,
-        stall_timeout_seconds: int = 300,
     ):
         """
         Initialize Facebook scraper.
@@ -56,14 +55,15 @@ class FacebookScraper:
             scroll_threshold: Scrolls before rotating account
             headless: Run browsers in headless mode
             mobile: Use mobile browser emulation
-            stall_timeout_seconds: Bail out if no GraphQL response arrives within N seconds (default 120)
+
+        Note: per-call knobs like `stall_timeout_seconds` are passed to
+        `user_timeline()` (see Query.ENDPOINT_REGISTRY), not here.
         """
         self.pool = db if isinstance(db, AccountsPool) else AccountsPool(db)
         self.max_browser_sessions = max_browser_sessions
         self.scroll_threshold = scroll_threshold
         self.headless = headless
         self.mobile = mobile
-        self.stall_timeout_seconds = stall_timeout_seconds
         self.worker_pool: WorkerPool | None = None
         self._init_lock = asyncio.Lock()
 
@@ -78,7 +78,6 @@ class FacebookScraper:
                     scroll_threshold=self.scroll_threshold,
                     headless=self.headless,
                     mobile=self.mobile,
-                    stall_timeout_seconds=self.stall_timeout_seconds,
                 )
 
     async def user_timeline(
@@ -86,6 +85,10 @@ class FacebookScraper:
         handle: str,
         start_date: str,
         end_date: str,
+        mode: str = "hybrid",
+        # Mode-specific tuning knobs. All optional. Anything left as None gets
+        # the registry default from Query.ENDPOINT_REGISTRY at Query construction.
+        **params,
     ) -> ScrapingResult:
         """
         Scrape a Facebook user's homepage/timeline.
@@ -94,30 +97,45 @@ class FacebookScraper:
             handle: Facebook username/handle (e.g., "zuck")
             start_date: Start date for scraping (YYYY-MM-DD format)
             end_date: End date for scraping (YYYY-MM-DD format)
+            mode: "manual" (scroll-driven) or "hybrid" (page.request POST-driven,
+                  no scroll-induced DOM growth — default).
+            **params: mode-specific tuning knobs. Allowed keys and defaults
+                  live in Query.ENDPOINT_REGISTRY[("UserTimeline", mode)]["params"].
+                  Pass `None` (or omit) to use the registry default.
 
         Returns:
             ScrapingResult with outcome and collected posts
 
         Raises:
             NoAccountError: If no accounts available in pool
-            ValueError: If query validation fails
+            ValueError: If endpoint/mode/query/params validation fails
         """
-        await self._ensure_initialized()
+        await self._ensure_initialized() # unsure what this line does
+
+        # Drop None entries so registry defaults win in Query.__post_init__.
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
 
         query = Query(
             endpoint="UserTimeline",
+            mode=mode,
             query={
                 "handle": handle,
                 "start_date": start_date,
                 "end_date": end_date,
             },
-            params={},
+            params=cleaned_params,
         )
 
-        logger.debug(f"Submitting user_timeline task for handle={handle}, date_range={start_date} to {end_date}")
+        logger.debug(
+            f"Submitting UserTimeline task (mode={mode}) for handle={handle}, "
+            f"date_range={start_date} to {end_date}"
+        )
         future = await self.worker_pool.submit_task(query)
         result = await future
-        logger.debug(f"Completed user_timeline for handle={handle}, result={result.result}, posts={len(result.posts)}")
+        logger.debug(
+            f"Completed UserTimeline (mode={mode}) for handle={handle}, "
+            f"result={result.result}, posts={len(result.posts)}"
+        )
         return result
 
     async def close(self):

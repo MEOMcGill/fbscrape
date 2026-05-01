@@ -1,6 +1,6 @@
-# fbscrape Design Document
+# Architecture Overview
 
-This document explains the design decisions, architecture, and implementation patterns used in the fbscrape library.
+Design decisions, architecture, and implementation patterns used in the fbscrape library.
 
 ## Design Goals
 

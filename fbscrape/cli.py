@@ -519,19 +519,59 @@ def scrape():
 @click.option('--end-date', required=True, help='End date YYYY-MM-DD (most recent date to scrape from)')
 @click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
-@click.option('--scroll-threshold', default=500, type=int, help='Scrolls before rotating account')
-@click.option('--stall-timeout-seconds', default=300, type=int, help='Bail out if no GraphQL response for N seconds (default 300)')
+@click.option('--scroll-threshold', default=500, type=int, help='Scrolls (or hybrid paginations) before rotating account')
+@click.option('--stall-timeout-seconds', default=None, type=int, help='[manual] bail out if no GraphQL response for N seconds (default 300, ignored for --mode hybrid)')
 @click.option('--headless', is_flag=True, help='Run browsers headless')
 @click.option('--mobile', is_flag=True, help='Use mobile emulation')
 @click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--mode', type=click.Choice(['manual', 'hybrid']), default='hybrid',
+              help="Scrape strategy: 'manual' (scroll-driven) or 'hybrid' "
+                   "(page.request POSTs, no scroll-induced DOM growth — default). "
+                   "See docs/hybrid/overview.md.")
+@click.option('--pagination-count', type=int, default=None,
+              help='[hybrid] posts per pagination request (default 3, matches FB UI)')
+@click.option('--scroll-burst-every', type=int, default=None,
+              help='[hybrid] organic scroll burst every N paginations (default 10, set very high to disable)')
+@click.option('--scroll-burst-min', type=int, default=None,
+              help='[hybrid] minimum scrolls per organic burst (default 2)')
+@click.option('--scroll-burst-max', type=int, default=None,
+              help='[hybrid] maximum scrolls per organic burst (default 5)')
+@click.option('--max-paginations', type=int, default=None,
+              help='[hybrid] safety cap on paginations per session (default -1 = no cap)')
+@click.option('--pagination-sleep-mean', type=float, default=None,
+              help='[hybrid] mean inter-pagination sleep seconds (default 2.5)')
+@click.option('--pagination-sleep-std', type=float, default=None,
+              help='[hybrid] std dev of inter-pagination sleep (default 0.5)')
+@click.option('--template-capture-timeout', type=float, default=None,
+              help='[hybrid] max seconds to wait for first ProfileCometTimelineFeedRefetchQuery (default 20)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='[hybrid] pause after navigating to the profile, before bootstrap scroll (default 3)')
+@click.option('--request-timeout-ms', type=int, default=None,
+              help='[hybrid] per-request timeout for page.request.post in milliseconds (default 30000)')
+@click.option('--max-no-progress-streak', type=int, default=None,
+              help='[hybrid] bail after N consecutive paginations with no new posts (default 5)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='[hybrid] per-await safety timeout for hangs (default 900)')
 @click.pass_context
-def scrape_user_timeline(ctx, handles, start_date, end_date, output_dir, max_sessions, scroll_threshold, stall_timeout_seconds, headless, mobile, log_level):
+def scrape_user_timeline(
+    ctx, handles, start_date, end_date, output_dir, max_sessions,
+    scroll_threshold, stall_timeout_seconds, headless, mobile, log_level,
+    mode, pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
+    max_paginations, pagination_sleep_mean, pagination_sleep_std,
+    template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
+    max_no_progress_streak, operation_timeout_seconds,
+):
     """Scrape a user's timeline between two dates.
 
     \b
     Examples:
       fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
       fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --end-date 2025-01-01 --headless
+
+    \b
+    Force the scroll-driven path:
+      fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01 \\
+        --mode manual
     """
     from .scraper import FacebookScraper
     from .logger import set_log_level
@@ -543,6 +583,35 @@ def scrape_user_timeline(ctx, handles, start_date, end_date, output_dir, max_ses
         output_dir = os.path.join(get_home_dir_path(), "data", "posts", f"{start_date}_{end_date}")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Bundle mode-specific kwargs. Only forward keys explicitly set on the CLI —
+    # None falls through to the registry default in Query.__post_init__.
+    # `stall_timeout_seconds` is manual-only; routed only when --mode manual to
+    # avoid Query rejecting it as an unknown param under hybrid.
+    mode_params = {
+        "pagination_count": pagination_count,
+        "scroll_burst_every": scroll_burst_every,
+        "max_paginations": max_paginations,
+        "pagination_sleep_mean": pagination_sleep_mean,
+        "pagination_sleep_std": pagination_sleep_std,
+        "template_capture_timeout": template_capture_timeout,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "request_timeout_ms": request_timeout_ms,
+        "max_no_progress_streak": max_no_progress_streak,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    # scroll_burst_size_range is a tuple in the registry; expose as two flags
+    # on the CLI and rebuild the tuple when both are set.
+    if scroll_burst_min is not None or scroll_burst_max is not None:
+        from .models import Query
+        default_min, default_max = Query.ENDPOINT_REGISTRY["UserTimeline"]["modes"]["hybrid"]["params"]["scroll_burst_size_range"]
+        mode_params["scroll_burst_size_range"] = (
+            scroll_burst_min if scroll_burst_min is not None else default_min,
+            scroll_burst_max if scroll_burst_max is not None else default_max,
+        )
+    if mode == 'manual' and stall_timeout_seconds is not None:
+        mode_params['stall_timeout_seconds'] = stall_timeout_seconds
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
     async def _scrape():
         pool = AccountsPool(ctx.obj['db'])
         async with FacebookScraper(
@@ -551,10 +620,15 @@ def scrape_user_timeline(ctx, handles, start_date, end_date, output_dir, max_ses
             scroll_threshold=scroll_threshold,
             headless=headless,
             mobile=mobile,
-            stall_timeout_seconds=stall_timeout_seconds,
         ) as scraper:
             async for result in gather(
-                scraper.user_timeline(handle=h, start_date=start_date, end_date=end_date)
+                scraper.user_timeline(
+                    handle=h,
+                    start_date=start_date,
+                    end_date=end_date,
+                    mode=mode,
+                    **mode_params,
+                )
                 for h in handles
             ):
                 data: ScrapingResult = result
@@ -563,7 +637,7 @@ def scrape_user_timeline(ctx, handles, start_date, end_date, output_dir, max_ses
 
                 filename = (
                     f"{handle.replace('.', '_')}"
-                    f"_{data.query.endpoint}"
+                    f"_{data.query.endpoint}_{data.query.mode}"
                     f"_{start_date}_{end_date}.json"
                 )
                 data.save(os.path.join(output_dir, filename))

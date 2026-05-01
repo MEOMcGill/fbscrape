@@ -133,7 +133,7 @@ Stack:
 Different profile from status quo and from option 1, with one major weak point:
 
 - *Network signature.* Server-side, the request itself is identical to one fired by the page UI — same headers, same body shape. **Lower per-request signal than current approach** in this dimension.
-- *Surrounding telemetry — the big problem.* A real browser firing a GraphQL pagination request is surrounded by hundreds of other requests: resource loads (CSS, JS, images, video segments), telemetry pings, sensor data, focus/blur events, scroll position reports. Direct replay has *none* of those. A bare stream of pagination POSTs without any of the chatter that always accompanies real navigation is a strong signal — much stronger than any scroll pattern. **Higher signal than status quo for this dimension.**
+- *Surrounding telemetry — narrower risk than initially framed.* Empirical finding from [`hybrid overview`](../hybrid/overview.md): the bulk of per-scroll chatter is on CDN domains (`scontent-*.fbcdn.net` images and video chunks) — different infrastructure from the FB application servers that actually gate pagination, and unlikely to feed real-time anti-bot decisions. The only FB-domain ambient endpoints that fire meaningfully during scrolling are `/ajax/bulk-route-definitions/` (~45% of scrolls) and `/ajax/bnzai` (sporadic, session-level — not scroll-coupled). The actual missing-signal risk under Path B-lite is **engagement breadth on the FB application domain**: a session that fires only `ProfileCometTimelineFeedRefetchQuery` for an hour is distinguishable from one that incidentally hovers links or briefly navigates elsewhere. **Still higher signal than status quo, but narrower and more targeted to mitigate than "no chatter at all" suggests.**
 - *Cadence.* Replays can be done much faster than scroll-driven pagination. Bursting through a year of pagination in 30 seconds is very hard to disguise. Need explicit throttling matched to plausible user pace, which partly defeats the throughput win.
 - *Token shape consistency.* `fb_dtsg`, `lsd`, `__rev`, etc. encode session state. If tokens don't match the cookies' session, FB flags. Token-management bugs will show up as bans, not error responses.
 
@@ -142,6 +142,7 @@ Mitigations:
 - Throttle to plausible page-scroll cadence (a few requests/second max), not maximum throughput.
 - Periodically reload the bootstrap page to refresh tokens and generate the surrounding chatter.
 - Mix replay sessions with occasional full page-driven sessions on the same account, so the account profile has both patterns.
+- Every N replay calls, perform a small native page interaction (a real scroll, a hover, a brief navigation) to generate engagement-breadth signal organically rather than synthesizing it. This addresses the narrower risk surface identified in [`hybrid overview`](../hybrid/overview.md) at the lowest engineering cost.
 
 **Net assessment.** *In principle* the cleanest solve for the wedge problem. *In practice* the missing-telemetry signal is a real risk that needs careful engineering to mitigate. Best as a long-term project once option 1 is buying us time. Hybrid stack (page-driven for shallow recent + GraphQL replay for deep historical) is probably the eventual right architecture.
 

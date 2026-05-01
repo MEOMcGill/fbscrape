@@ -19,9 +19,9 @@ when they fire later):
                               etc. — body bytes are skipped for binary types,
                               metadata + size are always recorded).
 
-Output goes to: data/path_b_investigation/<handle>_<UTC-timestamp>/
+Output goes to: data/hybrid/<handle>_<UTC-timestamp>/
 
-Pre-flight: all the path_b_investigation TEMP code in response.py and
+Pre-flight: all the hybrid TEMP code in response.py and
 browser_session.py must still be present (search `# TEMP:`). It is — but if
 the investigation has been concluded and that code stripped, this script will
 silently produce no capture files.
@@ -35,10 +35,11 @@ from pathlib import Path
 
 # --- Target ---------------------------------------------------------------
 # Picked from data/posts/2024-10-01_2026-04-17 — handle scraped successfully
-# and produced 42 posts. Small enough that the capture file is manageable but
-# deep enough that we see real pagination GraphQL traffic.
-TARGET_HANDLE = "JohnYakabuskiMPP"
-TARGET_ID = 2550
+# and produced 151 posts (~3-4x the depth of the JohnYakabuskiMPP capture).
+# We're using this one to verify the pagination + per-cycle XHR patterns
+# observed at 42 posts also hold at ~50 paginations.
+TARGET_HANDLE = "FilomenaTassi"
+TARGET_ID = 3155
 
 START_DATE = "2024-10-01"
 END_DATE = "2026-04-17"
@@ -46,7 +47,7 @@ END_DATE = "2026-04-17"
 # --- Output ---------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TIMESTAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-OUTPUT_DIR = REPO_ROOT / "data" / "path_b_investigation" / f"{TARGET_HANDLE}_{TIMESTAMP}"
+OUTPUT_DIR = REPO_ROOT / "data" / "hybrid" / f"{TARGET_HANDLE}_{TIMESTAMP}"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Capture toggles (must be set before fbscrape import) -----------------

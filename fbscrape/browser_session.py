@@ -1,12 +1,11 @@
 """
 Browser management and page control for Facebook scraping
 """
-from . import exceptions
 from .accounts_pool import AccountsPool
 from .response import ResponseInterceptor
 from .account import Account
 from .logger import logger
-from .models import ScrapingResult, Query
+from .models import ScrapeOutcome
 from .utils import (
     recursively_get_dict_value,
     get_device_os,
@@ -15,41 +14,34 @@ from .utils import (
     deserialize_fingerprint,
     fingerprint_os,
 )
-from .exceptions import FailedLoginError, CheckpointError, AccountDisabledError, TransientLoginError
+from .exceptions import (
+    FailedLoginError, CheckpointError, AccountDisabledError, TransientLoginError,
+    AccountBannedError, RateLimitError,
+)
 
 import asyncio
+import json
 import os
 import random
 from datetime import datetime, timezone, timedelta
+from urllib.parse import parse_qs, urlencode
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser, Locator
 from camoufox.async_api import AsyncNewBrowser
 from typing import Optional
 import re
 
 
-# (URL-path-suffix regex, outcome kind). Order matters: most-specific first
-# (so /checkpoint/disabled/ wins over /checkpoint/, and the `/?home` /
-# end-of-host / query-only patterns are kept narrow so they don't swallow
-# /login/, /zuck, /recover/, etc). Adding a new FB login flow = one row.
-_LOGIN_OUTCOMES: list[tuple[str, str]] = [
-    (r"/checkpoint/disabled/",   "disabled"),
-    (r"/checkpoint/",            "checkpoint"),
-    (r"/two_step_verification/", "two_factor"),
-    (r"/two_factor/",            "two_factor"),
-    (r"/?home",                  "logged_in"),  # /home, /home.php
-    (r"/?$",                     "logged_in"),  # bare root (host or host/)
-    (r"/?\?",                    "logged_in"),  # query-only (host?... / host/?...)
-]
-
-# Single source of truth: wait regex is the union; dispatch iterates the
-# same table in order and returns the first per-row pattern that matches.
-_HOST_RE = r"https://(?:www|m|web|mbasic)\.facebook\.com"
-_LOGIN_OUTCOME_RE = re.compile(
-    rf"^{_HOST_RE}(?:{'|'.join(f'(?:{p})' for p, _ in _LOGIN_OUTCOMES)})"
-)
-_LOGIN_OUTCOME_DISPATCH: list[tuple[re.Pattern, str]] = [
-    (re.compile(rf"^{_HOST_RE}{p}"), kind) for p, kind in _LOGIN_OUTCOMES
-]
+# Hybrid-mode constants — used by user_timeline_hybrid() to drive
+# pagination via page.request.post() instead of scroll-driven rendering.
+GRAPHQL_API_URL = "https://www.facebook.com/api/graphql/"
+# Headers managed by Playwright / TLS layer or by the BrowserContext; never
+# pass them through to page.request.post() from a captured template.
+HYBRID_HEADER_DROP = frozenset({
+    "host", "content-length", "connection", "accept-encoding", "cookie",
+})
+# GraphQL friendly name we look for in the live network capture to
+# extract the request template.
+HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 
 
 class BrowserSession:
@@ -60,14 +52,11 @@ class BrowserSession:
     # before escalating to the worker via TransientLoginError.
     LOGIN_FORM_MAX_ATTEMPTS = 2
 
-    # Per-call wall-clock cap on page-DOM ops (scroll, error checks). Playwright's
-    # `page.evaluate` and locator queries have no default timeout on the JS-engine
-    # side, so if FB's renderer wedges (anti-bot kill, OOM, GC death) the await
-    # blocks forever — the in-loop stall watchdog never fires because it runs
-    # downstream of the hung await. This bounds the worst case at the call site.
-    # TODO: replace with an external watchdog task that can cancel any hung await
-    # (see CLAUDE.md → "External watchdog task for hang detection").
-    OPERATION_TIMEOUT_SECONDS = 900
+    # NOTE: per-call wall-clock cap on page-DOM ops (scroll, error checks) used
+    # to live here as the class constant `OPERATION_TIMEOUT_SECONDS = 900`. It
+    # is now `operation_timeout_seconds`, a per-mode param in
+    # Query.ENDPOINT_REGISTRY (see docs/hybrid/overview.md and CLAUDE.md →
+    # "External watchdog task for hang detection" for the long-term plan).
 
     # ==================== Initialization & Lifecycle ====================
 
@@ -77,13 +66,11 @@ class BrowserSession:
             pool: AccountsPool,
             headless: bool = False,
             mobile: bool = False,
-            stall_timeout_seconds: int = 300,
     ):
         self.account = account
         self.pool = pool
         self.headless = headless
         self.mobile = mobile
-        self.stall_timeout_seconds = stall_timeout_seconds
 
         # the endpoint we're scrolling (set by scraping methods like user_timeline)
         self.endpoint: str = ""
@@ -96,9 +83,9 @@ class BrowserSession:
         self.response_interceptor: Optional[ResponseInterceptor] = None
 
     @classmethod
-    async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False, stall_timeout_seconds: int = 300):
+    async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False):
         logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}")
-        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile, stall_timeout_seconds=stall_timeout_seconds)
+        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile)
         await instance.initialize()
         return instance
 
@@ -223,7 +210,7 @@ class BrowserSession:
         if self.response_interceptor:
             # TEMP: Path B investigation. If FB_NETWORK_CAPTURE_DIR is set, dump the
             # captured XHR (request + response) to a JSONL file before tearing down.
-            # See docs/path_b_investigation.md. Remove this block when done.
+            # See docs/hybrid/overview.md. Remove this block when done.
             capture_dir = os.environ.get("FB_NETWORK_CAPTURE_DIR")
             if capture_dir and self.response_interceptor.network_capture:
                 try:
@@ -539,16 +526,37 @@ class BrowserSession:
     async def _wait_for_log_in_outcome(self) -> bool:
         """Wait for the post-login-form URL to settle and classify the outcome.
 
-        Outcomes are enumerated in the module-level `_LOGIN_OUTCOMES` table —
-        regex (`_LOGIN_OUTCOME_RE`) and dispatch share that single source of
-        truth, so adding a new FB login flow is one row.
+        Outcomes table: (URL-path-suffix regex, outcome kind). Order matters —
+        most-specific first (so /checkpoint/disabled/ wins over /checkpoint/,
+        and the `/?home` / end-of-host / query-only patterns are kept narrow
+        so they don't swallow /login/, /zuck, /recover/, etc.). Adding a new
+        FB login flow is one row. The wait regex is the union of all rows;
+        the dispatch iterates the same table in order and returns the first
+        per-row pattern that matches.
 
         On a known terminal failure (`disabled`, `checkpoint`, `two_factor`)
         we persist `error_msg` + mark the account inactive *before* raising,
         so higher layers don't need a second DB write.
         """
+        outcomes: list[tuple[str, str]] = [
+            (r"/checkpoint/disabled/",   "disabled"),
+            (r"/checkpoint/",            "checkpoint"),
+            (r"/two_step_verification/", "two_factor"),
+            (r"/two_factor/",            "two_factor"),
+            (r"/?home",                  "logged_in"),  # /home, /home.php
+            (r"/?$",                     "logged_in"),  # bare root (host or host/)
+            (r"/?\?",                    "logged_in"),  # query-only (host?... / host/?...)
+        ]
+        host_re = r"https://(?:www|m|web|mbasic)\.facebook\.com"
+        wait_re = re.compile(
+            rf"^{host_re}(?:{'|'.join(f'(?:{p})' for p, _ in outcomes)})"
+        )
+        dispatch: list[tuple[re.Pattern, str]] = [
+            (re.compile(rf"^{host_re}{p}"), kind) for p, kind in outcomes
+        ]
+
         try:
-            await self.page.wait_for_url(_LOGIN_OUTCOME_RE, timeout=5000)
+            await self.page.wait_for_url(wait_re, timeout=5000)
         except Exception as e:
             logger.debug(
                 f"No known login-outcome URL after 5s: {e} "
@@ -557,13 +565,13 @@ class BrowserSession:
             return False
 
         url = self.page.url
-        for pattern, kind in _LOGIN_OUTCOME_DISPATCH:
+        for pattern, kind in dispatch:
             if pattern.match(url):
                 return await self._dispatch_login_outcome(kind, url)
 
         # Unreachable as long as the wait regex and the dispatch list are
         # built from the same table — log and bail just in case.
-        logger.warning(f"URL matched _LOGIN_OUTCOME_RE but no handler: {url}")
+        logger.warning(f"URL matched login-outcome wait regex but no handler: {url}")
         return False
 
     async def _dispatch_login_outcome(self, kind: str, url: str) -> bool:
@@ -593,46 +601,51 @@ class BrowserSession:
 
     # ==================== Scraping ====================
 
-    async def user_timeline(
+    async def user_timeline_manual(
         self,
         handle: str,
         start_date: str,
         end_date: str,
-    ) -> ScrapingResult:
+        scroll_window_height_coefficient: float = 3.0,
+        post_nav_sleep_seconds: float = 5.0,
+        inter_scroll_sleep_range: tuple[float, float] = (2.0, 4.5),
+        breather_every_n_scrolls: int = 50,
+        breather_duration_seconds: float = 30,
+        max_no_new_posts_streak: int = 30,
+        stall_timeout_seconds: float = 300,
+        operation_timeout_seconds: float = 900,
+    ) -> ScrapeOutcome:
         """
-        Scrape a Facebook user's homepage using GraphQL response interception.
+        Scrape a Facebook user's homepage by driving scroll and intercepting
+        GraphQL responses (the "manual" mode of the UserTimeline endpoint).
+
+        Direct-call caveat: when invoked outside the Worker pipeline, callers
+        are responsible for pre-validating inputs (date format / range / future
+        end_date clamping). This method does not run Query.__post_init__.
+        Going through `FacebookScraper.user_timeline` does run validation.
 
         Args:
-            handle: Facebook username/handle
-            start_date: Start date for scraping (YYYY-MM-DD)
-            end_date: End date for scraping (YYYY-MM-DD)
+            handle: Facebook username/handle.
+            start_date / end_date: YYYY-MM-DD.
+            (... see Query.ENDPOINT_REGISTRY[("UserTimeline","manual")] for the
+             full list of param defaults and meanings.)
 
         Returns:
-            ScrapingResult with outcome and collected data
+            ScrapeOutcome — Worker composes the final ScrapingResult by
+            attaching the canonical Query via ScrapingResult.from_outcome.
         """
 
         self.endpoint = "UserTimeline"
-        logger.debug(f"user_timeline() starting for @{handle}, date range: {start_date} to {end_date}")
+        logger.debug(f"user_timeline_manual() starting for @{handle}, date range: {start_date} to {end_date}")
 
         base_url = "https://www.facebook.com/"
         target_url = f"{base_url}{handle}/"
 
         scrape_start_time = datetime.now(timezone.utc)
+
+        # Inputs are assumed pre-validated (see direct-call caveat above).
         start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
         end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
-
-        # Create Query object for this scrape
-        query = Query(
-            endpoint=self.endpoint,
-            query={
-                "handle": handle,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
-            params={},
-            start_date=start_datetime,
-            end_date=end_datetime
-        )
 
         total_scrolls = 0
         no_new_posts_count = 0
@@ -652,15 +665,14 @@ class BrowserSession:
                 if not self.is_on_page(target_url):
                     logger.info(f"Navigating to {target_url}")
                     await self.goto(target_url)
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(post_nav_sleep_seconds)
 
                     # press escape key
                     await self.page.keyboard.press('Escape')
 
                     # Check if we got logged out
                     if not self.is_on_page(target_url):
-                        return ScrapingResult(
-                            query=query,
+                        return ScrapeOutcome(
                             result='logged out while scraping',
                             posts=self.response_interceptor.get_posts(),
                             time_started=scrape_start_time,
@@ -671,23 +683,21 @@ class BrowserSession:
                     try:
                         error = await asyncio.wait_for(
                             self.check_error_conditions(),
-                            timeout=self.OPERATION_TIMEOUT_SECONDS,
+                            timeout=operation_timeout_seconds,
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
                             f"@{handle}: check_error_conditions() (post-nav) hung > "
-                            f"{self.OPERATION_TIMEOUT_SECONDS}s — returning partial results"
+                            f"{operation_timeout_seconds}s — returning partial results"
                         )
-                        return ScrapingResult(
-                            query=query,
-                            result=f'hang: post-nav error check timed out after {self.OPERATION_TIMEOUT_SECONDS}s',
+                        return ScrapeOutcome(
+                            result=f'hang: post-nav error check timed out after {operation_timeout_seconds}s',
                             posts=self.response_interceptor.get_posts(),
                             time_started=scrape_start_time,
-                            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                            time_taken=datetime.now(timezone.utc) - scrape_start_time
                         )
                     if error:
-                        return ScrapingResult(
-                            query=query,
+                        return ScrapeOutcome(
                             result=error,
                             posts=self.response_interceptor.get_posts(),
                             time_started=scrape_start_time,
@@ -702,9 +712,9 @@ class BrowserSession:
                 last_resp_dbg = self.response_interceptor.last_response_time
                 if last_resp_dbg is not None:
                     silence_dbg = (datetime.now(timezone.utc) - last_resp_dbg).total_seconds()
-                    last_resp_str = f"{last_resp_dbg.strftime('%H:%M:%S')} ({silence_dbg:.1f}s ago, threshold={self.stall_timeout_seconds}s)"
+                    last_resp_str = f"{last_resp_dbg.strftime('%H:%M:%S')} ({silence_dbg:.1f}s ago, threshold={stall_timeout_seconds}s)"
                 else:
-                    last_resp_str = f"never (threshold={self.stall_timeout_seconds}s)"
+                    last_resp_str = f"never (threshold={stall_timeout_seconds}s)"
                 logger.debug(
                     f"@{handle} iter {total_scrolls}: after get_posts() "
                     f"({(datetime.now(timezone.utc) - t_get_posts).total_seconds():.2f}s), "
@@ -727,47 +737,43 @@ class BrowserSession:
                         try:
                             error = await asyncio.wait_for(
                                 self.check_error_conditions(),
-                                timeout=self.OPERATION_TIMEOUT_SECONDS,
+                                timeout=operation_timeout_seconds,
                             )
                         except asyncio.TimeoutError:
                             logger.warning(
                                 f"@{handle}: check_error_conditions() (stalled) hung > "
-                                f"{self.OPERATION_TIMEOUT_SECONDS}s — returning partial results"
+                                f"{operation_timeout_seconds}s — returning partial results"
                             )
-                            return ScrapingResult(
-                                query=query,
-                                result=f'hang: stalled error check timed out after {self.OPERATION_TIMEOUT_SECONDS}s',
+                            return ScrapeOutcome(
+                                result=f'hang: stalled error check timed out after {operation_timeout_seconds}s',
                                 posts=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
-                                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                                time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
                         logger.debug(
                             f"@{handle} iter {total_scrolls}: after check_error_conditions() "
                             f"({(datetime.now(timezone.utc) - t_err).total_seconds():.2f}s), error={error!r}"
                         )
                         if error:
-                            return ScrapingResult(
-                                query=query,
+                            return ScrapeOutcome(
                                 result=error,
                                 posts=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
 
-                    if no_new_posts_count > 30:
+                    if no_new_posts_count > max_no_new_posts_streak:
                         if current_post_count == 0:
-                            return ScrapingResult(
-                                query=query,
+                            return ScrapeOutcome(
                                 result='no posts',
-                                posts=[],
+                                posts=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
                         else:
-                            return ScrapingResult(
-                                query=query,
+                            return ScrapeOutcome(
                                 result='scraped until first ever post was reached',
-                                posts=posts,
+                                posts=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
@@ -785,12 +791,13 @@ class BrowserSession:
 
                         # Check if we've reached the target date
                         if oldest_timestamp.replace(tzinfo=None) < start_datetime:
-                            response_interceptor_posts = self.response_interceptor.get_posts()
-                            logger.info(f"Reached target start date {start_date} for @{handle} scraping {len(response_interceptor_posts)} posts")
-                            return ScrapingResult(
-                                query=query,
+                            logger.info(
+                                f"Reached target start date {start_date} for @{handle} "
+                                f"scraping {len(self.response_interceptor.get_posts())} posts"
+                            )
+                            return ScrapeOutcome(
                                 result='scraped until user-specified starting date was reached',
-                                posts=response_interceptor_posts,
+                                posts=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
@@ -798,35 +805,36 @@ class BrowserSession:
                 # Watchdog: bail out if Facebook has stopped responding to GraphQL
                 last_resp = self.response_interceptor.last_response_time or scrape_start_time
                 silence_seconds = (datetime.now(timezone.utc) - last_resp).total_seconds()
-                if silence_seconds > self.stall_timeout_seconds:
+                if silence_seconds > stall_timeout_seconds:
                     logger.warning(
                         f"@{handle}: no GraphQL response for {silence_seconds:.0f}s "
-                        f"(threshold={self.stall_timeout_seconds}s) — returning partial results"
+                        f"(threshold={stall_timeout_seconds}s) — returning partial results"
                     )
-                    return ScrapingResult(
-                        query=query,
+                    return ScrapeOutcome(
                         result=f'stalled: no graphql response for {int(silence_seconds)}s',
                         posts=self.response_interceptor.get_posts(),
                         time_started=scrape_start_time,
-                        time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                        time_taken=datetime.now(timezone.utc) - scrape_start_time
                     )
 
                 # Scroll to trigger loading more posts (also records scroll in database)
                 t_scroll = datetime.now(timezone.utc)
                 logger.debug(f"@{handle} iter {total_scrolls}: before scroll()")
                 try:
-                    await asyncio.wait_for(self.scroll(), timeout=self.OPERATION_TIMEOUT_SECONDS)
+                    await asyncio.wait_for(
+                        self.scroll(window_height_coefficient=scroll_window_height_coefficient),
+                        timeout=operation_timeout_seconds,
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        f"@{handle}: scroll() hung > {self.OPERATION_TIMEOUT_SECONDS}s "
+                        f"@{handle}: scroll() hung > {operation_timeout_seconds}s "
                         f"— renderer likely wedged, returning partial results"
                     )
-                    return ScrapingResult(
-                        query=query,
-                        result=f'hang: scroll timed out after {self.OPERATION_TIMEOUT_SECONDS}s',
+                    return ScrapeOutcome(
+                        result=f'hang: scroll timed out after {operation_timeout_seconds}s',
                         posts=self.response_interceptor.get_posts(),
                         time_started=scrape_start_time,
-                        time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                        time_taken=datetime.now(timezone.utc) - scrape_start_time
                     )
                 logger.debug(
                     f"@{handle} iter {total_scrolls}: after scroll() "
@@ -834,12 +842,15 @@ class BrowserSession:
                 )
                 total_scrolls += 1
 
-                # Rate limiting
-                if total_scrolls % 50 == 0:
-                    logger.info(f"@{handle}: {current_post_count} posts after {total_scrolls} scrolls - pausing 30s")
-                    await asyncio.sleep(30)
+                # Periodic breather to look less bot-like
+                if total_scrolls % breather_every_n_scrolls == 0:
+                    logger.info(
+                        f"@{handle}: {current_post_count} posts after {total_scrolls} scrolls - "
+                        f"pausing {breather_duration_seconds}s"
+                    )
+                    await asyncio.sleep(breather_duration_seconds)
 
-                sleep_s = random.uniform(2, 4.5)
+                sleep_s = random.uniform(*inter_scroll_sleep_range)
                 logger.debug(f"@{handle} iter {total_scrolls-1}: sleeping {sleep_s:.2f}s for GraphQL responses")
                 await asyncio.sleep(sleep_s)
                 logger.debug(
@@ -849,13 +860,439 @@ class BrowserSession:
 
             except Exception as e:
                 logger.error(f"Error scraping @{handle}: {e}")
-                return ScrapingResult(
-                    query=query,
+                return ScrapeOutcome(
                     result=f'error: {str(e)}',
                     posts=self.response_interceptor.get_posts(),
                     time_started=scrape_start_time,
                     time_taken=datetime.now(timezone.utc) - scrape_start_time
                 )
+
+    # ==================== Hybrid mode (UserTimeline) ====================
+    #
+    # Boundary between hybrid-private and shared utilities (for the future
+    # manual+hybrid dedup pass — search for `manual+hybrid dedup`):
+    #   Shared utilities used by hybrid:
+    #     - self.goto()                         — navigation wrapper
+    #     - self.scroll()                       — bootstrap + organic bursts
+    #     - self.check_error_conditions()       — DOM error detection
+    #     - self.record_scroll()                — DB write for rotation policy
+    #     - self.response_interceptor.parser.parse_timeline_response()
+    #     - self.response_interceptor.add_posts()
+    #     - self.response_interceptor.latest_csr / latest_dyn (token freshness)
+    #   Hybrid-private (search `_hybrid_*` to find them all):
+    #     phase methods: _hybrid_navigate, _hybrid_bootstrap,
+    #                    _hybrid_capture_template, _hybrid_pagination_loop
+    #     helpers:       _hybrid_wait_for_template, _hybrid_parse_form_data,
+    #                    _hybrid_clean_headers, _hybrid_build_body,
+    #                    _hybrid_walk_response_for, _hybrid_extract_end_cursor,
+    #                    _hybrid_extract_oldest_creation_time,
+    #                    _hybrid_extract_graphql_error,
+    #                    _hybrid_organic_scroll_burst
+    #     constants:     GRAPHQL_API_URL, HYBRID_HEADER_DROP,
+    #                    HYBRID_TARGET_FRIENDLY_NAME
+
+    async def user_timeline_hybrid(
+        self,
+        handle: str,
+        start_date: str,
+        end_date: str,
+        pagination_count: int = 3,
+        scroll_burst_every: int = 10,
+        scroll_burst_size_range: tuple[int, int] = (2, 5),
+        pagination_sleep_mean: float = 2.5,
+        pagination_sleep_std: float = 0.5,
+        template_capture_timeout: float = 20.0,
+        max_paginations: int = 10000,
+        post_nav_sleep_seconds: float = 3.0,
+        request_timeout_ms: int = 30000,
+        max_no_progress_streak: int = 5,
+        operation_timeout_seconds: float = 900,
+    ) -> ScrapeOutcome:
+        """
+        Scrape a Facebook user's timeline via the "hybrid" mode.
+
+        Bypasses scroll-driven pagination: navigates to the profile, provokes
+        one bootstrap scroll to fire the first ProfileCometTimelineFeedRefetchQuery
+        (so we can capture its shape), then drives all subsequent paginations
+        via `page.request.post()` directly. `beforeTime` is set on every
+        replay (matching FB's UI date-filter behavior) so FB caps the
+        upper bound server-side; `afterTime` is left `null` (FB's UI never
+        sets it — overriding would be a fingerprint). The lower bound is
+        enforced client-side by terminating the loop when a batch's oldest
+        post is older than `start_date`.
+
+        Every successful pagination request increments the account's scroll
+        count via `record_scroll()` — paginations count as scrolls for
+        rotation-policy purposes (see docs/hybrid/overview.md
+        "Bookkeeping rules").
+
+        Stop conditions:
+          1. `end_cursor` missing/null in the response — FB has no more
+             posts in our filter range.
+          2. (defensive) Oldest post in response is older than `start_date`
+             — in case `afterTime` returns posts past the boundary.
+
+        Direct-call caveat: when invoked outside the Worker pipeline, callers
+        are responsible for pre-validating inputs (date format / range / future
+        end_date clamping). This method does not run Query.__post_init__.
+        Going through `FacebookScraper.user_timeline` does run validation.
+
+        Args:
+            handle: Facebook username/handle.
+            start_date: Lower-bound date (YYYY-MM-DD). Sent as `afterTime`.
+            end_date: Upper-bound date (YYYY-MM-DD). Sent as `beforeTime`.
+            (... see Query.ENDPOINT_REGISTRY[("UserTimeline","hybrid")] for the
+             full list of param defaults and meanings.)
+
+        Returns:
+            ScrapeOutcome — Worker composes the final ScrapingResult by
+            attaching the canonical Query via ScrapingResult.from_outcome.
+        """
+        self.endpoint = "UserTimeline"
+        logger.info(
+            f"[hybrid] @{handle}: starting hybrid scrape "
+            f"({start_date} → {end_date}, count={pagination_count})"
+        )
+
+        target_url = f"https://www.facebook.com/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+
+        # Inputs are assumed pre-validated (see direct-call caveat above).
+        # Compute the date bounds the pagination loop needs.
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+        # afterTime: start-of-day UTC of start_date (inclusive — catches every
+        # post on start_date since their creation_time ≥ start-of-day).
+        start_unix = int(start_datetime.timestamp())
+
+        # beforeTime: end-of-day UTC of end_date, capped at "now" so we capture
+        # all posts up to this exact second when end_date is today. Mirrors
+        # FB's frontend behavior: when "today" is selected as a date filter,
+        # FB sets beforeTime to int(datetime.now(UTC).timestamp()) (verified
+        # empirically — see docs/hybrid/overview.md). A non-null
+        # beforeTime is also a precondition for FB honoring `cursor=null` on
+        # the first replay (which is how we walk a date-filtered range from
+        # the most-recent end), so this guarantee matters.
+        end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
+        now_utc = datetime.now(timezone.utc)
+        end_unix = int(min(end_of_day, now_utc).timestamp())
+
+        # Bundle pagination-loop tunables into a local params dict so the
+        # phase method can pull what it needs by key (and adding a new tunable
+        # doesn't need a signature change in _hybrid_pagination_loop).
+        loop_params = {
+            "pagination_count": pagination_count,
+            "scroll_burst_every": scroll_burst_every,
+            "scroll_burst_size_range": scroll_burst_size_range,
+            "pagination_sleep_mean": pagination_sleep_mean,
+            "pagination_sleep_std": pagination_sleep_std,
+            "max_paginations": max_paginations,
+            "max_no_progress_streak": max_no_progress_streak,
+            "request_timeout_ms": request_timeout_ms,
+            "operation_timeout_seconds": operation_timeout_seconds,
+        }
+
+        self.response_interceptor.flush()
+        # Hybrid sources every post from a replay request whose body carries
+        # the user's date filters. The natural PCTFRQ fired by the bootstrap
+        # scroll (and any organic-burst PCTFRQ during the loop) has no
+        # beforeTime/afterTime set — auto-extracting its posts would drop
+        # off-range posts into the result. Token tracking, viewer detection,
+        # and network_capture all keep working with this off.
+        self.response_interceptor.extract_posts = False
+
+        # Phase 1 — navigate
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                posts=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+
+        # Phase 2 — bootstrap scroll
+        error = await self._hybrid_bootstrap(operation_timeout_seconds)
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                posts=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+
+        # Phase 3 — capture pagination template
+        error, template = await self._hybrid_capture_template(
+            template_capture_timeout=template_capture_timeout,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                posts=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+        logger.info(
+            f"[hybrid] @{handle}: template captured "
+            f"(doc_id={template['doc_id']}, profile_id={template['profile_id']})"
+        )
+
+        # Phase 4 — pagination loop
+        result_str = await self._hybrid_pagination_loop(
+            handle=handle,
+            template=template,
+            params=loop_params,
+            start_unix=start_unix,
+            end_unix=end_unix,
+        )
+        return ScrapeOutcome(
+            result=result_str,
+            posts=self.response_interceptor.get_posts(),
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time
+        )
+
+    # ---------------- Hybrid mode phases ----------------
+
+    async def _hybrid_navigate(
+        self,
+        target_url: str,
+        post_nav_sleep_seconds: float,
+        operation_timeout_seconds: float,
+    ) -> str | None:
+        """Navigate to the profile and run the post-nav error check.
+        Returns an error result string, or None on success."""
+        logger.info(f"[hybrid] navigating to {target_url}")
+        try:
+            await self.goto(target_url, wait_until="domcontentloaded")
+        except Exception as e:
+            return f'navigation_error: {e}'
+        await asyncio.sleep(post_nav_sleep_seconds)
+
+        await self.page.keyboard.press('Escape')
+        await asyncio.sleep(abs(random.gauss(1, 0.2)))
+
+        try:
+            error = await asyncio.wait_for(
+                self.check_error_conditions(),
+                timeout=operation_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return f'hang: post-nav error check timed out after {operation_timeout_seconds}s'
+        return error  # may be None (success) or an FB-surfaced error code
+
+    async def _hybrid_bootstrap(self, operation_timeout_seconds: float) -> str | None:
+        """Provoke the first ProfileCometTimelineFeedRefetchQuery via a real
+        scroll. Required because the profile page does not fire pagination
+        GraphQL on initial load alone (see memory: pagination_needs_scroll)."""
+        logger.debug("[hybrid] bootstrap scroll to provoke first pagination")
+        try:
+            await asyncio.wait_for(
+                self.scroll(window_height_coefficient=1.0),
+                timeout=operation_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return f'hang: bootstrap scroll timed out after {operation_timeout_seconds}s'
+        return None
+
+    async def _hybrid_capture_template(
+        self,
+        template_capture_timeout: float,
+        operation_timeout_seconds: float,
+    ) -> tuple[str | None, dict | None]:
+        """Wait for the natural pagination request to land and extract a
+        replay template from it.
+
+        We copy the *form* (static tokens: fb_dtsg, lsd, doc_id, the
+        __relay_internal__pv__* flags, etc.) and *headers* — but NOT the
+        cursor. With a non-null `beforeTime` set on every replay, FB honors
+        `cursor=null` on the first request and returns the most-recent batch
+        within [afterTime, beforeTime] (matches FB's own frontend behavior
+        when a date filter is active). Reading the natural cursor would skip
+        the SSR-rendered batch; using null instead picks it up.
+
+        Returns (error_or_None, template_or_None). Template dict shape:
+            { 'form':       <full url-decoded form dict>,
+              'headers':    <cleaned header dict ready for page.request.post>,
+              'cursor':     None — first replay always uses cursor=null,
+              'doc_id':     <doc_id, for logging>,
+              'profile_id': <profile id, for logging> }
+        On capture failure, re-checks DOM error conditions to surface a
+        clean reason (private profile, etc.) instead of a generic timeout.
+        """
+        template = await self._hybrid_wait_for_template(template_capture_timeout)
+        if not template:
+            try:
+                error = await asyncio.wait_for(
+                    self.check_error_conditions(),
+                    timeout=operation_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                error = None
+            return (error or 'template_capture_timeout', None)
+
+        form = self._hybrid_parse_form_data(template["post_data"])
+        headers = self._hybrid_clean_headers(template["headers"])
+        try:
+            initial_variables = json.loads(form.get("variables", "{}"))
+        except json.JSONDecodeError:
+            initial_variables = {}
+
+        return (None, {
+            "form": form,
+            "headers": headers,
+            "cursor": None,  # see docstring — cursor=null is the right start
+            "doc_id": form.get("doc_id"),
+            "profile_id": initial_variables.get("id"),
+        })
+
+    async def _hybrid_pagination_loop(
+        self,
+        handle: str,
+        template: dict,
+        params: dict,
+        start_unix: int,
+        end_unix: int,
+    ) -> str:
+        """Drive paginations via page.request.post() until one of the stop
+        conditions fires. Returns the result string for the ScrapingResult."""
+        template_form = template["form"]
+        template_headers = template["headers"]
+        cursor = template["cursor"]
+
+        # Pull tunables from the validated params dict so callers can't
+        # accidentally bypass registry validation.
+        pagination_count = params["pagination_count"]
+        scroll_burst_every = params["scroll_burst_every"]
+        scroll_burst_size_range = params["scroll_burst_size_range"]
+        pagination_sleep_mean = params["pagination_sleep_mean"]
+        pagination_sleep_std = params["pagination_sleep_std"]
+        max_paginations = params["max_paginations"]
+        max_no_progress_streak = params["max_no_progress_streak"]
+        request_timeout_ms = params["request_timeout_ms"]
+        operation_timeout_seconds = params["operation_timeout_seconds"]
+
+        total_paginations = 0
+        no_progress_streak = 0
+        previous_post_count = len(self.response_interceptor.get_posts())
+
+        # max_paginations == -1 means "no cap"; any positive int caps the loop.
+        while max_paginations < 0 or total_paginations < max_paginations:
+            # No `afterTime` override — FB's UI never sets afterTime (only
+            # beforeTime), so sending it would be a unique fingerprint. The
+            # captured template has `afterTime: null` baked in; not
+            # overriding keeps our replay shape identical to the UI.
+            # Lower-bound enforcement happens client-side: terminate when a
+            # batch's oldest post is older than start_unix (further down).
+            overrides = {
+                "cursor": cursor,
+                "beforeTime": end_unix,
+                "count": pagination_count,
+            }
+            body = self._hybrid_build_body(template_form, overrides)
+
+            iter_start = datetime.now(timezone.utc)
+            response, text, error_str = await self._hybrid_send_replay(
+                handle=handle,
+                body=body,
+                template_headers=template_headers,
+                request_timeout_ms=request_timeout_ms,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+            if error_str is not None:
+                return error_str
+
+            await self.record_scroll(endpoint=self.endpoint, count=1)
+            total_paginations += 1
+
+            # Extract posts via the shared parser; push into the interceptor's
+            # accumulator so get_posts() returns a unified view of everything
+            # (template-capture pagination + hybrid replays).
+            try:
+                parsed = self.response_interceptor.parser.parse_timeline_response(
+                    text.encode("utf-8"), GRAPHQL_API_URL
+                )
+            except Exception as e:
+                logger.warning(f"[hybrid] @{handle}: parser raised: {e}")
+                parsed = None
+            if parsed and parsed.get("posts"):
+                self.response_interceptor.add_posts(parsed["posts"])
+
+            # 200 + errors[] populated → drain posts above, then classify.
+            # Auth-ish errors mean the session is invalid → raise so Worker
+            # rotates the account. Other errors → bail with a result string.
+            graphql_error = self._hybrid_extract_graphql_error(text)
+            if graphql_error:
+                logger.warning(f"[hybrid] @{handle}: GraphQL error: {graphql_error}")
+                if self._hybrid_is_auth_error(graphql_error):
+                    raise FailedLoginError(
+                        f"Session invalid mid-scrape (graphql error: {graphql_error})"
+                    )
+                return f'graphql_error: {graphql_error}'
+
+            current_post_count = len(self.response_interceptor.get_posts())
+            new_posts_in_iter = current_post_count - previous_post_count
+            no_progress_streak = 0 if new_posts_in_iter else no_progress_streak + 1
+            previous_post_count = current_post_count
+
+            # Stop 1: end_cursor missing → no more posts in the filter range.
+            end_cursor = self._hybrid_extract_end_cursor(text)
+            if not end_cursor:
+                elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
+                logger.info(
+                    f"[hybrid] @{handle}: end_cursor null after "
+                    f"{total_paginations} paginations (last iter {elapsed_iter:.2f}s) — "
+                    f"end of feed within filter range"
+                )
+                return 'scraped until user-specified starting date was reached'
+
+            # Stop 2 (defensive): oldest post in this response < start_unix.
+            oldest_in_batch = self._hybrid_extract_oldest_creation_time(text)
+            if oldest_in_batch is not None and oldest_in_batch < start_unix:
+                logger.info(
+                    f"[hybrid] @{handle}: oldest post in batch "
+                    f"({datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()}) "
+                    f"is older than start; done"
+                )
+                return 'scraped until user-specified starting date was reached'
+
+            # No-progress backstop: bail rather than spin if FB's filter is
+            # returning empty page after empty page.
+            if no_progress_streak >= max_no_progress_streak:
+                logger.warning(
+                    f"[hybrid] @{handle}: {no_progress_streak} paginations "
+                    f"with no new posts — bailing"
+                )
+                return 'no_new_posts_streak'
+
+            cursor = end_cursor
+
+            elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
+            logger.debug(
+                f"[hybrid] @{handle} pagination {total_paginations}: "
+                f"{response.status} in {elapsed_iter:.2f}s, "
+                f"posts now={current_post_count} (+{new_posts_in_iter})"
+            )
+
+            if (total_paginations % scroll_burst_every) == 0:
+                await self._hybrid_organic_scroll_burst(
+                    *scroll_burst_size_range,
+                    operation_timeout_seconds=operation_timeout_seconds,
+                )
+
+            sleep_s = abs(random.gauss(pagination_sleep_mean, pagination_sleep_std))
+            await asyncio.sleep(sleep_s)
+
+        logger.warning(
+            f"[hybrid] @{handle}: hit max_paginations cap ({max_paginations})"
+        )
+        return f'hit max_paginations cap ({max_paginations})'
 
     async def check_error_conditions(self) -> str | None:
         """
@@ -1127,3 +1564,350 @@ class BrowserSession:
                     continue
 
         return oldest_timestamp
+
+    # ---------------- Hybrid mode helpers ----------------
+    # Used by user_timeline_hybrid() to drive pagination via
+    # page.request.post() instead of scroll-driven rendering.
+
+    @staticmethod
+    def _hybrid_parse_form_data(post_data: str | None) -> dict[str, str]:
+        """Parse a urlencoded form body into a dict (last-value-wins on
+        duplicates). Returns empty dict for None/empty input."""
+        if not post_data:
+            return {}
+        try:
+            parsed = parse_qs(post_data, keep_blank_values=True)
+            return {k: v[-1] for k, v in parsed.items()}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _hybrid_clean_headers(raw: dict[str, str]) -> dict[str, str]:
+        """Drop HTTP/2 pseudo-headers and headers managed by Playwright /
+        BrowserContext (cookie, host, content-length, etc.) so they aren't
+        double-set when we hand them to page.request.post()."""
+        out = {}
+        for k, v in raw.items():
+            if k.startswith(":"):
+                continue
+            if k.lower() in HYBRID_HEADER_DROP:
+                continue
+            out[k] = v
+        return out
+
+    def _hybrid_build_body(
+        self,
+        template_form: dict[str, str],
+        variable_overrides: dict,
+    ) -> str:
+        """Build the form body for a hybrid replay POST.
+
+        Steps:
+          1. Apply `variable_overrides` (cursor, beforeTime, afterTime, count)
+             to the JSON-encoded `variables` field of the template.
+          2. Splice in the freshest `__csr` and `__dyn` seen on any natural
+             browser-issued GraphQL POST (tracked by ResponseInterceptor).
+             FB rotates these per-session — `__csr` every ~3-4 paginations,
+             `__dyn` every ~10-25 — so replaying the cached template values
+             eventually drifts and gets rejected. Live-splicing keeps replays
+             aligned with the most recent organic traffic.
+          3. URL-encode the whole body for sending.
+        """
+        body = dict(template_form)
+        try:
+            variables = json.loads(body.get("variables", "{}"))
+        except json.JSONDecodeError:
+            variables = {}
+        variables.update(variable_overrides)
+        body["variables"] = json.dumps(variables, separators=(",", ":"))
+
+        # Token splicing: prefer freshness if any natural GraphQL traffic has
+        # been seen since the template was captured.
+        if self.response_interceptor.latest_csr:
+            body["__csr"] = self.response_interceptor.latest_csr
+        if self.response_interceptor.latest_dyn:
+            body["__dyn"] = self.response_interceptor.latest_dyn
+
+        return urlencode(body)
+
+    async def _hybrid_wait_for_template(self, timeout_seconds: float) -> dict | None:
+        """Poll until a natural ProfileCometTimelineFeedRefetchQuery request
+        has been observed (saved to `interceptor.latest_pctfrq_request` by
+        `_track_pctfrq_template`), or until the timeout elapses.
+
+        Returns a dict shaped {"post_data": str|None, "headers": dict} — the
+        narrower template hook we promote to production. Falls back to
+        `network_capture` if it's been populated (i.e., FB_NETWORK_CAPTURE_ALL=1)
+        and the dedicated hook hasn't fired yet.
+        """
+        elapsed = 0.0
+        interval = 0.5
+        while elapsed < timeout_seconds:
+            tpl = self.response_interceptor.latest_pctfrq_request
+            if tpl is not None:
+                return tpl
+            # Fallback: scan the full capture if it happens to be enabled.
+            for rec in self.response_interceptor.network_capture:
+                req = rec.get("request") or {}
+                headers = req.get("headers") or {}
+                if headers.get("x-fb-friendly-name") == HYBRID_TARGET_FRIENDLY_NAME:
+                    return {"post_data": req.get("post_data"), "headers": headers}
+                form = self._hybrid_parse_form_data(req.get("post_data"))
+                if form.get("fb_api_req_friendly_name") == HYBRID_TARGET_FRIENDLY_NAME:
+                    return {"post_data": req.get("post_data"), "headers": headers}
+            await asyncio.sleep(interval)
+            elapsed += interval
+        return None
+
+    @staticmethod
+    def _hybrid_walk_response_for(text: str, target_keys: set[str]):
+        """Walk a JSON or JSONL response body, yielding (key, value) pairs
+        for every nested dict key matching target_keys.
+
+        FB GraphQL can be a single JSON doc OR JSONL when @stream/@defer
+        is in play, so try JSONL first then fall back to single-doc.
+        """
+        if not text:
+            return
+        docs: list = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                docs.append(json.loads(line))
+            except json.JSONDecodeError:
+                docs = []
+                break
+        if not docs:
+            try:
+                docs = [json.loads(text)]
+            except json.JSONDecodeError:
+                return
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in target_keys:
+                        yield (k, v)
+                    yield from walk(v)
+            elif isinstance(o, list):
+                for item in o:
+                    yield from walk(item)
+
+        for d in docs:
+            yield from walk(d)
+
+    @classmethod
+    def _hybrid_extract_end_cursor(cls, text: str) -> str | None:
+        """Find the first non-empty `end_cursor` (or `endCursor`) in a
+        GraphQL response body. Returns None if no cursor is present —
+        which we interpret as end-of-feed."""
+        for k, v in cls._hybrid_walk_response_for(text, {"end_cursor", "endCursor"}):
+            if v:
+                return v
+        return None
+
+    @classmethod
+    def _hybrid_extract_oldest_creation_time(cls, text: str) -> int | None:
+        """Find the smallest `creation_time` (unix seconds) in a GraphQL
+        response body. Returns None if no creation_time was present."""
+        oldest: int | None = None
+        for _, v in cls._hybrid_walk_response_for(text, {"creation_time"}):
+            if isinstance(v, (int, float)):
+                t = int(v)
+                if oldest is None or t < oldest:
+                    oldest = t
+        return oldest
+
+    @classmethod
+    def _hybrid_extract_graphql_error(cls, text: str) -> str | None:
+        """Find the first GraphQL error message in a response body. Returns
+        None if no errors are surfaced. FB returns 200 even on errors, so
+        this is how we detect them."""
+        for _, v in cls._hybrid_walk_response_for(text, {"errors"}):
+            if isinstance(v, list) and v:
+                first = v[0]
+                if isinstance(first, dict):
+                    msg = first.get("message")
+                    if msg:
+                        return str(msg)[:200]
+                elif isinstance(first, str):
+                    return first[:200]
+        return None
+
+    # Substrings that indicate the GraphQL error is auth-related (session/token
+    # invalid). FB historically uses 200 + errors[] for these instead of HTTP
+    # 401, so we have to pattern-match on the message. Empirical mapping is
+    # incomplete (see CLAUDE.md TODO "HTTP error classification"); update as
+    # we observe new ones in the wild.
+    _HYBRID_AUTH_ERROR_MARKERS = (
+        "lsddataerror",       # historical FB auth-token error
+        "useridiszero",       # session lost, viewer is anonymous
+        "not logged in",
+        "must be logged in",
+        "invalid session",
+        "session has expired",
+    )
+
+    @classmethod
+    def _hybrid_is_auth_error(cls, message: str) -> bool:
+        """True if a GraphQL error message looks auth-related (session lost,
+        token invalid, etc.). Pattern-matched because FB returns these as
+        200+errors[] rather than HTTP 401."""
+        if not message:
+            return False
+        m = message.lower()
+        return any(marker in m for marker in cls._HYBRID_AUTH_ERROR_MARKERS)
+
+    @staticmethod
+    def _hybrid_body_looks_like_html(text: str) -> bool:
+        """True if a response body is HTML (FB redirected our POST to a
+        login / interstitial page). page.request.post does not auto-follow
+        the redirect; the body lands here as HTML and JSON parsing would
+        fail. Detect early so we can raise a clean logged-out signal."""
+        head = text.lstrip()[:64].lower()
+        return head.startswith("<!doctype") or head.startswith("<html")
+
+    async def _hybrid_send_replay(
+        self,
+        handle: str,
+        body: str,
+        template_headers: dict,
+        request_timeout_ms: int,
+        operation_timeout_seconds: float,
+    ) -> tuple[object | None, str, str | None]:
+        """Send one replay request with built-in 5xx-retry and HTTP-status
+        classification. Returns `(response, body_text, error_string)`:
+
+        - On success: `(response, body_text, None)` and the loop continues.
+        - On terminal failure with no rotation: `(None, "", error_string)`
+          and the loop returns that string as the ScrapeOutcome result.
+        - On terminal failure that warrants rotation: raises a typed
+          exception (`FailedLoginError` / `AccountBannedError` /
+          `RateLimitError`) so `Worker.execute_task`'s existing handlers
+          activate.
+
+        Status mapping (see CLAUDE.md TODO "HTTP error classification" — this
+        is the working hypothesis until empirical data refines it):
+          - 200 + HTML body         → FailedLoginError (session bounced to login)
+          - 200 + auth errors[]     → FailedLoginError (handled in caller, not here)
+          - 200 + GraphQL data      → success
+          - 401                     → FailedLoginError
+          - 403                     → AccountBannedError
+          - 429                     → RateLimitError
+          - 500/502/503/504         → retry up to 3x with 5s/15s/45s backoff
+          - other 4xx/5xx           → error string (no retry, no rotation)
+        """
+        retry_delays = [5, 15, 45]
+        retryable_5xx = {500, 502, 503, 504}
+        attempt = 0
+
+        while True:
+            try:
+                response = await asyncio.wait_for(
+                    self.page.request.post(
+                        GRAPHQL_API_URL,
+                        headers=template_headers,
+                        data=body,
+                        timeout=request_timeout_ms,
+                    ),
+                    timeout=operation_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[hybrid] @{handle}: page.request.post hung > "
+                    f"{operation_timeout_seconds}s — returning partial"
+                )
+                return None, "", f'hang: page.request.post timed out after {operation_timeout_seconds}s'
+            except Exception as e:
+                logger.warning(f"[hybrid] @{handle}: page.request.post failed: {e}")
+                return None, "", f'pagination_error: {e}'
+
+            status = response.status
+
+            # 5xx — retry with backoff up to len(retry_delays) times.
+            if status in retryable_5xx:
+                if attempt < len(retry_delays):
+                    delay = retry_delays[attempt]
+                    attempt += 1
+                    logger.warning(
+                        f"[hybrid] @{handle}: HTTP {status}, retry {attempt}/"
+                        f"{len(retry_delays)} after {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    f"[hybrid] @{handle}: HTTP {status} after "
+                    f"{len(retry_delays) + 1} attempts — bailing"
+                )
+                return None, "", f'pagination_error: HTTP {status} after retries'
+
+            # 401 / 403 / 429 — typed exceptions so Worker's handlers fire.
+            if status == 401:
+                raise FailedLoginError(
+                    f"Hybrid replay returned HTTP 401 — session invalid"
+                )
+            if status == 403:
+                raise AccountBannedError(
+                    f"Hybrid replay returned HTTP 403 — account likely banned"
+                )
+            if status == 429:
+                raise RateLimitError(
+                    f"Hybrid replay returned HTTP 429 — rate limited"
+                )
+
+            # Other non-200 (400, 404, 5xx-non-retryable, etc.) — bail with
+            # a result string but no rotation.
+            if status != 200:
+                logger.warning(
+                    f"[hybrid] @{handle}: HTTP {status} — bailing (no retry)"
+                )
+                return None, "", f'pagination_error: HTTP {status}'
+
+            # 200 — read body. FB sometimes returns HTML (redirect to login)
+            # in our POST response; treat as logged out.
+            try:
+                text = await response.text()
+            except Exception as e:
+                return None, "", f'pagination_error: read body: {e}'
+
+            if self._hybrid_body_looks_like_html(text):
+                raise FailedLoginError(
+                    "Hybrid replay returned HTML body on 200 — session bounced to login"
+                )
+
+            return response, text, None
+
+    async def _hybrid_organic_scroll_burst(
+        self,
+        min_scrolls: int = 2,
+        max_scrolls: int = 5,
+        operation_timeout_seconds: float = 900,
+    ):
+        """Fire a small burst of real scrolls to mimic an intermittent reader.
+
+        Pure page.request traffic without any scroll events would be a
+        unique pattern. Sprinkling a few scrolls between page.request bursts
+        makes the session pattern look like a normal scroller. Each scroll
+        is wrapped in `asyncio.wait_for(operation_timeout_seconds)` so a
+        wedged renderer doesn't stall the whole scrape.
+        """
+        n_scrolls = random.randint(min_scrolls, max_scrolls)
+        logger.debug(f"[hybrid] organic-scroll burst: {n_scrolls} scrolls")
+        for j in range(n_scrolls):
+            try:
+                await asyncio.wait_for(
+                    self.scroll(window_height_coefficient=1.0),
+                    timeout=operation_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[hybrid] burst scroll {j+1}/{n_scrolls} timed out — "
+                    f"aborting burst"
+                )
+                break
+            except Exception as e:
+                logger.warning(f"[hybrid] burst scroll {j+1} failed: {e}")
+                break
+            await asyncio.sleep(abs(random.gauss(2.5, 0.5)))
