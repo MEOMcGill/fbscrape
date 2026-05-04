@@ -167,10 +167,33 @@ class WorkerPool:
                     f"WorkerPool: {worker.id} completed {query.endpoint} - "
                     f"{len(result.posts)} posts"
                 )
+            except NoAccountError:
+                logger.warning(f"WorkerPool: {worker.id} failed {query.endpoint} - no accounts available")
+                await self.task_queue.put((query, future))
+                break
             except Exception as e:
                 logger.error(f"WorkerPool: {worker.id} failed {query.endpoint}: {e}")
                 future.set_exception(e)
             finally:
+                self.task_queue.task_done()
+
+        # post-loop cleanup
+        self.workers.remove(worker)
+        if not self.workers and not self._shutdown:
+            logger.warning(
+                f"WorkerPool: {worker.id} exiting loop, but no more workers available - "
+                f"shutdown={self._shutdown}, workers={len(self.workers)}\n"
+                f"draining {self.task_queue.qsize()} pending tasks..."
+            )
+            while not self.task_queue.empty():
+                try:
+                    _, future = self.task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not future.done():
+                    future.set_exception(
+                        NoAccountError("All workers exhausted; no accounts available")
+                    )
                 self.task_queue.task_done()
 
         logger.info(f"WorkerPool: {worker.id} loop exiting")

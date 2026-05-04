@@ -303,14 +303,60 @@ FB_LOG_LEVEL=DEBUG python your_script.py
 
 ```python
 from fbscrape.exceptions import (
-    NoAccountError,       # No accounts available
-    FailedLoginError,     # Login attempt failed
-    AccountBannedError,   # Account was banned
-    RateLimitError,       # Hit rate limit
+    # Pool-level
+    NoAccountError,             # No accounts available in the pool
+
+    # Login / account state (raised from BrowserSession, caught by Worker)
+    FailedLoginError,           # Login attempt failed
+    CheckpointError,            # FB redirected to /checkpoint — manual action required
+    AccountDisabledError,       # FB redirected to /checkpoint/disabled — account is dead
+    TransientLoginError,        # Likely playwright/page flake — account stays active
+    AccountBannedError,         # HTTP 403 mid-scrape, account flagged
+    RateLimitError,             # HTTP 429 mid-scrape
+
+    # Browser / runtime
+    RendererHangError,          # A page-level await exceeded operation_timeout_seconds
+    RetryBudgetExhaustedError,  # Worker exhausted its 3-retry budget for a single task
 )
 ```
 
-Workers automatically handle these errors by rotating to a new account and retrying (up to 3 times).
+### Worker policy per exception
+
+| Exception | Action | Counts as retry? |
+|---|---|---|
+| `AccountDisabledError` | rotate to a new account | no |
+| `CheckpointError` | rotate to a new account | yes |
+| `TransientLoginError` | rotate, account stays active | yes |
+| `RendererHangError` | restart task on **same** account, fresh BrowserSession | yes |
+| `FailedLoginError` | mark account inactive + rotate | yes |
+| `AccountBannedError` | mark account inactive + rotate | yes |
+| `RateLimitError` | lock account 1h + rotate | yes |
+| `NoAccountError` | re-queue task, worker exits cleanly | — |
+
+After 3 retries on the same task, `Worker.execute_task` raises `RetryBudgetExhaustedError`. That exception surfaces in your `gather()` loop as the value of the resolved future.
+
+### What you'll see in user code
+
+```python
+from fbscrape import FacebookScraper, gather
+from fbscrape.exceptions import NoAccountError, RetryBudgetExhaustedError
+
+async with FacebookScraper(db="db/accounts.db") as scraper:
+    async for result in gather(
+        scraper.user_timeline(h, "2024-01-01", "2025-01-01")
+        for h in handles
+    ):
+        # result is a ScrapingResult on success, or the loop body raises:
+        #   - RetryBudgetExhaustedError: this handle failed 3 times
+        #   - NoAccountError: pool fully drained mid-run
+        # ScrapeOutcome.result strings ("account is private", "logged out
+        # while scraping", "graphql_error: ...", "error: ...") indicate
+        # per-task non-rotation outcomes — the future still resolves
+        # successfully with those.
+        print(result.query.query["handle"], result.result, len(result.posts))
+```
+
+Renderer hangs (`RendererHangError`) are caught internally and trigger a same-account restart — they do not surface to user code unless they exceed the retry budget, in which case `RetryBudgetExhaustedError` is raised instead.
 
 ## Project Structure
 

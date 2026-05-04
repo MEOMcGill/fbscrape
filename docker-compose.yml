@@ -1,0 +1,20 @@
+services:
+  scraper:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: fbscrape:latest
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./db:/app/db
+      - ./data:/app/data
+      - ./auth:/app/auth
+      - ./tmp:/app/tmp
+    environment:
+      - DISPLAY=:99
+      - SCREEN_RES=1920x1080x24
+    stdin_open: true
+    tty: true

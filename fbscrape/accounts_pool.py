@@ -45,8 +45,6 @@ class AccountsPool:
             proxy_server: str = None,
             proxy_username: str = None,
             proxy_password: str = None,
-            fingerprint: str = None,
-            os: str = "macos",
             twofa_id: str = None,
     ):
         """Add account to the db. Must provide either email or phone_number."""
@@ -81,8 +79,6 @@ class AccountsPool:
             proxy_server=proxy_server,
             proxy_username=proxy_username,
             proxy_password=proxy_password,
-            fingerprint=fingerprint,
-            os=os,
             twofa_id=twofa_id,
         )
 
@@ -330,28 +326,29 @@ class AccountsPool:
         """Get an available account, or wait until one is available"""
         msg_shown = False
         while True:
+            # 1. probe to see if there's even an account that could pick from -
+            # query: active=True & in_use=False.
+            #       0 -> "excess worker, quit"
+            #       1 -> "log unlock ETA" but continue looping every 5s
             account = await self.get_available()
             if not account:
                 if self._raise_when_no_account or get_env_bool("FB_RAISE_WHEN_NO_ACCOUNT"):
                     raise NoAccountError("No account available")
 
-                if not msg_shown:
-                    nat = await self.next_available_at()
-                    if not nat:
-                        logger.warning("No active accounts. Stopping...")
-                        return None
-
-                    msg = f'No account available. Next available at {nat}'
-                    logger.info(msg)
-                    msg_shown = True
-
+                nat = await self.next_available_at()
+                if nat:
+                    if not msg_shown:
+                        msg = f"No account available. Next available at {nat}"
+                        logger.info(msg)
+                        msg_shown = True
+                else:
+                    logger.info("Not enough active accounts, exiting worker.")
+                    return None
                 await asyncio.sleep(5)
                 continue
             else:
-                if msg_shown:
-                    logger.info(f"Continuing with account {account.identifier}")
-
-            return account
+                logger.info(f"Continuing with account {account.identifier}")
+                return account
 
     async def get_for_queue_or_wait(self, queue: str = "general") -> Account | None:
         """Alias for get_available_or_wait() - queue parameter is ignored (backward compatibility)"""
@@ -362,7 +359,7 @@ class AccountsPool:
         qs = """
         SELECT json_extract(locks, '$.locked_until') as locked_until
         FROM accounts
-        WHERE active = true
+        WHERE active = true AND in_use = false
             AND json_extract(locks, '$.locked_until') IS NOT NULL
             AND json_extract(locks, '$.locked_until') > datetime('now')
         ORDER BY locked_until ASC
@@ -376,7 +373,6 @@ class AccountsPool:
 
             at_local = datetime.now() + (trg - now)
             return at_local.strftime("%H:%M:%S")
-
         return None
 
     async def release_account(self, identifier: str | list[str] | None):
@@ -442,12 +438,13 @@ class AccountsPool:
         await execute(self._db_file, qs, {"cookies": cookies_json})
         logger.info(f"Updated cookies for {identifier} ({len(cookies)} cookies)")
 
-    async def update_fingerprint(self, identifier: str, fingerprint_json: str):
-        """Persist a serialized browserforge Fingerprint for an account."""
-        logger.debug(f"update_fingerprint({identifier}, {len(fingerprint_json)} bytes)")
-        qs = f"UPDATE accounts SET fingerprint = :fp WHERE {self._identifier_condition(identifier)}"
-        await execute(self._db_file, qs, {"fp": fingerprint_json})
-        logger.info(f"Updated fingerprint for {identifier}")
+    async def update_fingerprint(self, identifier: str, fingerprints: dict[str, str]):
+        """Persist the full per-OS fingerprint dict for an account."""
+        payload = json.dumps(fingerprints)
+        logger.debug(f"update_fingerprint({identifier}, oses={list(fingerprints)}, {len(payload)} bytes)")
+        qs = f"UPDATE accounts SET fingerprints = :fp WHERE {self._identifier_condition(identifier)}"
+        await execute(self._db_file, qs, {"fp": payload})
+        logger.info(f"Updated fingerprints for {identifier} (oses={list(fingerprints)})")
 
     async def update_last_used(self, identifier: str):
         """Update last_used timestamp for an account"""
@@ -535,7 +532,7 @@ class AccountsPool:
     _updatable_fields = {
         'password', 'email', 'username', 'email_password', 'phone_number',
         'active', 'proxy_server', 'proxy_username', 'proxy_password',
-        'fingerprint', 'os', 'error_msg', 'twofa_id',
+        'error_msg', 'twofa_id',
     }
 
     async def update_field(

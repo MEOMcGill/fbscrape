@@ -12,12 +12,11 @@ from .utils import (
     generate_fingerprint,
     serialize_fingerprint,
     deserialize_fingerprint,
-    fingerprint_os,
 )
 from .exceptions import (
-    FailedLoginError, CheckpointError, AccountDisabledError, TransientLoginError,
-    AccountBannedError, RateLimitError,
+    FailedLoginError, AccountBannedError, RateLimitError, RendererHangError,
 )
+from . import login as _login
 
 import asyncio
 import json
@@ -25,7 +24,7 @@ import os
 import random
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs, urlencode
-from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser, Locator
+from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser
 from camoufox.async_api import AsyncNewBrowser
 from typing import Optional
 import re
@@ -47,11 +46,6 @@ HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 class BrowserSession:
     """Manages browser session and page navigation"""
 
-    # Max attempts of the form-fill + submit + verify inner block within a single
-    # login() call. Gives us one internal retry on transient playwright flakes
-    # before escalating to the worker via TransientLoginError.
-    LOGIN_FORM_MAX_ATTEMPTS = 2
-
     # NOTE: per-call wall-clock cap on page-DOM ops (scroll, error checks) used
     # to live here as the class constant `OPERATION_TIMEOUT_SECONDS = 900`. It
     # is now `operation_timeout_seconds`, a per-mode param in
@@ -66,11 +60,18 @@ class BrowserSession:
             pool: AccountsPool,
             headless: bool = False,
             mobile: bool = False,
+            auto_login: bool = True,
     ):
         self.account = account
         self.pool = pool
         self.headless = headless
         self.mobile = mobile
+        # If False, initialize() opens the browser/context/page but skips the
+        # cookie-injection + automatic form-login orchestration. Used by the
+        # `fbscrape login` CLI command, which needs a clean-slate browser to
+        # drive login itself (manual or automatic). The default `True`
+        # preserves the worker's existing behavior.
+        self.auto_login = auto_login
 
         # the endpoint we're scrolling (set by scraping methods like user_timeline)
         self.endpoint: str = ""
@@ -83,9 +84,16 @@ class BrowserSession:
         self.response_interceptor: Optional[ResponseInterceptor] = None
 
     @classmethod
-    async def create(cls, account: Account, pool: AccountsPool, headless=False, mobile: bool = False):
-        logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}")
-        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile)
+    async def create(
+        cls,
+        account: Account,
+        pool: AccountsPool,
+        headless=False,
+        mobile: bool = False,
+        auto_login: bool = True,
+    ):
+        logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}, auto_login={auto_login}")
+        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile, auto_login=auto_login)
         await instance.initialize()
         return instance
 
@@ -167,11 +175,17 @@ class BrowserSession:
             self.response_interceptor = ResponseInterceptor()
             self.response_interceptor.setup_interception(self.page)
 
+            if not self.auto_login:
+                # Caller opts out of the embedded login orchestration; they're
+                # responsible for driving login themselves (e.g. `fbscrape login`).
+                logger.info(f"Browser session initialized for {self.account.display_name} (auto_login=False)")
+                return
+
             # Auth branch depends on whether we have cookies to try:
             #   - Cookies present: inject, verify with check_logged_in, fall back to recovery
             #     (obstacle handlers + form login) if cookies didn't yield a logged-in session.
-            #   - No cookies: go straight to the form login flow. login() owns its own
-            #     _on_login_success call on success, so we don't re-do the bookkeeping here.
+            #   - No cookies: go straight to the form login flow. login_automatic() owns its
+            #     own _on_login_success call on success, so we don't re-do bookkeeping here.
             if self.account.cookies:
                 logger.debug(f"Account has {len(self.account.cookies)} cookies, injecting...")
                 try:
@@ -181,17 +195,17 @@ class BrowserSession:
                     logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
 
                 # Fast happy-path: cookies worked.
-                if await self.check_logged_in(timeout=5.0):
-                    await self._on_login_success()
+                if await _login.check_logged_in(self, timeout=5.0):
+                    await _login._on_login_success(self)
                     logger.info(f"Browser session initialized for {self.account.display_name} (already logged in)")
                     return
 
                 # Cookies didn't get us in — obstacle handlers + form-login fallback.
-                await self._resolve_not_logged_in()
+                await _login.resolve_not_logged_in(self)
                 logger.info(f"Browser session initialized for {self.account.display_name}")
             else:
                 logger.debug("No cookies available, going straight to form login")
-                if not await self.login():
+                if not await _login.login_automatic(self):
                     raise FailedLoginError(
                         f"Failed to login for {self.account.display_name} (no login form)"
                     )
@@ -240,224 +254,6 @@ class BrowserSession:
 
         logger.info(f"Browser session closed for {self.account.display_name}")
 
-    # ==================== Authentication ====================
-    async def _continue_to_login_is_visible(self):
-        try:
-            await self.page.get_by_label("Continue", exact=False).wait_for(state="visible", timeout=3000)
-            logger.debug("Continue for login is visible")
-            return True
-        except Exception as e:
-            logger.debug(f"Continue for login is not visible: {e}")
-            return False
-
-    async def pass_continue_button(self):
-        # click on the 'Continue' button if it's there
-        try:
-            await self.page.get_by_label("Continue", exact=False).click(timeout=10000)
-            logger.debug("Clicked post-login 'Continue' button")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.debug(f"Failed to click post-login 'Continue' button: {e}")
-            return
-
-        # insert the password for the login
-        try:
-            await self._human_type(
-                self.page.get_by_role("textbox", name="Password"),
-                self.account.password
-            )
-            logger.debug("Filled post-login 'Password' field")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.debug(f"Failed to fill post-login 'Password' field: {e}")
-            return
-
-        # press login button
-        try:
-            await self.page.get_by_role("button", name="Log in", exact=True).click(timeout=10000)
-            logger.debug("Clicked post-login 'Log in' button")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.debug(f"Failed to click post-login 'Log in' button: {e}")
-            return
-
-        # now check if you've hit some issues logging in
-        await self._wait_for_log_in_outcome()
-
-    async def login(self) -> bool:
-        """
-        Execute Facebook login flow if needed.
-
-        Transient errors (playwright flake, element-not-found, page timeout) get
-        one internal retry with a page reload; if still failing, a
-        `TransientLoginError` is raised so the worker can rotate to a different
-        account WITHOUT marking the current one inactive.
-
-        Returns:
-            True if login successful or already logged in, False on known "can't
-            login here" conditions (no form visible, viewer never resolved, URL
-            never settled).
-
-        Raises:
-            CheckpointError / AccountDisabledError: Facebook redirected to a
-                /checkpoint/ page (detector already wrote DB state).
-            TransientLoginError: Both internal attempts hit unexpected errors.
-        """
-        logger.debug(f"BrowserSession.login() for {self.account.display_name}")
-        # Check if already logged in
-        if await self.check_logged_in(timeout=5.0):
-            logger.debug("Already logged in")
-            await self._on_login_success()
-            return True
-
-        # Decline cookies popup
-        await self._clear_pre_login_popups()
-
-        # Check if login form is visible
-        if not await self._is_login_form_visible():
-            logger.warning(f"Cannot login {self.account.display_name}: no login form and not logged in")
-            return False
-
-        logger.info(f"Logging in to Facebook as {self.account.display_name}")
-        logger.debug("Login form is visible, proceeding with credentials")
-
-        last_transient: Exception | None = None
-        for attempt in range(1, self.LOGIN_FORM_MAX_ATTEMPTS + 1):
-            logger.debug(
-                f"Login attempt {attempt}/{self.LOGIN_FORM_MAX_ATTEMPTS} "
-                f"for {self.account.display_name}"
-            )
-            try:
-                # Fill username with human-like typing
-                await self._human_type(
-                    self.page.get_by_role('textbox', name='Email or mobile number'),
-                    self.account.identifier
-                )
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
-                # Fill password with human-like typing.
-                # Use role-based textbox selector: `get_by_label("Password")` also matches
-                # the "Show password" button (role=button) which shares the same label.
-                await self._human_type(
-                    self.page.get_by_role("textbox", name="Password"),
-                    self.account.password
-                )
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
-                # Click login button
-                if self.mobile:
-                    await self.page.get_by_role('button', name='Log in').click()
-                else:
-                    await self.page.get_by_role('button', name='Log in').nth(0).click()
-
-                logger.info("Login form submitted")
-                await asyncio.sleep(5)
-
-                # Classify the post-form URL. Raises CheckpointError / AccountDisabledError
-                # on a checkpoint; returns True on a logged-in URL; False if URL never settled.
-                url_ok = await self._wait_for_log_in_outcome()
-                if not url_ok:
-                    # URL stayed on /login or some intermediate page — most commonly a
-                    # slow/flaky network rather than a credential problem. Treat as
-                    # transient so the worker rotates without marking the account inactive.
-                    logger.warning(f"Login URL never settled for {self.account.display_name}")
-                    raise TransientLoginError(
-                        f"Login URL never settled after form submit for {self.account.display_name}"
-                    )
-
-                # Belt-and-suspenders: GraphQL-level confirmation
-                if await self.check_logged_in(timeout=10.0):
-                    await self._on_login_success()
-                    logger.info(f"Login successful for {self.account.display_name}")
-                    return True
-
-                # Form submitted, URL settled on a logged-in variant, but viewer GraphQL
-                # never came through — usually a GraphQL timing race or soft network issue
-                # rather than a real credential failure. Treat as transient.
-                logger.warning(f"Viewer never came through after form submit for {self.account.display_name}")
-                raise TransientLoginError(
-                    f"Viewer never came through after form submit for {self.account.display_name}"
-                )
-
-            except FailedLoginError:
-                # CheckpointError / AccountDisabledError — detector already wrote DB state.
-                raise
-            except Exception as e:
-                last_transient = e
-                logger.warning(
-                    f"Transient error on login attempt "
-                    f"{attempt}/{self.LOGIN_FORM_MAX_ATTEMPTS} "
-                    f"for {self.account.display_name}: {e}"
-                )
-                # Reset for next attempt — reload page and re-verify form is present
-                if attempt < self.LOGIN_FORM_MAX_ATTEMPTS:
-                    try:
-                        await self.page.goto(
-                            "https://www.facebook.com", wait_until="domcontentloaded"
-                        )
-                        await self._clear_pre_login_popups()
-                        if not await self._is_login_form_visible():
-                            # Page landed on a non-form state (e.g., already logged in
-                            # via partial submission, or a checkpoint); can't retry.
-                            break
-                    except Exception as reset_err:
-                        logger.warning(
-                            f"Failed to reset page for retry "
-                            f"({self.account.display_name}): {reset_err}"
-                        )
-                        break
-                    await asyncio.sleep(random.uniform(1.5, 3.0))
-
-        # Exhausted internal retries — escalate to worker without marking account inactive.
-        raise TransientLoginError(
-            f"Login failed after {self.LOGIN_FORM_MAX_ATTEMPTS} transient attempts "
-            f"for {self.account.display_name}: {last_transient}"
-        )
-
-    async def check_logged_in(self, timeout: float = 10.0) -> bool:
-        """
-        Check if logged in by navigating to facebook.com and waiting for a GraphQL
-        response whose body carries a non-null `data.viewer` object. `viewer` is
-        Facebook's authenticated-user context — queries referencing it only resolve
-        when a live session exists; the Continue/login pages don't answer them.
-        This is DOM-independent and, unlike post-bearing responses, doesn't require
-        the home feed to render (which may not fire without a scroll).
-
-        Args:
-            timeout: Max seconds to wait for a viewer-bearing GraphQL response
-
-        Returns:
-            True if a viewer-bearing response was intercepted (logged in), False otherwise
-        """
-        logger.debug(f"check_logged_in() with timeout={timeout}s")
-        # Create a temporary interceptor for this check
-        temp_interceptor = ResponseInterceptor()
-        temp_interceptor.setup_interception(self.page)
-
-        try:
-            await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
-
-            # Wait for a viewer-bearing GraphQL response (authenticated user context)
-            elapsed = 0.0
-            interval = 0.5
-            while elapsed < timeout:
-                if temp_interceptor.has_viewer_response():
-                    logger.info(
-                        f"Logged in: viewer-bearing response intercepted "
-                        f"({temp_interceptor.get_graphql_request_count()} GraphQL responses seen)"
-                    )
-                    return True
-                await asyncio.sleep(interval)
-                elapsed += interval
-
-            logger.warning(
-                f"Not logged in: no viewer-bearing GraphQL response after {timeout}s "
-                f"({temp_interceptor.get_graphql_request_count()} generic GraphQL responses seen)"
-            )
-            return False
-        finally:
-            temp_interceptor.stop_interception()
-
     async def get_cookies(self) -> list[dict]:
         """Get cookies from current browser context"""
         storage_state = await self._context.storage_state()
@@ -469,142 +265,6 @@ class BrowserSession:
         await self.pool.update_cookies(self.account.identifier, cookies)
         logger.info(f"Saved cookies for {self.account.display_name}")
 
-    async def _on_login_success(self):
-        """Post-successful-login bookkeeping: persist cookies, mark account active,
-        reset stale scroll counts, update last_used, and clear post-login popups."""
-        # Save cookies after successful login
-        await self.save_cookies()
-        # Mark account as active and clear any previous error message
-        await self.pool.set_active(self.account.identifier, True, None)
-        # Reset scroll_count_overall_24h if last_used was over 24h ago
-        if self.account.last_used:
-            time_since_last_used = datetime.now(timezone.utc) - self.account.last_used.replace(tzinfo=timezone.utc)
-            if time_since_last_used > timedelta(hours=24):
-                await self.pool.reset_scroll_counts(self.account.identifier)
-                logger.info(f"Reset scroll counts for {self.account.display_name} (last used {time_since_last_used} ago)")
-        # Update last_used timestamp
-        await self.pool.update_last_used(self.account.identifier)
-        # Clear any post-login popups
-        await self._clear_post_login_popups()
-
-    async def _resolve_not_logged_in(self):
-        """Handle all known 'not-yet-logged-in' states after cookie injection.
-
-        Tries each registered obstacle handler in order. Each handler self-detects
-        its case and, if matched, performs the recovery action. After any match we
-        re-verify with `check_logged_in` (GraphQL-based, DOM-independent). If no
-        handler succeeds in getting us logged in, we fall back to the last resort:
-        wipe cookies and run the full `login()` form flow.
-
-        To add a new obstacle, define `_handle_<case>(self) -> bool` that returns
-        True iff it matched, and register it in `obstacle_handlers` below.
-
-        Raises:
-            FailedLoginError: if no handler and no fallback resulted in a login.
-        """
-        obstacle_handlers = [
-            self._handle_continue_interstitial,
-            # future: self._handle_2fa_challenge,
-            # future: self._handle_checkpoint,
-        ]
-
-        for handler in obstacle_handlers:
-            if not await handler():
-                continue
-            logger.info(f"Login obstacle matched by {handler.__name__}")
-            if await self.check_logged_in(timeout=10.0):
-                await self._on_login_success()
-                return
-            logger.warning(f"{handler.__name__} ran but login still not confirmed")
-
-        # Last resort: wipe cookies and run the full login form flow.
-        logger.warning(f"No obstacle handler succeeded — falling back to full login for {self.account.display_name}")
-        await self._context.clear_cookies()
-        if not await self.login():
-            raise FailedLoginError(f"Failed to login for {self.account.display_name}")
-
-    async def _handle_continue_interstitial(self) -> bool:
-        """Facebook 'Continue' re-auth screen: click Continue, submit password, click Log in."""
-        if not await self._continue_to_login_is_visible():
-            return False
-        await self.pass_continue_button()
-        return True
-
-    async def _wait_for_log_in_outcome(self) -> bool:
-        """Wait for the post-login-form URL to settle and classify the outcome.
-
-        Outcomes table: (URL-path-suffix regex, outcome kind). Order matters —
-        most-specific first (so /checkpoint/disabled/ wins over /checkpoint/,
-        and the `/?home` / end-of-host / query-only patterns are kept narrow
-        so they don't swallow /login/, /zuck, /recover/, etc.). Adding a new
-        FB login flow is one row. The wait regex is the union of all rows;
-        the dispatch iterates the same table in order and returns the first
-        per-row pattern that matches.
-
-        On a known terminal failure (`disabled`, `checkpoint`, `two_factor`)
-        we persist `error_msg` + mark the account inactive *before* raising,
-        so higher layers don't need a second DB write.
-        """
-        outcomes: list[tuple[str, str]] = [
-            (r"/checkpoint/disabled/",   "disabled"),
-            (r"/checkpoint/",            "checkpoint"),
-            (r"/two_step_verification/", "two_factor"),
-            (r"/two_factor/",            "two_factor"),
-            (r"/?home",                  "logged_in"),  # /home, /home.php
-            (r"/?$",                     "logged_in"),  # bare root (host or host/)
-            (r"/?\?",                    "logged_in"),  # query-only (host?... / host/?...)
-        ]
-        host_re = r"https://(?:www|m|web|mbasic)\.facebook\.com"
-        wait_re = re.compile(
-            rf"^{host_re}(?:{'|'.join(f'(?:{p})' for p, _ in outcomes)})"
-        )
-        dispatch: list[tuple[re.Pattern, str]] = [
-            (re.compile(rf"^{host_re}{p}"), kind) for p, kind in outcomes
-        ]
-
-        try:
-            await self.page.wait_for_url(wait_re, timeout=5000)
-        except Exception as e:
-            logger.debug(
-                f"No known login-outcome URL after 5s: {e} "
-                f"(last url={self.page.url})"
-            )
-            return False
-
-        url = self.page.url
-        for pattern, kind in dispatch:
-            if pattern.match(url):
-                return await self._dispatch_login_outcome(kind, url)
-
-        # Unreachable as long as the wait regex and the dispatch list are
-        # built from the same table — log and bail just in case.
-        logger.warning(f"URL matched login-outcome wait regex but no handler: {url}")
-        return False
-
-    async def _dispatch_login_outcome(self, kind: str, url: str) -> bool:
-        """Route a classified login outcome to its handler.
-
-        `logged_in` returns True. Failure kinds mark the account inactive and
-        raise the corresponding exception — all info needed by the worker is
-        on the exception (`url` attr) and in the DB (`error_msg`).
-        """
-        if kind == "logged_in":
-            return True
-
-        msg_by_kind = {
-            "disabled":   f"Account disabled by Facebook ({url})",
-            "checkpoint": f"Checkpoint challenge — manual intervention required ({url})",
-            "two_factor": f"2FA challenge — manual intervention required ({url})",
-        }
-        exc_by_kind = {
-            "disabled":   AccountDisabledError,
-            "checkpoint": CheckpointError,
-            "two_factor": CheckpointError,
-        }
-        msg = msg_by_kind[kind]
-        logger.warning(f"{self.account.display_name}: {msg}")
-        await self.pool.set_active(self.account.identifier, False, msg)
-        raise exc_by_kind[kind](msg, url=url)
 
     # ==================== Scraping ====================
 
@@ -693,15 +353,8 @@ class BrowserSession:
                             timeout=operation_timeout_seconds,
                         )
                     except asyncio.TimeoutError:
-                        logger.warning(
-                            f"@{handle}: check_error_conditions() (post-nav) hung > "
-                            f"{operation_timeout_seconds}s — returning partial results"
-                        )
-                        return ScrapeOutcome(
-                            result=f'hang: post-nav error check timed out after {operation_timeout_seconds}s',
-                            posts=self.response_interceptor.get_posts(),
-                            time_started=scrape_start_time,
-                            time_taken=datetime.now(timezone.utc) - scrape_start_time
+                        raise RendererHangError(
+                            f"post-nav error check timed out after {operation_timeout_seconds}s"
                         )
                     if error:
                         return ScrapeOutcome(
@@ -747,15 +400,8 @@ class BrowserSession:
                                 timeout=operation_timeout_seconds,
                             )
                         except asyncio.TimeoutError:
-                            logger.warning(
-                                f"@{handle}: check_error_conditions() (stalled) hung > "
-                                f"{operation_timeout_seconds}s — returning partial results"
-                            )
-                            return ScrapeOutcome(
-                                result=f'hang: stalled error check timed out after {operation_timeout_seconds}s',
-                                posts=self.response_interceptor.get_posts(),
-                                time_started=scrape_start_time,
-                                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                            raise RendererHangError(
+                                f"stalled error check timed out after {operation_timeout_seconds}s"
                             )
                         logger.debug(
                             f"@{handle} iter {total_scrolls}: after check_error_conditions() "
@@ -833,15 +479,8 @@ class BrowserSession:
                         timeout=operation_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"@{handle}: scroll() hung > {operation_timeout_seconds}s "
-                        f"— renderer likely wedged, returning partial results"
-                    )
-                    return ScrapeOutcome(
-                        result=f'hang: scroll timed out after {operation_timeout_seconds}s',
-                        posts=self.response_interceptor.get_posts(),
-                        time_started=scrape_start_time,
-                        time_taken=datetime.now(timezone.utc) - scrape_start_time
+                    raise RendererHangError(
+                        f"scroll timed out after {operation_timeout_seconds}s"
                     )
                 logger.debug(
                     f"@{handle} iter {total_scrolls}: after scroll() "
@@ -865,6 +504,9 @@ class BrowserSession:
                     f"{(datetime.now(timezone.utc) - iter_start).total_seconds():.2f}s"
                 )
 
+            except (FailedLoginError, AccountBannedError, RateLimitError,
+                    RendererHangError):
+                raise
             except Exception as e:
                 logger.error(f"Error scraping @{handle}: {e}")
                 return ScrapeOutcome(
@@ -1091,7 +733,9 @@ class BrowserSession:
                 timeout=operation_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            return f'hang: post-nav error check timed out after {operation_timeout_seconds}s'
+            raise RendererHangError(
+                f"post-nav error check timed out after {operation_timeout_seconds}s"
+            )
         return error  # may be None (success) or an FB-surfaced error code
 
     async def _hybrid_bootstrap(self, operation_timeout_seconds: float) -> str | None:
@@ -1105,7 +749,9 @@ class BrowserSession:
                 timeout=operation_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            return f'hang: bootstrap scroll timed out after {operation_timeout_seconds}s'
+            raise RendererHangError(
+                f"bootstrap scroll timed out after {operation_timeout_seconds}s"
+            )
         return None
 
     async def _hybrid_capture_template(
@@ -1141,7 +787,9 @@ class BrowserSession:
                     timeout=operation_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                error = None
+                raise RendererHangError(
+                    f"template-capture error check timed out after {operation_timeout_seconds}s"
+                )
             return (error or 'template_capture_timeout', None)
 
         form = self._hybrid_parse_form_data(template["post_data"])
@@ -1417,45 +1065,36 @@ class BrowserSession:
     # ==================== Private Helpers ====================
 
     async def _resolve_fingerprint(self):
-        """Return a browserforge Fingerprint for this session.
+        """Return a browserforge Fingerprint for this session, lazily
+        generating + persisting one per host OS the first time we see it.
 
-        Prefers the persisted fingerprint on the account, but regenerates if:
-          - no fingerprint is stored yet,
-          - the stored JSON is corrupt / fails to deserialize,
-          - the stored fingerprint's OS differs from the current host OS.
-
-        Camoufox cannot reliably mask the underlying host OS (canvas / WebGL /
-        fonts / media APIs leak through the Firefox sandbox regardless of the
-        fingerprint overrides), so a macOS fingerprint run on a Linux host is
-        a stronger anti-bot signal than a fresh consistent one. We regenerate
-        on host-OS drift.
+        Each (account, host_os) pair gets a stable fingerprint that survives
+        re-runs and OS hops: account.fingerprints maps os -> serialized JSON.
+        Camoufox can't reliably mask the underlying host OS (canvas / WebGL /
+        fonts leak through the Firefox sandbox regardless of overrides), so
+        we keep one fingerprint per host OS rather than overwriting on drift.
         """
         host_os = get_device_os()
-        fp_json = self.account.fingerprint
+        fp_json = self.account.fingerprints.get(host_os)
         if fp_json:
             try:
                 fp = deserialize_fingerprint(fp_json)
-                stored_os = fingerprint_os(fp)
-                if stored_os == host_os:
-                    logger.debug(
-                        f"Loaded persisted fingerprint for {self.account.display_name} (os={stored_os})"
-                    )
-                    return fp
-                logger.info(
-                    f"Host OS changed for {self.account.display_name} "
-                    f"(stored={stored_os}, current={host_os}); regenerating fingerprint"
+                logger.debug(
+                    f"Loaded persisted fingerprint for {self.account.display_name} (os={host_os})"
                 )
+                return fp
             except Exception as e:
                 logger.warning(
-                    f"Corrupt fingerprint for {self.account.display_name}: {e}; regenerating"
+                    f"Corrupt {host_os} fingerprint for {self.account.display_name}: {e}; regenerating"
                 )
 
         fp = generate_fingerprint(host_os)
         fp_json = serialize_fingerprint(fp)
-        await self.pool.update_fingerprint(self.account.identifier, fp_json)
-        self.account.fingerprint = fp_json
+        self.account.fingerprints[host_os] = fp_json
+        await self.pool.update_fingerprint(self.account.identifier, self.account.fingerprints)
         logger.info(
-            f"Generated + persisted new fingerprint for {self.account.display_name} (os={host_os})"
+            f"Generated + persisted new fingerprint for {self.account.display_name} "
+            f"(os={host_os}, slots_after={sorted(self.account.fingerprints)})"
         )
         return fp
 
@@ -1481,69 +1120,6 @@ class BrowserSession:
                 )
         return None
 
-    async def _is_login_form_visible(self) -> bool:
-        """Check if Facebook login form is visible"""
-        try:
-            await self.page.get_by_label("Email or phone number").or_(
-                self.page.get_by_label("Password")
-            ).or_(
-                self.page.get_by_role("button", name="Log in", exact=True)
-            ).first.wait_for(state="visible", timeout=5000)
-            return True
-        except Exception:
-            return False
-
-    async def _decline_optional_cookies(self) -> bool:
-        """Decline optional cookies popup if present"""
-        try:
-            await self.page.get_by_role('button', name='Decline optional cookies').nth(0).click(timeout=5000)
-            logger.info("Declined optional cookies")
-            return True
-        except Exception:
-            return False
-
-    async def _close_firefox_startup_overlay(self):
-        """Close Firefox startup overlay if present"""
-        try:
-            await self.page.get_by_role('button', name='Close').nth(0).click(timeout=5000)
-            logger.info("Closed Firefox startup overlay")
-        except Exception:
-            pass
-
-    async def _close_not_now_pop(self):
-        """Close Not Now popup if present"""
-        try:
-            label = 'Not now' if self.mobile else 'Not Now'
-            await self.page.get_by_role('button', name=label).nth(0).click(timeout=5000)
-            logger.info("Closed Not Now popup")
-        except Exception:
-            pass
-
-    async def _clear_pre_login_popups(self):
-        """Dismiss pre-login popup dialogs"""
-        await self._decline_optional_cookies()
-
-    async def _clear_post_login_popups(self):
-        """Dismiss post-login popup dialogs"""
-        await self._close_firefox_startup_overlay()
-        await self._close_not_now_pop()
-
-    async def _human_type(self, locator: Locator, text: str, mean_delay: float = 0.1, std_dev: float = 0.03):
-        """
-        Type text with human-like timing using a normal distribution for delays.
-
-        Args:
-            locator: Playwright locator to type into
-            text: Text to type
-            mean_delay: Mean delay between keystrokes in seconds (default 100ms)
-            std_dev: Standard deviation of delay in seconds (default 30ms)
-        """
-        await locator.click()
-        for char in text:
-            await locator.press(char)
-            # Sample delay from normal distribution, clamp to avoid negative/extreme values
-            delay = max(0.02, random.gauss(mean_delay, std_dev))
-            await asyncio.sleep(delay)
 
     def _find_oldest_post_timestamp(self, posts: list[dict]) -> datetime | None:
         """Find the oldest timestamp among intercepted posts"""
@@ -1833,11 +1409,9 @@ class BrowserSession:
                     timeout=operation_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"[hybrid] @{handle}: page.request.post hung > "
-                    f"{operation_timeout_seconds}s — returning partial"
+                raise RendererHangError(
+                    f"page.request.post timed out after {operation_timeout_seconds}s"
                 )
-                return None, "", f'hang: page.request.post timed out after {operation_timeout_seconds}s'
             except Exception as e:
                 logger.warning(f"[hybrid] @{handle}: page.request.post failed: {e}")
                 return None, "", f'pagination_error: {e}'
@@ -1920,6 +1494,9 @@ class BrowserSession:
                     timeout=operation_timeout_seconds,
                 )
             except asyncio.TimeoutError:
+                # Burst is best-effort fingerprint cosmetics; a hang here does
+                # NOT warrant a RendererHangError + scrape restart. Just abort
+                # the burst and let the pagination loop continue.
                 logger.warning(
                     f"[hybrid] burst scroll {j+1}/{n_scrolls} timed out — "
                     f"aborting burst"

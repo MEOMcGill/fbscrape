@@ -51,3 +51,18 @@ class AccountBannedError(FacebookScraperError):
 class RateLimitError(FacebookScraperError):
     """Hit rate limit"""
     pass
+
+
+class RendererHangError(FacebookScraperError):
+    """A page-level await exceeded its operation_timeout_seconds. Browser
+    session is wedged; account state itself is *not* assumed bad. Worker
+    restarts the task on the same account with a fresh BrowserSession.
+    Partial posts are discarded today (TODO: progress save/resume)."""
+    pass
+
+
+class RetryBudgetExhaustedError(FacebookScraperError):
+    """Worker.execute_task rotated through `max_retries` accounts and every
+    attempt raised a typed login/ban/rate-limit/checkpoint error. Per-task
+    signal — distinct from NoAccountError (pool-level: nothing left to try)."""
+    pass

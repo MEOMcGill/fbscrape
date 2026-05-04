@@ -7,7 +7,7 @@ import os
 import traceback
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
-from playwright.async_api import Page, Response
+from playwright.async_api import Page, Response, Error as PlaywrightError
 from fbscrape.utils import parse_json_or_jsonl
 from .logger import logger
 
@@ -393,6 +393,15 @@ class ResponseInterceptor:
                 else:
                     logger.warning(f"[PARSER] Returned None - parser needs implementation")
 
+        except PlaywrightError as e:
+            # Benign shutdown race: browser closed while a response.body() callback
+            # was still queued on the event loop. Demote to debug — cookies/scrape
+            # state already persisted by the time close() runs.
+            if "Target page, context or browser has been closed" in str(e):
+                logger.debug(f"Response intercept skipped (browser closing): {url}")
+            else:
+                logger.error(f"[ERROR] Error intercepting response: {e}")
+                traceback.print_exc()
         except Exception as e:
             logger.error(f"[ERROR] Error intercepting response: {e}")
             traceback.print_exc()

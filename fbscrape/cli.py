@@ -70,9 +70,8 @@ def account():
 @click.option('--proxy-user', default=None, help='Proxy username')
 @click.option('--proxy-pass', default=None, help='Proxy password')
 @click.option('--cookies', default=None, help='Cookies (JSON string or file path)')
-@click.option('--os', 'os_type', default='macos', help='OS type for fingerprint (macos/windows/linux)')
 @click.pass_context
-def add(ctx, email, phone, password, username, email_password, proxy, proxy_user, proxy_pass, cookies, os_type):
+def add(ctx, email, phone, password, username, email_password, proxy, proxy_user, proxy_pass, cookies):
     """Add a new account"""
     if not email and not phone:
         raise click.UsageError("Must provide either --email or --phone")
@@ -96,7 +95,6 @@ def add(ctx, email, phone, password, username, email_password, proxy, proxy_user
             proxy_username=proxy_user,
             proxy_password=proxy_pass,
             cookies=cookie_data,
-            os=os_type,
         )
         identifier = email or phone
         click.echo(f"Added account: {identifier}")
@@ -286,7 +284,7 @@ def info(ctx, identifier):
         click.echo(f"  Active:        {account.active}")
         click.echo(f"  In Use:        {account.in_use}")
         click.echo(f"  Last Used:     {account.last_used or '-'}")
-        click.echo(f"  OS:            {account.os}")
+        click.echo(f"  Fingerprints:  {', '.join(sorted(account.fingerprints)) or '-'}")
         click.echo(f"  Proxy:         {account.proxy_server or '-'}")
         click.echo(f"  Cookies:       {len(account.cookies)} stored")
         click.echo(f"  Scrolls (24h): {account.scroll_count_overall_24h}")
@@ -419,7 +417,7 @@ def set_field(ctx, identifier, field, value):
     Updatable fields:
       password, email, username, email_password, phone_number,
       active, proxy_server, proxy_username, proxy_password,
-      fingerprint, os, error_msg, twofa_id
+      error_msg, twofa_id
 
     \b
     Examples:
@@ -531,7 +529,247 @@ def export_cookies(ctx, identifier, output_file):
     run_async(_export())
 
 
+# ============== Login ==============
+
+@cli.command()
+@click.argument('identifier')
+@click.option(
+    '--mode',
+    type=click.Choice(['manual', 'automatic', 'cookies']),
+    default='automatic',
+    help='manual: open browser + breakpoint() for human takeover. '
+         'automatic: form-fill flow with stored credentials. '
+         'cookies: inject stored cookies and verify (no form-login fallback). '
+         '(Default: automatic)',
+)
+@click.option(
+    '--headless/--no-headless',
+    default=False,
+    help='Run browser headless (auto-resolves to "virtual" on Linux). Default: --no-headless.',
+)
+@click.pass_context
+def login(ctx, identifier, mode, headless):
+    """Log in to a Facebook account and persist cookies to the DB.
+
+    \b
+    --mode manual: opens facebook.com in a non-headless browser (use noVNC at
+        localhost:6080 in the container) and pauses at a (Pdb) prompt.
+        Log in by hand, type 'c' + Enter to save cookies; 'q' + Enter
+        (or Ctrl-D) to abort without saving.
+
+    \b
+    --mode automatic: runs the form-fill login the worker uses on scrape start.
+        The account must already have password / email_password stored.
+
+    \b
+    --mode cookies: injects the account's stored cookies and verifies with the
+        GraphQL viewer probe. Refreshes cookies in the DB on success. Does NOT
+        fall back to form login on failure — exits with an error so you can
+        decide whether to re-run with --mode automatic or --mode manual.
+    """
+    from .browser_session import BrowserSession
+    from .login import login_automatic, login_manual, login_with_cookies
+
+    async def _login():
+        pool = AccountsPool(ctx.obj['db'])
+        try:
+            account = await pool.get(identifier)
+        except ValueError:
+            raise click.ClickException(f"Account not found: {identifier}")
+
+        # auto_login=False so initialize() opens the browser without trying
+        # cookies/form login on its own — we drive login explicitly below.
+        async with BrowserSession(
+            account, pool, headless=headless, auto_login=False
+        ) as session:
+            if mode == 'manual':
+                ok = await login_manual(session)
+                if not ok:
+                    click.echo("Aborted; no cookies saved.")
+                    return
+                # Manual flow doesn't run _on_login_success, so save explicitly.
+                await session.save_cookies()
+                click.echo(f"Saved cookies for {identifier}.")
+
+            elif mode == 'automatic':
+                # login_automatic returns False on "no login form visible",
+                # raises typed exceptions on checkpoint / disabled / transient.
+                # On success it runs _on_login_success which already saves cookies.
+                ok = await login_automatic(session)
+                if not ok:
+                    raise click.ClickException(
+                        f"Automatic login failed for {identifier}: no login form visible"
+                    )
+                click.echo(f"Login OK for {identifier} (cookies persisted).")
+
+            else:  # cookies
+                # Injects stored cookies, verifies via viewer probe. On success
+                # _on_login_success runs (refreshes cookies in DB, marks active).
+                ok = await login_with_cookies(session)
+                if not ok:
+                    raise click.ClickException(
+                        f"Cookie validation failed for {identifier}. "
+                        f"Re-run with --mode automatic or --mode manual to recover."
+                    )
+                click.echo(f"Cookies valid for {identifier} (refreshed in DB).")
+
+    run_async(_login())
+
+
 # ============== Scraping ==============
+
+# Recognized per-row keys in --input-file; everything else is dropped.
+_RECOGNIZED_TARGET_KEYS = ('handle', 'start_date', 'end_date')
+_INPUT_FILE_EXTENSIONS = ('.csv', '.parquet', '.json', '.jsonl', '.ndjson', '.yaml', '.yml')
+
+
+def _load_scrape_targets(path: str) -> list[dict]:
+    """Read scrape targets from a structured file.
+
+    Dispatches on file extension. Each row/entry must have a non-empty
+    `handle`; `start_date` and `end_date` are optional. Other columns/keys
+    are silently dropped. NaN / None / empty-string cells are treated as
+    "not supplied" (so a CSV with a sparsely-populated start_date column
+    is fine).
+    """
+    import json as _json
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _INPUT_FILE_EXTENSIONS:
+        raise click.UsageError(
+            f"Unsupported --input-file extension {ext!r}. "
+            f"Supported: {', '.join(_INPUT_FILE_EXTENSIONS)}"
+        )
+
+    if ext == '.csv':
+        import csv
+        with open(path, newline='') as f:
+            raw_rows = list(csv.DictReader(f))
+    elif ext == '.parquet':
+        import pandas as pd
+        raw_rows = pd.read_parquet(path).to_dict(orient='records')
+    elif ext in ('.yaml', '.yml'):
+        import yaml
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+        if isinstance(doc, dict):
+            raw_rows = [doc]
+        elif isinstance(doc, list):
+            raw_rows = doc
+        else:
+            raise click.UsageError(
+                f"{path}: YAML must be a list of objects or a single object, "
+                f"got {type(doc).__name__}"
+            )
+    elif ext == '.json':
+        with open(path) as f:
+            doc = _json.load(f)
+        if isinstance(doc, dict):
+            raw_rows = [doc]
+        elif isinstance(doc, list):
+            raw_rows = doc
+        else:
+            raise click.UsageError(
+                f"{path}: JSON must be a list of objects or a single object, "
+                f"got {type(doc).__name__}"
+            )
+    else:  # .jsonl / .ndjson
+        raw_rows = []
+        with open(path) as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _json.loads(line)
+                except _json.JSONDecodeError as e:
+                    raise click.UsageError(f"{path}:{line_num} invalid JSON: {e}")
+                if not isinstance(obj, dict):
+                    raise click.UsageError(
+                        f"{path}:{line_num} expected JSON object, "
+                        f"got {type(obj).__name__}"
+                    )
+                raw_rows.append(obj)
+
+    targets: list[dict] = []
+    for i, row in enumerate(raw_rows, 1):
+        if not isinstance(row, dict):
+            raise click.UsageError(
+                f"{path} row {i}: expected object/dict, got {type(row).__name__}"
+            )
+        target: dict = {}
+        for key in _RECOGNIZED_TARGET_KEYS:
+            if key not in row:
+                continue
+            val = row[key]
+            if val is None:
+                continue
+            if isinstance(val, float) and val != val:  # NaN
+                continue
+            if isinstance(val, str):
+                val = val.strip()
+                if not val:
+                    continue
+            target[key] = val
+        if 'handle' not in target:
+            raise click.UsageError(f"{path} row {i}: missing or empty `handle`")
+        targets.append(target)
+
+    if not targets:
+        raise click.UsageError(f"{path}: no rows found")
+
+    return targets
+
+
+def _resolve_targets(handles, input_file, start_date, end_date) -> list[dict]:
+    """Resolve handles + dates from CLI flags and/or --input-file into a flat
+    list of {handle, start_date, end_date} dicts.
+
+    Enforces:
+    - exactly one of (positional handles, --input-file) is supplied
+    - if the file supplies a start_date for any row, --start-date must NOT be set
+    - same exclusivity for end_date
+    - every resolved row ends up with a start_date (CLI flag fills rows that
+      don't carry one); end_date defaults to today UTC if neither file nor flag
+      supplies it
+    """
+    if handles and input_file:
+        raise click.UsageError(
+            "Cannot use both positional handles and --input-file. Pick one."
+        )
+    if not handles and not input_file:
+        raise click.UsageError(
+            "Must provide either positional handles or --input-file."
+        )
+
+    if input_file:
+        targets = _load_scrape_targets(input_file)
+        if start_date is not None and any('start_date' in t for t in targets):
+            raise click.UsageError(
+                "Input file supplies start_date and --start-date is also set. "
+                "Pick one source."
+            )
+        if end_date is not None and any('end_date' in t for t in targets):
+            raise click.UsageError(
+                "Input file supplies end_date and --end-date is also set. "
+                "Pick one source."
+            )
+    else:
+        targets = [{'handle': h} for h in handles]
+
+    today = utc.now().strftime("%Y-%m-%d")
+    resolved = []
+    for t in targets:
+        sd = t.get('start_date') or start_date
+        if sd is None:
+            raise click.UsageError(
+                f"start_date missing for handle {t['handle']!r} "
+                f"(no row value, no --start-date flag)"
+            )
+        ed = t.get('end_date') or end_date or today
+        resolved.append({'handle': t['handle'], 'start_date': sd, 'end_date': ed})
+    return resolved
+
 
 @cli.group()
 def scrape():
@@ -540,9 +778,19 @@ def scrape():
 
 
 @scrape.command(name='user-timeline')
-@click.argument('handles', nargs=-1, required=True)
-@click.option('--start-date', required=True, help='Start date YYYY-MM-DD (how far back to scrape)')
-@click.option('--end-date', required=True, help='End date YYYY-MM-DD (most recent date to scrape from)')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read (handle, start_date?, end_date?) rows from a CSV, '
+                   'Parquet, YAML, or JSON/JSONL file. Mutually exclusive with '
+                   'positional handles. If the file supplies start_date / '
+                   'end_date columns, the matching CLI flag must NOT be set.')
+@click.option('--start-date', default=None,
+              help='Start date YYYY-MM-DD (how far back to scrape). Required '
+                   'unless supplied per-row via --input-file.')
+@click.option('--end-date', default=None,
+              help='End date YYYY-MM-DD (most recent date to scrape from). '
+                   'Default: today (UTC). Mutually exclusive with an end_date '
+                   'column in --input-file.')
 @click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=500, type=int, help='Scrolls (or hybrid paginations) before rotating account')
@@ -584,7 +832,7 @@ def scrape():
                    'long-running scrapes — only aborts if the pool has zero active accounts.')
 @click.pass_context
 def scrape_user_timeline(
-    ctx, handles, start_date, end_date, output_dir, max_sessions,
+    ctx, handles, input_file, start_date, end_date, output_dir, max_sessions,
     scroll_threshold, stall_timeout_seconds, headless, mobile, log_level,
     mode, pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
     max_paginations, pagination_sleep_mean, pagination_sleep_std,
@@ -599,6 +847,11 @@ def scrape_user_timeline(
       fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --end-date 2025-01-01 --headless
 
     \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL):
+      fbscrape scrape user-timeline --input-file targets.csv
+      fbscrape scrape user-timeline --input-file handles.yaml --start-date 2024-01-01
+
+    \b
     Force the scroll-driven path:
       fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01 \\
         --mode manual
@@ -609,8 +862,15 @@ def scrape_user_timeline(
 
     set_log_level(log_level)
 
+    targets = _resolve_targets(handles, input_file, start_date, end_date)
+
     if output_dir is None:
-        output_dir = os.path.join(get_home_dir_path(), "data", "posts", f"{start_date}_{end_date}")
+        starts = [t['start_date'] for t in targets]
+        ends = [t['end_date'] for t in targets]
+        output_dir = os.path.join(
+            get_home_dir_path(), "data", "posts",
+            f"{min(starts)}_{max(ends)}",
+        )
     os.makedirs(output_dir, exist_ok=True)
 
     # Bundle mode-specific kwargs. Only forward keys explicitly set on the CLI —
@@ -654,13 +914,13 @@ def scrape_user_timeline(
         ) as scraper:
             async for result in gather(
                 scraper.user_timeline(
-                    handle=h,
-                    start_date=start_date,
-                    end_date=end_date,
+                    handle=t['handle'],
+                    start_date=t['start_date'],
+                    end_date=t['end_date'],
                     mode=mode,
                     **mode_params,
                 )
-                for h in handles
+                for t in targets
             ):
                 data: ScrapingResult = result
                 handle = data.query.query.get('handle')
@@ -669,7 +929,7 @@ def scrape_user_timeline(
                 filename = (
                     f"{handle.replace('.', '_')}"
                     f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{start_date}_{end_date}.json"
+                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json"
                 )
                 data.save(os.path.join(output_dir, filename))
 

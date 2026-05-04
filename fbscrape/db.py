@@ -50,6 +50,7 @@ async def migrate(db: aiosqlite.Connection):
     MIGRATIONS = [
         (1, migrate_v1),
         (2, migrate_v2),
+        (3, migrate_v3),
     ]
 
     for version, migration_fn in MIGRATIONS:
@@ -77,8 +78,7 @@ async def migrate_v1(db: aiosqlite.Connection):
         proxy_server TEXT DEFAULT NULL,
         proxy_username TEXT DEFAULT NULL,
         proxy_password TEXT DEFAULT NULL,
-        fingerprint TEXT DEFAULT NULL,
-        os TEXT DEFAULT 'macos',
+        fingerprints TEXT DEFAULT '{}' NOT NULL,
         error_msg TEXT DEFAULT NULL,
         last_used TEXT DEFAULT NULL,
         in_use BOOLEAN DEFAULT FALSE NOT NULL,
@@ -166,6 +166,75 @@ async def migrate_v2(db: aiosqlite.Connection):
     await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_phone ON accounts(phone_number) WHERE phone_number IS NOT NULL")
 
     logger.info("Migration v2 complete")
+
+
+async def migrate_v3(db: aiosqlite.Connection):
+    """
+    Replace single `fingerprint` column + unused `os` column with a
+    JSON-dict `fingerprints` column keyed by OS, e.g. {"macos": "<json>"}.
+    Existing fingerprints are placed in the "macos" slot since this DB
+    has only ever run on macOS hosts up to this point.
+    """
+    async with db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'") as cur:
+        row = await cur.fetchone()
+        if not row:
+            return
+
+        table_sql = row[0]
+        if "fingerprint TEXT" not in table_sql:
+            logger.info("Database already on v3 schema (no `fingerprint` column), skipping v3 migration")
+            return
+
+    logger.info("Migrating accounts table: collapsing `fingerprint` + `os` into per-OS `fingerprints` dict")
+
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS accounts_new (
+        email TEXT DEFAULT NULL COLLATE NOCASE,
+        password TEXT NOT NULL,
+        username TEXT DEFAULT NULL COLLATE NOCASE,
+        email_password TEXT DEFAULT NULL,
+        phone_number TEXT DEFAULT NULL COLLATE NOCASE,
+        active BOOLEAN DEFAULT FALSE NOT NULL,
+        locks TEXT DEFAULT '{}' NOT NULL,
+        scroll_count_per_endpoint_total TEXT DEFAULT '{}' NOT NULL,
+        cookies TEXT DEFAULT '[]' NOT NULL,
+        twofa_id TEXT DEFAULT NULL,
+        proxy_server TEXT DEFAULT NULL,
+        proxy_username TEXT DEFAULT NULL,
+        proxy_password TEXT DEFAULT NULL,
+        fingerprints TEXT DEFAULT '{}' NOT NULL,
+        error_msg TEXT DEFAULT NULL,
+        last_used TEXT DEFAULT NULL,
+        in_use BOOLEAN DEFAULT FALSE NOT NULL,
+        scroll_count_overall_24h INTEGER DEFAULT 0 NOT NULL,
+        _tx TEXT DEFAULT NULL,
+        CHECK (email IS NOT NULL OR phone_number IS NOT NULL)
+    )
+    """)
+
+    await db.execute("""
+    INSERT INTO accounts_new (
+        email, password, username, email_password, phone_number,
+        active, locks, scroll_count_per_endpoint_total, cookies,
+        twofa_id, proxy_server, proxy_username, proxy_password,
+        fingerprints, error_msg, last_used, in_use, scroll_count_overall_24h
+    )
+    SELECT
+        email, password, username, email_password, phone_number,
+        active, locks, scroll_count_per_endpoint_total, cookies,
+        twofa_id, proxy_server, proxy_username, proxy_password,
+        CASE WHEN fingerprint IS NULL THEN '{}' ELSE json_object('macos', fingerprint) END,
+        error_msg, last_used, in_use, scroll_count_overall_24h
+    FROM accounts
+    """)
+
+    await db.execute("DROP TABLE accounts")
+    await db.execute("ALTER TABLE accounts_new RENAME TO accounts")
+
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email) WHERE email IS NOT NULL")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_phone ON accounts(phone_number) WHERE phone_number IS NOT NULL")
+
+    logger.info("Migration v3 complete")
 
 
 class DB:

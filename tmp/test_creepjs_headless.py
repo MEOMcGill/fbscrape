@@ -91,7 +91,7 @@ PROBES = [
         # classes (passed/failed/warn) to apply.
         "settle_selector": "#fp-table, #fp2-table, table",
         "settle_timeout_ms": 15_000,
-        "grace_sleep_seconds": 2,
+        "grace_sleep_seconds": 15,
         # sannysoft renders multiple plain <table> elements; rows look like
         # `<tr><td>Name</td><td class="passed|failed result">value</td></tr>`.
         # No table ids - just walk every <tr> with two <td>s.

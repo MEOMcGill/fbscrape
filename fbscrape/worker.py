@@ -18,6 +18,8 @@ from .exceptions import (
     FailedLoginError,
     NoAccountError,
     RateLimitError,
+    RendererHangError,
+    RetryBudgetExhaustedError,
     TransientLoginError,
 )
 from .logger import logger
@@ -197,47 +199,6 @@ class Worker:
         self.scroll_count = 0
         self._initialized = False
 
-    async def run(self, task_queue: asyncio.Queue) -> list[ScrapingResult]:
-        """
-        Process tasks from queue until empty.
-
-        Args:
-            task_queue: AsyncIO queue containing Query objects
-
-        Returns:
-            List of ScrapingResult objects from completed tasks
-        """
-        results: list[ScrapingResult] = []
-
-        while True:
-            try:
-                task: Query = task_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            logger.info(f"Worker {self.id} processing task: {task.endpoint}/{task.mode} - {task.query}")
-
-            try:
-                result = await self.execute_task(task)
-                results.append(result)
-                logger.info(
-                    f"Worker {self.id} completed task: {task.endpoint}/{task.mode} - "
-                    f"{len(result.posts)} posts, result='{result.result}'"
-                )
-            except NoAccountError:
-                # No account available for rotation - put task back and stop
-                logger.error(f"Worker {self.id}: no account available, stopping")
-                await task_queue.put(task)
-                break
-            except Exception as e:
-                logger.error(f"Worker {self.id} unexpected error: {e}")
-                # Continue with next task
-            finally:
-                task_queue.task_done()
-
-        logger.info(f"Worker {self.id} finished, processed {len(results)} tasks")
-        return results
-
     async def execute_task(self, task: Query) -> ScrapingResult:
         """
         Execute a single scraping task.
@@ -348,6 +309,20 @@ class Worker:
                 await self.rotate_account()
                 retry_count += 1
 
+            except RendererHangError as e:
+                # Browser is wedged; account is fine. Restart with the SAME account
+                # on a fresh BrowserSession (the `async with BrowserSession(...)`
+                # block exits and the next iteration opens a new one). Discard
+                # partial posts.
+                # TODO: progress save / resume — preserve pre-hang posts so a
+                # restart picks up where the wedged session left off instead of
+                # from scratch.
+                logger.warning(
+                    f"Worker {self.id}: renderer hang on {self.current_account.display_name}: "
+                    f"{e} — restarting task with same account (no rotation, partial discarded)"
+                )
+                retry_count += 1
+
             except FailedLoginError as e:
                 # Generic login failure — detector may not have written DB (e.g. form
                 # submit silently failed), so mark inactive here as the safety net.
@@ -377,19 +352,15 @@ class Worker:
                     f"Worker {self.id}: rate limited on {self.current_account.display_name}: {e}, "
                     f"locking temporarily and rotating"
                 )
-                await self.pool.lock_until(
-                    self.current_account.identifier,
-                    "datetime('now', '+1 hour')",
-                )
-                await self.rotate_account()
+                await self.rotate_account(lock_until="datetime('now', '+1 hour')")
                 retry_count += 1
 
         # If we exhausted retries, raise to signal failure
-        raise RuntimeError(
+        raise RetryBudgetExhaustedError(
             f"Worker {self.id}: failed to execute task after {max_retries} retries"
         )
 
-    async def rotate_account(self):
+    async def rotate_account(self, lock_until: str | None = None):
         """
         Release current account and acquire a new one.
 
@@ -403,7 +374,7 @@ class Worker:
         if self.current_account:
             await self.pool.lock_until(
                 self.current_account.identifier,
-                "datetime('now', '+5 minutes')"
+                "datetime('now', '+5 minutes')" if lock_until is None else lock_until,
             )
             await self.pool.release_account(self.current_account.identifier)
             logger.info(f"Worker {self.id} released account {self.current_account.display_name} (5s cooldown)")

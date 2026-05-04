@@ -22,8 +22,7 @@ class Account(JSONTrait):
     proxy_server: str | None = None
     proxy_username: str | None = None
     proxy_password: str | None = None
-    fingerprint: str | None = None
-    os: str = "macos"
+    fingerprints: dict[str, str] = field(default_factory=dict)  # os -> serialized fingerprint JSON
     error_msg: str | None = None
     last_used: datetime | None = None
     in_use: bool = False
@@ -51,6 +50,7 @@ class Account(JSONTrait):
         doc["locks"] = {k: utc.from_iso(v) for k, v in json.loads(doc["locks"]).items()}
         doc["scroll_count_per_endpoint_total"] = {k: v for k, v in json.loads(doc["scroll_count_per_endpoint_total"]).items() if isinstance(v, int)}
         doc["cookies"] = json.loads(doc["cookies"])
+        doc["fingerprints"] = json.loads(doc["fingerprints"])
         doc["active"] = bool(doc["active"])
         doc["in_use"] = bool(doc["in_use"])
         doc["last_used"] = utc.from_iso(doc["last_used"]) if doc["last_used"] else None
@@ -61,5 +61,6 @@ class Account(JSONTrait):
         rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat())
         rs["scroll_count_per_endpoint_total"] = json.dumps(rs["scroll_count_per_endpoint_total"])
         rs["cookies"] = json.dumps(rs["cookies"])
+        rs["fingerprints"] = json.dumps(rs["fingerprints"])
         rs["last_used"] = rs["last_used"].isoformat() if rs["last_used"] else None
         return rs

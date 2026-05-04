@@ -117,7 +117,7 @@ class FacebookScraper:
             NoAccountError: If no accounts available in pool
             ValueError: If endpoint/mode/query/params validation fails
         """
-        await self._ensure_initialized() # unsure what this line does
+        await self._ensure_initialized()
 
         # Drop None entries so registry defaults win in Query.__post_init__.
         cleaned_params = {k: v for k, v in params.items() if v is not None}

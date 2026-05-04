@@ -8,6 +8,7 @@ Equivalent of:
 import asyncio
 import os
 import json
+import gzip
 
 from fbscrape.accounts_pool import AccountsPool
 from fbscrape.logger import set_log_level
@@ -86,15 +87,22 @@ async def main():
     # Endpoint is now always "UserTimeline" — mode segment ("manual"/"hybrid")
     # disambiguates re-runs across strategies. Dedup against the current mode's
     # suffix so a re-run with a different mode re-scrapes rather than skipping.
+    # Match either `.json` or `.json.gz` so re-runs after the gzip cutover
+    # (and any leftover plain-json files) both count as "already scraped".
     already_scraped = set()
-    suffix = f"_UserTimeline_{MODE}_{START_DATE}_{END_DATE}.json"
+    base_suffix = f"_UserTimeline_{MODE}_{START_DATE}_{END_DATE}"
     for f in os.listdir(output_dir):
-        if not f.endswith(suffix):
+        if f.endswith(base_suffix + ".json.gz"):
+            prefix = f[: -len(base_suffix + ".json.gz")]
+        elif f.endswith(base_suffix + ".json"):
+            prefix = f[: -len(base_suffix + ".json")]
+        else:
             continue
-        prefix = f[: -len(suffix)]
         id_str, _, handle = prefix.partition("_")
         if id_str.isdigit() and handle:
             already_scraped.add((int(id_str), handle))
+    print(f"Already scraped: {len(already_scraped)}")
+
     SEEDS = load_facebook_seeds(only_actives=True)
     SEEDS = [
         s for s in SEEDS
@@ -102,6 +110,8 @@ async def main():
         and not s["Handle"].isdigit()
         and (s["ID"], s["Handle"].replace(".", "_")) not in already_scraped
     ]
+
+    print(f"Seeds to scrape: {len(SEEDS)}")
 
     pool = AccountsPool(db_path)
     async with FacebookScraper(
@@ -136,12 +146,11 @@ async def main():
                 f"{seed_info['ID']}"
                 f"_{handle.replace('.', '_')}"
                 f"_{data.query.endpoint}_{data.query.mode}"
-                f"_{START_DATE}_{END_DATE}.json"
+                f"_{START_DATE}_{END_DATE}.json.gz"
             )
 
-            with open(os.path.join(output_dir, filename), "w") as f:
+            with gzip.open(os.path.join(output_dir, filename), "wt") as f:
                 json.dump(data_to_save, f, indent=2)
-            #data.save(os.path.join(output_dir, filename))
 
     print(f"\nResults saved to: {output_dir}")
 

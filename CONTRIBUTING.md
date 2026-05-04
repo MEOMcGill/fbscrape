@@ -156,10 +156,9 @@ FB_LOG_LEVEL=DEBUG python your_test_script.py
 
 ## Creating a Test Account
 
-For the scraper to be usable in production, we need many accounts. The `tmp/create_account.py` script helps 
-you create an account and saves the authentication cookies for use with the scraper. For now, all it does is starts a Camoufox
-browser session for effective anti-automation spoofing, pauses at a breakpoint, before saving the Firefox's storage
-state to `auth/my_account.json`.
+For the scraper to be usable in production, we need many accounts. The `fbscrape login`
+command opens a Camoufox browser session, pauses at a `breakpoint()`, and persists the
+resulting cookies into the AccountsPool DB once you `c`ontinue.
 
 
 ### Prerequisites
@@ -170,18 +169,23 @@ state to `auth/my_account.json`.
 
 ### Steps
 
-1. Run the account creation script:
+1. Add the account stub to the DB (no cookies yet — set the password if you plan to also use
+   `--automatic` later):
    ```bash
-   python tmp/create_account.py --output my_account.json
+   fbscrape account add --phone +1XXXXXXXXXX --password '<password>'
    ```
 
-2. A browser window will open automatically at `facebook.com`
+2. Run the manual login flow. The browser window will open automatically at `facebook.com`
+   (use the noVNC viewport at `http://localhost:6080/vnc.html` if you're in the container):
+   ```bash
+   fbscrape login +1XXXXXXXXXX --manual --no-headless
+   ```
 
 3. In the browser, manually create your Facebook account:
    - Click "Create new account"
    - Fill in the required information
    - Complete any verification steps (phone)
-   - Ensure you are fully logged in`
+   - Ensure you are fully logged in
 
 4. Add a human touch to your Facebook profile. Facebook would rather you scrape than produce inauthentic activity and ruin people's experience. Build the profile without leaving too much of a trace by:
    - Add a profile and cover photo,
@@ -189,28 +193,12 @@ state to `auth/my_account.json`.
    - Follow a couple of big pages
    - Watch some reels and maybe like a couple
 
-5. Once logged in and humanized, return to the terminal in the breakpoint prompt and press **c** to continue
+5. Once logged in and humanized, return to the terminal at the `(Pdb)` prompt and press **c** + Enter
+   to save cookies to the DB. (Press **q** + Enter to abort without saving anything.)
 
-6. The script saves the storage state (cookies) to:
-   ```
-   ~/.fbscrape/auth/my_account.json
-   ```
-
-6. ~~Add the account to your database:~~ (don't actually do this, just save it as JSON)
+6. Verify the account is now active:
    ```bash
-   fbscrape add \
-       --phone phone_number \
-       --password your_password \
-       --cookies ~/.fbscrape/auth/my_account.json
-       --username "Your account's name."
-       --proxy proxy_address
-       --proxy-user proxy_username
-       --proxy-pass proxy_password
-   ```
-
-7. ~~Verify the account was added:~~
-   ```bash
-   fbscrape list -v
+   fbscrape account info +1XXXXXXXXXX
    ```
 
 ### Notes
