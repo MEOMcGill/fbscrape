@@ -146,57 +146,58 @@ class WorkerPool:
             worker: Worker instance to execute tasks
         """
         logger.info(f"WorkerPool: {worker.id} loop started")
-
-        while not self._shutdown:
-            try:
-                # Wait for task with timeout to allow checking shutdown flag
-                query, future = await asyncio.wait_for(
-                    self.task_queue.get(),
-                    timeout=1.0
-                )
-            except asyncio.TimeoutError:
-                # No task available, check shutdown flag and continue
-                continue
-
-            logger.info(f"WorkerPool: {worker.id} processing {query.endpoint} - {query.query}")
-
-            try:
-                result = await worker.execute_task(query)
-                future.set_result(result)
-                logger.info(
-                    f"WorkerPool: {worker.id} completed {query.endpoint} - "
-                    f"{len(result.posts)} posts"
-                )
-            except NoAccountError:
-                logger.warning(f"WorkerPool: {worker.id} failed {query.endpoint} - no accounts available")
-                await self.task_queue.put((query, future))
-                break
-            except Exception as e:
-                logger.error(f"WorkerPool: {worker.id} failed {query.endpoint}: {e}")
-                future.set_exception(e)
-            finally:
-                self.task_queue.task_done()
-
-        # post-loop cleanup
-        self.workers.remove(worker)
-        if not self.workers and not self._shutdown:
-            logger.warning(
-                f"WorkerPool: {worker.id} exiting loop, but no more workers available - "
-                f"shutdown={self._shutdown}, workers={len(self.workers)}\n"
-                f"draining {self.task_queue.qsize()} pending tasks..."
-            )
-            while not self.task_queue.empty():
+        try: # wrap in try/finally so clean exit of workers runs regardless of exit strategy (e.g., double Ctrl+C)
+            while not self._shutdown:
                 try:
-                    _, future = self.task_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if not future.done():
-                    future.set_exception(
-                        NoAccountError("All workers exhausted; no accounts available")
+                    # Wait for task with timeout to allow checking shutdown flag
+                    query, future = await asyncio.wait_for(
+                        self.task_queue.get(),
+                        timeout=1.0
                     )
-                self.task_queue.task_done()
+                except asyncio.TimeoutError:
+                    # No task available, check shutdown flag and continue
+                    continue
 
-        logger.info(f"WorkerPool: {worker.id} loop exiting")
+                logger.info(f"WorkerPool: {worker.id} processing {query.endpoint} - {query.query}")
+
+                try:
+                    result = await worker.execute_task(query)
+                    future.set_result(result)
+                    logger.info(
+                        f"WorkerPool: {worker.id} completed {query.endpoint} - "
+                        f"{len(result.data)} records"
+                    )
+                except NoAccountError:
+                    logger.warning(f"WorkerPool: {worker.id} failed {query.endpoint} - no accounts available")
+                    await self.task_queue.put((query, future))
+                    break
+                except Exception as e:
+                    logger.error(f"WorkerPool: {worker.id} failed {query.endpoint}: {e}")
+                    future.set_exception(e)
+                finally:
+                    self.task_queue.task_done()
+        finally:
+            # post-loop cleanup
+            await worker.close()
+            self.workers.remove(worker)
+            if not self.workers and not self._shutdown:
+                logger.warning(
+                    f"WorkerPool: {worker.id} exiting loop, but no more workers available - "
+                    f"shutdown={self._shutdown}, workers={len(self.workers)}\n"
+                    f"draining {self.task_queue.qsize()} pending tasks..."
+                )
+                while not self.task_queue.empty():
+                    try:
+                        _, future = self.task_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if not future.done():
+                        future.set_exception(
+                            NoAccountError("All workers exhausted; no accounts available")
+                        )
+                    self.task_queue.task_done()
+
+            logger.info(f"WorkerPool: {worker.id} loop exiting")
 
     async def submit_task(self, query: Query) -> asyncio.Future:
         """

@@ -2,7 +2,7 @@
 Browser management and page control for Facebook scraping
 """
 from .accounts_pool import AccountsPool
-from .response import ResponseInterceptor
+from .response import ResponseInterceptor, FacebookGraphQLParser
 from .account import Account
 from .logger import logger
 from .models import ScrapeOutcome
@@ -19,11 +19,14 @@ from .exceptions import (
 from . import login as _login
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import random
+from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser
 from camoufox.async_api import AsyncNewBrowser
 from typing import Optional
@@ -41,6 +44,24 @@ HYBRID_HEADER_DROP = frozenset({
 # GraphQL friendly name we look for in the live network capture to
 # extract the request template.
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
+# Same role for the Search endpoint's hybrid mode.
+SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
+# Single-shot ProfileTransparencyDialogQuery — fires from a UI click in the
+# natural flow, so we synthesize the body from any captured natural GraphQL
+# POST and override the friendly-name + variables + doc_id. doc_id is stable
+# (same value across every observed capture).
+PAGE_TRANSPARENCY_FRIENDLY_NAME = "ProfileTransparencyDialogQuery"
+PAGE_TRANSPARENCY_DOC_ID = "25844809825201975"
+
+# Cursor-reset diagnostic dump knobs. When the hybrid pagination loop sees
+# `oldest_in_batch` jump *newer* by more than HYBRID_CURSOR_RESET_JUMP_SECONDS
+# vs. the previous iteration, we dump the last HYBRID_CURSOR_RESET_WINDOW
+# (request, response) tuples to HYBRID_CURSOR_RESET_DUMP_ROOT. Diagnostic only
+# — does not change loop behaviour. One dump per scrape (re-arming would
+# flood disk on a session that's stuck in a recycle loop).
+HYBRID_CURSOR_RESET_WINDOW = 20
+HYBRID_CURSOR_RESET_JUMP_SECONDS = 7 * 86400
+HYBRID_CURSOR_RESET_DUMP_ROOT = "tmp/hybrid/cursor_reset"
 
 
 class BrowserSession:
@@ -82,20 +103,6 @@ class BrowserSession:
         self._context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.response_interceptor: Optional[ResponseInterceptor] = None
-
-    @classmethod
-    async def create(
-        cls,
-        account: Account,
-        pool: AccountsPool,
-        headless=False,
-        mobile: bool = False,
-        auto_login: bool = True,
-    ):
-        logger.debug(f"BrowserSession.create() for {account.display_name}, headless={headless}, auto_login={auto_login}")
-        instance = cls(account=account, pool=pool, headless=headless, mobile=mobile, auto_login=auto_login)
-        await instance.initialize()
-        return instance
 
     async def __aenter__(self):
         """Async context manager entry - initialize browser session"""
@@ -341,7 +348,7 @@ class BrowserSession:
                     if not self.is_on_page(target_url):
                         return ScrapeOutcome(
                             result='logged out while scraping',
-                            posts=self.response_interceptor.get_posts(),
+                            data=self.response_interceptor.get_posts(),
                             time_started=scrape_start_time,
                             time_taken=datetime.now(timezone.utc) - scrape_start_time
                         )
@@ -359,7 +366,7 @@ class BrowserSession:
                     if error:
                         return ScrapeOutcome(
                             result=error,
-                            posts=self.response_interceptor.get_posts(),
+                            data=self.response_interceptor.get_posts(),
                             time_started=scrape_start_time,
                             time_taken=datetime.now(timezone.utc) - scrape_start_time
                         )
@@ -410,7 +417,7 @@ class BrowserSession:
                         if error:
                             return ScrapeOutcome(
                                 result=error,
-                                posts=self.response_interceptor.get_posts(),
+                                data=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
@@ -419,14 +426,14 @@ class BrowserSession:
                         if current_post_count == 0:
                             return ScrapeOutcome(
                                 result='no posts',
-                                posts=self.response_interceptor.get_posts(),
+                                data=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
                         else:
                             return ScrapeOutcome(
                                 result='scraped until first ever post was reached',
-                                posts=self.response_interceptor.get_posts(),
+                                data=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
@@ -450,7 +457,7 @@ class BrowserSession:
                             )
                             return ScrapeOutcome(
                                 result='scraped until user-specified starting date was reached',
-                                posts=self.response_interceptor.get_posts(),
+                                data=self.response_interceptor.get_posts(),
                                 time_started=scrape_start_time,
                                 time_taken=datetime.now(timezone.utc) - scrape_start_time
                             )
@@ -465,7 +472,7 @@ class BrowserSession:
                     )
                     return ScrapeOutcome(
                         result=f'stalled: no graphql response for {int(silence_seconds)}s',
-                        posts=self.response_interceptor.get_posts(),
+                        data=self.response_interceptor.get_posts(),
                         time_started=scrape_start_time,
                         time_taken=datetime.now(timezone.utc) - scrape_start_time
                     )
@@ -511,7 +518,7 @@ class BrowserSession:
                 logger.error(f"Error scraping @{handle}: {e}")
                 return ScrapeOutcome(
                     result=f'error: {str(e)}',
-                    posts=self.response_interceptor.get_posts(),
+                    data=self.response_interceptor.get_posts(),
                     time_started=scrape_start_time,
                     time_taken=datetime.now(timezone.utc) - scrape_start_time
                 )
@@ -660,7 +667,7 @@ class BrowserSession:
         if error:
             return ScrapeOutcome(
                 result=error,
-                posts=self.response_interceptor.get_posts(),
+                data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
                 time_taken=datetime.now(timezone.utc) - scrape_start_time
             )
@@ -670,7 +677,7 @@ class BrowserSession:
         if error:
             return ScrapeOutcome(
                 result=error,
-                posts=self.response_interceptor.get_posts(),
+                data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
                 time_taken=datetime.now(timezone.utc) - scrape_start_time
             )
@@ -683,7 +690,7 @@ class BrowserSession:
         if error:
             return ScrapeOutcome(
                 result=error,
-                posts=self.response_interceptor.get_posts(),
+                data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
                 time_taken=datetime.now(timezone.utc) - scrape_start_time
             )
@@ -694,7 +701,7 @@ class BrowserSession:
 
         # Phase 4 — pagination loop
         result_str = await self._hybrid_pagination_loop(
-            handle=handle,
+            label=handle,
             template=template,
             params=loop_params,
             start_unix=start_unix,
@@ -702,9 +709,276 @@ class BrowserSession:
         )
         return ScrapeOutcome(
             result=result_str,
-            posts=self.response_interceptor.get_posts(),
+            data=self.response_interceptor.get_posts(),
             time_started=scrape_start_time,
             time_taken=datetime.now(timezone.utc) - scrape_start_time
+        )
+
+    async def search_hybrid(
+        self,
+        query_text: str,
+        start_date: str,
+        end_date: str,
+        pagination_count: int = 5,
+        scroll_burst_every: int = 10,
+        scroll_burst_size_range: tuple[int, int] = (2, 5),
+        pagination_sleep_mean: float = 2.5,
+        pagination_sleep_std: float = 0.5,
+        template_capture_timeout: float = 20.0,
+        max_paginations: int = -1,
+        post_nav_sleep_seconds: float = 3.0,
+        request_timeout_ms: int = 30000,
+        max_no_progress_streak: int = 5,
+        operation_timeout_seconds: float = 900,
+    ) -> ScrapeOutcome:
+        """
+        Scrape Facebook search results for `query_text` between two dates.
+
+        Targets the SearchCometResultsPaginatedResultsQuery GraphQL endpoint
+        and applies a "Latest posts" + creation_time date filter via the URL
+        filter blob (see `_build_search_url`) — date bounds are server-enforced,
+        so the GraphQL replay variables only override `cursor` and `count`.
+        Otherwise mirrors `user_timeline_hybrid` step-for-step (navigate,
+        bootstrap scroll, capture template, replay loop).
+
+        Stop conditions:
+          1. `end_cursor` missing/null in the response — no more results.
+          2. `max_no_progress_streak` consecutive paginations with zero new
+             posts — backstop against silent zero-batch loops.
+
+        Direct-call caveat: when invoked outside the Worker pipeline, callers
+        are responsible for pre-validating inputs. Going through
+        `FacebookScraper.search` runs full Query validation.
+
+        Args:
+            query_text: Free-form search term.
+            start_date: Lower-bound date (YYYY-MM-DD) — encoded into the URL
+                filter; not sent as a GraphQL variable.
+            end_date:   Upper-bound date (YYYY-MM-DD) — same as start_date.
+            (... see Query.ENDPOINT_REGISTRY[("Search","hybrid")] for the full
+             list of param defaults and meanings.)
+
+        Returns:
+            ScrapeOutcome — Worker composes the final ScrapingResult by
+            attaching the canonical Query via ScrapingResult.from_outcome.
+        """
+        self.endpoint = "Search"
+        logger.info(
+            f"[hybrid] search {query_text!r}: starting hybrid scrape "
+            f"({start_date} → {end_date}, count={pagination_count})"
+        )
+
+        target_url = self._build_search_url(query_text, start_date, end_date)
+        scrape_start_time = datetime.now(timezone.utc)
+
+        loop_params = {
+            "pagination_count": pagination_count,
+            "scroll_burst_every": scroll_burst_every,
+            "scroll_burst_size_range": scroll_burst_size_range,
+            "pagination_sleep_mean": pagination_sleep_mean,
+            "pagination_sleep_std": pagination_sleep_std,
+            "max_paginations": max_paginations,
+            "max_no_progress_streak": max_no_progress_streak,
+            "request_timeout_ms": request_timeout_ms,
+            "operation_timeout_seconds": operation_timeout_seconds,
+        }
+
+        self.response_interceptor.flush()
+        # Same reasoning as user_timeline_hybrid: posts come exclusively from
+        # the explicit replay loop. The natural bootstrap SCRQ is fired against
+        # the URL filter so it would in fact be in-range, but keeping
+        # extract_posts off makes the source-of-posts identical across hybrid
+        # endpoints and avoids any double-extraction surprises.
+        self.response_interceptor.extract_posts = False
+
+        # Phase 1 — navigate
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+
+        # Phase 2 — bootstrap scroll
+        error = await self._hybrid_bootstrap(operation_timeout_seconds)
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+
+        # Phase 3 — capture pagination template (SCRQ instead of PCTFRQ)
+        error, template = await self._hybrid_capture_template(
+            template_capture_timeout=template_capture_timeout,
+            operation_timeout_seconds=operation_timeout_seconds,
+            friendly_name=SEARCH_HYBRID_TARGET_FRIENDLY_NAME,
+            interceptor_attr="latest_scrq_request",
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time
+            )
+        logger.info(
+            f"[hybrid] search {query_text!r}: template captured "
+            f"(doc_id={template['doc_id']})"
+        )
+
+        # Phase 4 — pagination loop. start_unix / end_unix left as defaults
+        # (None) since the URL filter is the date authority for Search.
+        result_str = await self._hybrid_pagination_loop(
+            label=query_text,
+            template=template,
+            params=loop_params,
+        )
+        return ScrapeOutcome(
+            result=result_str,
+            data=self.response_interceptor.get_posts(),
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time
+        )
+
+    async def page_transparency_hybrid(
+        self,
+        handle: str,
+        page_id: str,
+        post_nav_sleep_seconds: float = 3.0,
+        template_capture_timeout: float = 20.0,
+        request_timeout_ms: int = 30000,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Scrape Facebook page transparency info (single-shot, no pagination).
+
+        Targets `ProfileTransparencyDialogQuery` — the GraphQL query that
+        backs the "Page transparency" dialog (page name, profile picture,
+        creation date in `history_items[item_type==CREATION]`, name-change
+        history, admin country breakdown, ad activity flags, verification).
+
+        The natural query only fires from a UI click on the "Page transparency"
+        button, so the hybrid pattern of "wait for natural fire, capture,
+        replay" doesn't apply. Instead we capture auth-bearing fields
+        (fb_dtsg, lsd, __user, __csr, __dyn, etc.) from any natural GraphQL
+        POST that fires during navigation, then synthesize the transparency
+        body by overriding `fb_api_req_friendly_name`, `variables`, and
+        `doc_id`.
+
+        Caller supplies both `handle` and `page_id`:
+          - `handle` drives the bootstrap navigation (warm-up + natural
+            traffic pattern). The transparency replay POST then fires
+            alongside organic GraphQL traffic rather than as a cold request.
+          - `page_id` is the numeric page id, sent as `variables.pageID`.
+            We don't resolve handle → page_id ourselves.
+
+        Direct-call caveat: when invoked outside the Worker pipeline, callers
+        are responsible for pre-validating inputs. Going through
+        `FacebookScraper.page_transparency` runs full Query validation.
+
+        Returns:
+            ScrapeOutcome — `data` is a 1-element list `[transparency_dict]`
+            on success, or `[]` on failure (with `result` carrying the reason).
+        """
+        self.endpoint = "PageTransparency"
+        logger.info(
+            f"[hybrid] page transparency for @{handle} (page_id={page_id})"
+        )
+
+        target_url = f"https://www.facebook.com/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+
+        self.response_interceptor.flush()
+        # We synthesize the transparency body from a captured natural request,
+        # so auto-extraction of timeline posts has no role here. Disable to
+        # avoid any natural PCTFRQ that might fire (no bootstrap scroll, but
+        # FB sometimes fires PCTFRQ from initial render in edge cases) from
+        # leaking posts into the interceptor's accumulator.
+        self.response_interceptor.extract_posts = False
+
+        # Phase 1 — navigate. Drives organic GraphQL traffic that the
+        # template-capture phase harvests for auth-bearing fields.
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 2 — capture template from any natural GraphQL POST.
+        template = await self._hybrid_wait_for_any_graphql_request(
+            template_capture_timeout
+        )
+        if not template:
+            try:
+                error = await asyncio.wait_for(
+                    self.check_error_conditions(),
+                    timeout=operation_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                raise RendererHangError(
+                    f"template-capture error check timed out after "
+                    f"{operation_timeout_seconds}s"
+                )
+            return ScrapeOutcome(
+                result=error or 'template_capture_timeout',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 3 — synthesize the transparency request and send it.
+        body = self._page_transparency_build_body(
+            template["post_data"], page_id
+        )
+        headers = self._hybrid_clean_headers(template["headers"])
+        # Override friendly-name header to match the synthesized body. FB
+        # cross-checks the header against the form field; mismatch → 400.
+        headers["x-fb-friendly-name"] = PAGE_TRANSPARENCY_FRIENDLY_NAME
+
+        response, text, error_str = await self._hybrid_send_replay(
+            handle=handle,
+            body=body,
+            template_headers=headers,
+            request_timeout_ms=request_timeout_ms,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error_str is not None:
+            return ScrapeOutcome(
+                result=error_str,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 4 — parse the response into a single record.
+        record = self._parse_page_transparency_response(text)
+        if record is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
         )
 
     # ---------------- Hybrid mode phases ----------------
@@ -758,6 +1032,8 @@ class BrowserSession:
         self,
         template_capture_timeout: float,
         operation_timeout_seconds: float,
+        friendly_name: str = HYBRID_TARGET_FRIENDLY_NAME,
+        interceptor_attr: str = "latest_pctfrq_request",
     ) -> tuple[str | None, dict | None]:
         """Wait for the natural pagination request to land and extract a
         replay template from it.
@@ -778,8 +1054,16 @@ class BrowserSession:
               'profile_id': <profile id, for logging> }
         On capture failure, re-checks DOM error conditions to surface a
         clean reason (private profile, etc.) instead of a generic timeout.
+
+        The PCTFRQ defaults preserve the user_timeline_hybrid call site;
+        search_hybrid passes SEARCH_HYBRID_TARGET_FRIENDLY_NAME and
+        "latest_scrq_request".
         """
-        template = await self._hybrid_wait_for_template(template_capture_timeout)
+        template = await self._hybrid_wait_for_template(
+            template_capture_timeout,
+            friendly_name=friendly_name,
+            interceptor_attr=interceptor_attr,
+        )
         if not template:
             try:
                 error = await asyncio.wait_for(
@@ -809,14 +1093,25 @@ class BrowserSession:
 
     async def _hybrid_pagination_loop(
         self,
-        handle: str,
+        label: str,
         template: dict,
         params: dict,
-        start_unix: int,
-        end_unix: int,
+        start_unix: int | None = None,
+        end_unix: int | None = None,
     ) -> str:
         """Drive paginations via page.request.post() until one of the stop
-        conditions fires. Returns the result string for the ScrapingResult."""
+        conditions fires. Returns the result string for the ScrapingResult.
+
+        `label` is a free-form identifier used only for logging (handle for
+        UserTimeline, query_text for Search).
+
+        `start_unix` / `end_unix` are optional. When `end_unix` is set, the
+        replay body carries it as `beforeTime` (matches FB's date-filter UI
+        behavior for UserTimeline). When `start_unix` is set, the loop also
+        terminates if a batch's oldest post is older than it. Search leaves
+        both unset because date bounds are server-enforced via the URL filter
+        blob — the GraphQL variables for SCRQ have no date fields to override.
+        """
         template_form = template["form"]
         template_headers = template["headers"]
         cursor = template["cursor"]
@@ -837,6 +1132,17 @@ class BrowserSession:
         no_progress_streak = 0
         previous_post_count = len(self.response_interceptor.get_posts())
 
+        # Cursor-reset detector state. `iter_window` is a rolling buffer of
+        # the most recent (request, response) tuples — dumped to disk on
+        # detection. `prev_oldest_unix` is the prior iter's oldest
+        # creation_time; if the new iter's oldest jumps newer by more than
+        # HYBRID_CURSOR_RESET_JUMP_SECONDS, FB has silently degraded the
+        # response stream (cursor still looks valid but content recycles to
+        # head). The loop returns 'cursor_reset' so the scraper layer can
+        # resume from a fresh session with end_date moved back.
+        iter_window: deque = deque(maxlen=HYBRID_CURSOR_RESET_WINDOW)
+        prev_oldest_unix: int | None = None
+
         # max_paginations == -1 means "no cap"; any positive int caps the loop.
         while max_paginations < 0 or total_paginations < max_paginations:
             # No `afterTime` override — FB's UI never sets afterTime (only
@@ -847,14 +1153,19 @@ class BrowserSession:
             # batch's oldest post is older than start_unix (further down).
             overrides = {
                 "cursor": cursor,
-                "beforeTime": end_unix,
                 "count": pagination_count,
             }
+            if end_unix is not None:
+                overrides["beforeTime"] = end_unix
             body = self._hybrid_build_body(template_form, overrides)
+
+            cursor_sent_fp = self._hybrid_cursor_fp(cursor)
+            csr_len = len(self.response_interceptor.latest_csr or "")
+            dyn_len = len(self.response_interceptor.latest_dyn or "")
 
             iter_start = datetime.now(timezone.utc)
             response, text, error_str = await self._hybrid_send_replay(
-                handle=handle,
+                handle=label,
                 body=body,
                 template_headers=template_headers,
                 request_timeout_ms=request_timeout_ms,
@@ -874,7 +1185,7 @@ class BrowserSession:
                     text.encode("utf-8"), GRAPHQL_API_URL
                 )
             except Exception as e:
-                logger.warning(f"[hybrid] @{handle}: parser raised: {e}")
+                logger.warning(f"[hybrid] @{label}: parser raised: {e}")
                 parsed = None
             if parsed and parsed.get("posts"):
                 self.response_interceptor.add_posts(parsed["posts"])
@@ -884,7 +1195,7 @@ class BrowserSession:
             # rotates the account. Other errors → bail with a result string.
             graphql_error = self._hybrid_extract_graphql_error(text)
             if graphql_error:
-                logger.warning(f"[hybrid] @{handle}: GraphQL error: {graphql_error}")
+                logger.warning(f"[hybrid] @{label}: GraphQL error: {graphql_error}")
                 if self._hybrid_is_auth_error(graphql_error):
                     raise FailedLoginError(
                         f"Session invalid mid-scrape (graphql error: {graphql_error})"
@@ -901,17 +1212,23 @@ class BrowserSession:
             if not end_cursor:
                 elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
                 logger.info(
-                    f"[hybrid] @{handle}: end_cursor null after "
+                    f"[hybrid] @{label}: end_cursor null after "
                     f"{total_paginations} paginations (last iter {elapsed_iter:.2f}s) — "
                     f"end of feed within filter range"
                 )
                 return 'scraped until user-specified starting date was reached'
 
-            # Stop 2 (defensive): oldest post in this response < start_unix.
+            # Stop 2 (defensive, UserTimeline-only): oldest post in this
+            # response < start_unix. Search has no client-side start bound —
+            # the URL filter enforces it server-side, so we skip this check.
             oldest_in_batch = self._hybrid_extract_oldest_creation_time(text)
-            if oldest_in_batch is not None and oldest_in_batch < start_unix:
+            if (
+                start_unix is not None
+                and oldest_in_batch is not None
+                and oldest_in_batch < start_unix
+            ):
                 logger.info(
-                    f"[hybrid] @{handle}: oldest post in batch "
+                    f"[hybrid] @{label}: oldest post in batch "
                     f"({datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()}) "
                     f"is older than start; done"
                 )
@@ -921,7 +1238,7 @@ class BrowserSession:
             # returning empty page after empty page.
             if no_progress_streak >= max_no_progress_streak:
                 logger.warning(
-                    f"[hybrid] @{handle}: {no_progress_streak} paginations "
+                    f"[hybrid] @{label}: {no_progress_streak} paginations "
                     f"with no new posts — bailing"
                 )
                 return 'no_new_posts_streak'
@@ -933,12 +1250,80 @@ class BrowserSession:
                 datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()
                 if oldest_in_batch is not None else "n/a"
             )
-            logger.debug(
-                f"[hybrid] @{handle} pagination {total_paginations}: "
-                f"{response.status} in {elapsed_iter:.2f}s, "
-                f"posts now={current_post_count} (+{new_posts_in_iter}), "
-                f"oldest_in_batch={oldest_iso}"
+            newest_in_batch = self._hybrid_extract_newest_creation_time(text)
+            newest_iso = (
+                datetime.fromtimestamp(newest_in_batch, tz=timezone.utc).isoformat()
+                if newest_in_batch is not None else "n/a"
             )
+            posts_in_resp = len(parsed.get("posts") or []) if parsed else 0
+            logger.debug(
+                f"[hybrid] @{label} pagination {total_paginations}: "
+                f"{response.status} in {elapsed_iter:.2f}s, "
+                f"posts now={current_post_count} (+{new_posts_in_iter}, "
+                f"in_resp={posts_in_resp}), "
+                f"batch=[{newest_iso} .. {oldest_iso}], "
+                f"cursor_sent={cursor_sent_fp}, "
+                f"cursor_recv={self._hybrid_cursor_fp(end_cursor)}, "
+                f"__csr_len={csr_len}, __dyn_len={dyn_len}, "
+                f"resp_bytes={len(text or '')}"
+            )
+
+            # Cursor-reset diagnostic capture. Append a self-contained record
+            # of this iteration to the rolling window, then trigger a dump if
+            # `oldest_in_batch` jumped newer by more than the threshold vs.
+            # the previous iter (the symptom we're trying to characterize).
+            iter_window.append({
+                "pagination_index": total_paginations,
+                "ts": iter_start.isoformat(),
+                "elapsed_s": elapsed_iter,
+                "status": response.status,
+                "request": {
+                    "body": body,
+                    "headers": template_headers,
+                    "cursor_sent_fp": cursor_sent_fp,
+                },
+                "response": {
+                    "text": text,
+                    "size_bytes": len(text or ""),
+                    "cursor_recv_fp": self._hybrid_cursor_fp(end_cursor),
+                    "oldest_iso": oldest_iso,
+                    "newest_iso": newest_iso,
+                    "oldest_unix": oldest_in_batch,
+                    "newest_unix": newest_in_batch,
+                    "posts_in_resp": posts_in_resp,
+                },
+                "session": {
+                    "csr_len": csr_len,
+                    "dyn_len": dyn_len,
+                },
+            })
+            if (
+                prev_oldest_unix is not None
+                and oldest_in_batch is not None
+                and (oldest_in_batch - prev_oldest_unix) > HYBRID_CURSOR_RESET_JUMP_SECONDS
+            ):
+                jump_days = (oldest_in_batch - prev_oldest_unix) / 86400.0
+                out_dir = self._hybrid_dump_cursor_reset_window(
+                    label=label,
+                    trigger_index=total_paginations,
+                    prev_oldest_unix=prev_oldest_unix,
+                    cur_oldest_unix=oldest_in_batch,
+                    window=iter_window,
+                )
+                logger.warning(
+                    f"[hybrid] @{label}: cursor-reset detected at "
+                    f"pagination {total_paginations} (oldest jumped "
+                    f"+{jump_days:.1f} days) — dumped window to "
+                    f"{out_dir or '<dump_failed>'}; bailing with partial posts"
+                )
+                # Stop condition: FB silently returned a degraded stream.
+                # has_next_page / end_cursor remain valid, so neither
+                # existing stop fires. Returning here lets the high-level
+                # scraper resume from a fresh session with end_date adjusted
+                # to the oldest post collected so far.
+                return 'cursor_reset'
+            if oldest_in_batch is not None:
+                prev_oldest_unix = oldest_in_batch
 
             if (total_paginations % scroll_burst_every) == 0:
                 await self._hybrid_organic_scroll_burst(
@@ -950,7 +1335,7 @@ class BrowserSession:
             await asyncio.sleep(sleep_s)
 
         logger.warning(
-            f"[hybrid] @{handle}: hit max_paginations cap ({max_paginations})"
+            f"[hybrid] @{label}: hit max_paginations cap ({max_paginations})"
         )
         return f'hit max_paginations cap ({max_paginations})'
 
@@ -1176,6 +1561,64 @@ class BrowserSession:
             return {}
 
     @staticmethod
+    def _build_search_url(query_text: str, start_date: str, end_date: str) -> str:
+        """Build a Facebook search URL with a "Latest posts" sort + creation_time
+        date-range filter — the hybrid Search endpoint's target URL.
+
+        FB's UI encodes search filters as a base64-encoded JSON dict in the
+        `filters=` query param; each value is itself a JSON-encoded dict of
+        `{name, args}`. The shape mirrors the user-validated example URL:
+
+            {
+              "recent_posts:0":     '{"name":"recent_posts","args":""}',
+              "rp_creation_time:0": '{"name":"creation_time","args":"<inner>"}'
+            }
+
+        where `<inner>` is a JSON-encoded dict carrying year/month/day strings
+        derived from `start_date` / `end_date` (with no zero-padding on month
+        and day, matching the user's example: "2025", "2025-1", "2025-1-1").
+
+        Args:
+            query_text: Free-form search term.
+            start_date: YYYY-MM-DD lower bound (inclusive).
+            end_date:   YYYY-MM-DD upper bound (inclusive).
+
+        Returns:
+            Full URL string ready for `page.goto(...)`.
+        """
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        creation_args = {
+            "start_year":  f"{start_dt.year}",
+            "start_month": f"{start_dt.year}-{start_dt.month}",
+            "end_year":    f"{end_dt.year}",
+            "end_month":   f"{end_dt.year}-{end_dt.month}",
+            "start_day":   f"{start_dt.year}-{start_dt.month}-{start_dt.day}",
+            "end_day":     f"{end_dt.year}-{end_dt.month}-{end_dt.day}",
+        }
+        outer = {
+            "recent_posts:0": json.dumps(
+                {"name": "recent_posts", "args": ""},
+                separators=(",", ":"),
+            ),
+            "rp_creation_time:0": json.dumps(
+                {
+                    "name": "creation_time",
+                    "args": json.dumps(creation_args, separators=(",", ":")),
+                },
+                separators=(",", ":"),
+            ),
+        }
+        filters_b64 = base64.b64encode(
+            json.dumps(outer, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        return (
+            "https://www.facebook.com/search/top"
+            f"?q={quote(query_text)}"
+            f"&filters={quote(filters_b64)}"
+        )
+
+    @staticmethod
     def _hybrid_clean_headers(raw: dict[str, str]) -> dict[str, str]:
         """Drop HTTP/2 pseudo-headers and headers managed by Playwright /
         BrowserContext (cookie, host, content-length, etc.) so they aren't
@@ -1224,30 +1667,123 @@ class BrowserSession:
 
         return urlencode(body)
 
-    async def _hybrid_wait_for_template(self, timeout_seconds: float) -> dict | None:
-        """Poll until a natural ProfileCometTimelineFeedRefetchQuery request
-        has been observed (saved to `interceptor.latest_pctfrq_request` by
-        `_track_pctfrq_template`), or until the timeout elapses.
+    async def _hybrid_wait_for_any_graphql_request(
+        self, timeout_seconds: float
+    ) -> dict | None:
+        """Poll until any natural GraphQL POST has been observed (saved to
+        `interceptor.latest_natural_graphql_request`), or timeout.
+
+        Used by single-shot endpoints (PageTransparency) that synthesize
+        their own request body and only need cross-cutting auth-bearing
+        fields from organic traffic. Returns the same shape as
+        `_hybrid_wait_for_template`: `{"post_data": str|None, "headers": dict}`.
+        """
+        elapsed = 0.0
+        interval = 0.5
+        while elapsed < timeout_seconds:
+            tpl = self.response_interceptor.latest_natural_graphql_request
+            if tpl is not None:
+                return tpl
+            await asyncio.sleep(interval)
+            elapsed += interval
+        return None
+
+    def _page_transparency_build_body(
+        self,
+        template_post_data: str | None,
+        page_id: str,
+    ) -> str:
+        """Build a urlencoded form body for ProfileTransparencyDialogQuery
+        by overriding the friendly-name, variables, and doc_id fields on a
+        captured natural GraphQL POST template.
+
+        Auth-bearing and telemetry fields (fb_dtsg, lsd, __user, __hs,
+        __spin_*, __req, __crn, __ccg, __rev, __s, __hsi, __hsdp, __hblp,
+        __sjsp, jazoest, server_timestamps, av, __a, __aaid, dpr,
+        __comet_req) are inherited verbatim from the template — they are
+        cross-cutting per session, not per query. The freshest __csr / __dyn
+        seen on any natural GraphQL POST are spliced in (same logic as
+        `_hybrid_build_body`).
+        """
+        template_form = self._hybrid_parse_form_data(template_post_data)
+        body = dict(template_form)
+        body["fb_api_req_friendly_name"] = PAGE_TRANSPARENCY_FRIENDLY_NAME
+        body["variables"] = json.dumps(
+            {"pageID": str(page_id), "scale": 3},
+            separators=(",", ":"),
+        )
+        body["doc_id"] = PAGE_TRANSPARENCY_DOC_ID
+        if self.response_interceptor.latest_csr:
+            body["__csr"] = self.response_interceptor.latest_csr
+        if self.response_interceptor.latest_dyn:
+            body["__dyn"] = self.response_interceptor.latest_dyn
+        return urlencode(body)
+
+    @staticmethod
+    def _parse_page_transparency_response(text: str) -> dict | None:
+        """Parse a ProfileTransparencyDialogQuery response body into the
+        page transparency record (the `data.page` dict). Returns None on
+        parse failure or if no doc carries `data.page`.
+
+        Handles both single-doc JSON and JSONL bodies.
+        """
+        if not text:
+            return None
+        docs: list = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                docs.append(json.loads(line))
+            except json.JSONDecodeError:
+                docs = []
+                break
+        if not docs:
+            try:
+                docs = [json.loads(text)]
+            except json.JSONDecodeError:
+                return None
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            page = (doc.get("data") or {}).get("page")
+            if isinstance(page, dict):
+                return page
+        return None
+
+    async def _hybrid_wait_for_template(
+        self,
+        timeout_seconds: float,
+        friendly_name: str = HYBRID_TARGET_FRIENDLY_NAME,
+        interceptor_attr: str = "latest_pctfrq_request",
+    ) -> dict | None:
+        """Poll until a natural <friendly_name> GraphQL request has been
+        observed (saved to `interceptor.<interceptor_attr>` by the matching
+        `_track_*_template` hook), or until the timeout elapses.
 
         Returns a dict shaped {"post_data": str|None, "headers": dict} — the
         narrower template hook we promote to production. Falls back to
         `network_capture` if it's been populated (i.e., FB_NETWORK_CAPTURE_ALL=1)
         and the dedicated hook hasn't fired yet.
+
+        Defaults to the user-timeline (PCTFRQ) target so existing callers
+        don't need to change.
         """
         elapsed = 0.0
         interval = 0.5
         while elapsed < timeout_seconds:
-            tpl = self.response_interceptor.latest_pctfrq_request
+            tpl = getattr(self.response_interceptor, interceptor_attr, None)
             if tpl is not None:
                 return tpl
             # Fallback: scan the full capture if it happens to be enabled.
             for rec in self.response_interceptor.network_capture:
                 req = rec.get("request") or {}
                 headers = req.get("headers") or {}
-                if headers.get("x-fb-friendly-name") == HYBRID_TARGET_FRIENDLY_NAME:
+                if headers.get("x-fb-friendly-name") == friendly_name:
                     return {"post_data": req.get("post_data"), "headers": headers}
                 form = self._hybrid_parse_form_data(req.get("post_data"))
-                if form.get("fb_api_req_friendly_name") == HYBRID_TARGET_FRIENDLY_NAME:
+                if form.get("fb_api_req_friendly_name") == friendly_name:
                     return {"post_data": req.get("post_data"), "headers": headers}
             await asyncio.sleep(interval)
             elapsed += interval
@@ -1302,17 +1838,135 @@ class BrowserSession:
                 return v
         return None
 
+    @staticmethod
+    def _hybrid_iter_wrapping_creation_times(text: str):
+        """Yield wrapping (post-itself) creation_times for every Story in a
+        GraphQL response body, in unspecified order.
+
+        Routes through the parser's `_extract_times` (same source of truth
+        as the flattener), which reads the wrapping Story's metadata
+        strategy at `comet_sections.context_layout.story.comet_sections.
+        metadata[*].story.creation_time` where `__typename ==
+        CometFeedStoryLongerTimestampStrategy`. That path never descends
+        into `attached_story`, so a recent share of an older post yields
+        only the share's own wrapping date — fixing the false-positive
+        cursor-reset trigger and the early-stop in
+        `oldest_in_batch < start_unix`.
+
+        Handles both response shapes: A (`User.timeline_list_feed_units.
+        edges[].node`, multiple stories) and B (`node` is a Story directly).
+        """
+        if not text:
+            return
+        parser = FacebookGraphQLParser()
+        try:
+            body = text.encode("utf-8") if isinstance(text, str) else text
+            parsed = parser.parse_timeline_response(body, GRAPHQL_API_URL)
+        except Exception:
+            return
+        if not parsed:
+            return
+        for post in parsed.get("posts") or []:
+            node = (post or {}).get("node") or {}
+            stories: list[dict] = []
+            tlfu = node.get("timeline_list_feed_units") if isinstance(node, dict) else None
+            if isinstance(tlfu, dict):
+                for edge in (tlfu.get("edges") or []):
+                    inner = edge.get("node") if isinstance(edge, dict) else None
+                    if isinstance(inner, dict):
+                        stories.append(inner)
+            elif isinstance(node, dict) and "post_id" in node:
+                stories.append(node)
+            for story in stories:
+                ct = (parser._extract_times(story) or {}).get("created_at")
+                if isinstance(ct, (int, float)):
+                    yield int(ct)
+
     @classmethod
     def _hybrid_extract_oldest_creation_time(cls, text: str) -> int | None:
-        """Find the smallest `creation_time` (unix seconds) in a GraphQL
-        response body. Returns None if no creation_time was present."""
-        oldest: int | None = None
-        for _, v in cls._hybrid_walk_response_for(text, {"creation_time"}):
-            if isinstance(v, (int, float)):
-                t = int(v)
-                if oldest is None or t < oldest:
-                    oldest = t
-        return oldest
+        """Smallest WRAPPING (post-itself) creation_time in the response.
+        Skips nested `attached_story` timestamps (shares of older posts)
+        and any other inner `creation_time` fields. Returns None if no
+        wrapping creation_time was present."""
+        times = list(cls._hybrid_iter_wrapping_creation_times(text))
+        return min(times) if times else None
+
+    @classmethod
+    def _hybrid_extract_newest_creation_time(cls, text: str) -> int | None:
+        """Mirror — used by debug log to show batch span so a cursor reset
+        (oldest jumps newer) is visible per-iteration."""
+        times = list(cls._hybrid_iter_wrapping_creation_times(text))
+        return max(times) if times else None
+
+    @staticmethod
+    def _hybrid_cursor_fp(cursor: str | None) -> str:
+        """Compact fingerprint for a cursor string suitable for log lines.
+
+        Cursors are long opaque base64-ish blobs; dumping them in full would
+        flood logs. We need just enough to (a) tell `null` from a real cursor
+        and (b) match identical cursors across iterations to detect
+        cursor-reset symptoms. Format: `null` or `len=<N> sha=<8hex>`.
+        """
+        if not cursor:
+            return "null"
+        h = hashlib.sha1(cursor.encode("utf-8")).hexdigest()[:8]
+        return f"len={len(cursor)} sha={h}"
+
+    @staticmethod
+    def _hybrid_dump_cursor_reset_window(
+        label: str,
+        trigger_index: int,
+        prev_oldest_unix: int | None,
+        cur_oldest_unix: int | None,
+        window: deque,
+        dump_root: str = HYBRID_CURSOR_RESET_DUMP_ROOT,
+    ) -> str | None:
+        """Persist the rolling iteration window to disk when a cursor-reset
+        symptom fires. Returns the dump directory path on success, None on
+        failure — failure is logged but never raised, since this is purely
+        diagnostic.
+
+        Layout:
+            <dump_root>/<label>/<UTC_ts>/window.jsonl   one record per iter
+            <dump_root>/<label>/<UTC_ts>/summary.json   trigger metadata
+        """
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Strip leading "@" from a handle so the path is clean; safe no-op
+        # if `label` doesn't start with one (e.g. a search query_text).
+        safe_label = label.lstrip("@") or "unknown"
+        out_dir = os.path.join(dump_root, safe_label, ts)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "window.jsonl"), "w") as f:
+                for rec in window:
+                    f.write(json.dumps(rec) + "\n")
+            summary = {
+                "label": label,
+                "trigger_pagination": trigger_index,
+                "prev_oldest_unix": prev_oldest_unix,
+                "cur_oldest_unix": cur_oldest_unix,
+                "prev_oldest_iso": (
+                    datetime.fromtimestamp(prev_oldest_unix, tz=timezone.utc).isoformat()
+                    if prev_oldest_unix is not None else None
+                ),
+                "cur_oldest_iso": (
+                    datetime.fromtimestamp(cur_oldest_unix, tz=timezone.utc).isoformat()
+                    if cur_oldest_unix is not None else None
+                ),
+                "jump_seconds": (
+                    cur_oldest_unix - prev_oldest_unix
+                    if (prev_oldest_unix is not None and cur_oldest_unix is not None)
+                    else None
+                ),
+                "window_size": len(window),
+                "dumped_at": ts,
+            }
+            with open(os.path.join(out_dir, "summary.json"), "w") as f:
+                json.dump(summary, f, indent=2)
+            return out_dir
+        except Exception as e:
+            logger.warning(f"[hybrid] @{label}: cursor-reset dump failed: {e}")
+            return None
 
     @classmethod
     def _hybrid_extract_graphql_error(cls, text: str) -> str | None:

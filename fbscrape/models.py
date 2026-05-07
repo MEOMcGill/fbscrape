@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, date, timedelta
 from typing import ClassVar
 import json
+import gzip
 
 from .logger import logger
 
@@ -82,9 +83,56 @@ class Query:
                 # "api": {...}  -- future: pure replay, no browser
             },
         },
+        "Search": {
+            "query_required": ["query_text", "start_date", "end_date"],
+            "modes": {
+                # Hybrid only — Search has no scroll-driven `manual` mode and
+                # never will. Date bounds are enforced server-side via the
+                # URL filter blob (see browser_session._build_search_url),
+                # not via GraphQL `beforeTime` / `afterTime`.
+                "hybrid": {
+                    "params": {
+                        # FB UI requests 5 search posts per page; mirror it.
+                        "pagination_count": 5,
+                        "scroll_burst_every": 30,
+                        "scroll_burst_size_range": (2, 5),
+                        "pagination_sleep_mean": 2.5,
+                        "pagination_sleep_std": 0.5,
+                        "template_capture_timeout": 20.0,
+                        "max_paginations": -1,
+                        "post_nav_sleep_seconds": 3.0,
+                        "request_timeout_ms": 30000,
+                        "max_no_progress_streak": 5,
+                        "operation_timeout_seconds": 900,
+                    },
+                },
+            },
+        },
+        "PageTransparency": {
+            # Caller supplies the numeric page_id directly; handle drives the
+            # bootstrap navigation (warm-up + natural traffic pattern) so the
+            # transparency POST replays alongside organic GraphQL traffic
+            # rather than as a cold request.
+            "query_required": ["handle", "page_id"],
+            "modes": {
+                # Hybrid only — single-shot replay, no pagination, no date
+                # filter. The natural ProfileTransparencyDialogQuery only
+                # fires from a UI click, so we don't wait for it; we capture
+                # auth-bearing fields (fb_dtsg, lsd, __user, __csr, __dyn,
+                # cookies) from any natural GraphQL POST that fires during
+                # navigation and synthesize the transparency body.
+                "hybrid": {
+                    "params": {
+                        "post_nav_sleep_seconds": 3.0,
+                        "template_capture_timeout": 20.0,
+                        "request_timeout_ms": 30000,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
         # e.g. for future endpoints
         # "GroupTimeline": {...},
-        # "Search": {...},
     }
 
     # Format for date strings stored in `query` (e.g. query["start_date"]).
@@ -216,23 +264,31 @@ class ScrapeOutcome:
     """Outcome of a single scrape, without the Query that triggered it.
 
     Returned by BrowserSession scrape methods, which are Query-agnostic on the
-    output side: they describe *what happened* (result string, posts, timing).
+    output side: they describe *what happened* (result string, records, timing).
     The Worker layer attaches the canonical Query (which it already holds as
     the task) to compose a final ScrapingResult — so the Query is constructed
     exactly once, in the scraper layer, and never rebuilt downstream.
+
+    `data` is `list[dict]` always (one element per scraped record). Single-
+    record endpoints like PageTransparency populate a 1-element list; post-
+    stream endpoints like UserTimeline / Search populate one element per post.
     """
     result: str  # 'success', 'failed to load', 'timeout', etc.
-    posts: list[dict]
+    data: list[dict]
     time_started: datetime
     time_taken: timedelta
 
 
 @dataclass
 class ScrapingResult:
-    """Result of a Facebook scraping operation"""
+    """Result of a Facebook scraping operation.
+
+    `data` mirrors `ScrapeOutcome.data` — see that class's docstring for the
+    list[dict] convention across single-record and post-stream endpoints.
+    """
     query: Query
     result: str  # 'success', 'failed to load', 'timeout', etc.
-    posts: list[dict]
+    data: list[dict]
     time_started: datetime
     time_taken: timedelta
 
@@ -244,7 +300,7 @@ class ScrapingResult:
         return cls(
             query=query,
             result=outcome.result,
-            posts=outcome.posts,
+            data=outcome.data,
             time_started=outcome.time_started,
             time_taken=outcome.time_taken,
         )
@@ -254,7 +310,7 @@ class ScrapingResult:
         return {
             'query': self.query.to_dict(),
             'result': self.result,
-            'posts': self.posts,
+            'data': self.data,
             'time_started': str(self.time_started),
             'time_taken': str(self.time_taken),
         }
@@ -263,11 +319,15 @@ class ScrapingResult:
         """Convert to JSON string"""
         return json.dumps(self.to_dict())
 
-    def save(self, path: str):
+    def save(self, path: str, compress: bool = False):
         """Save to JSON file"""
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
+        if compress:
+            with gzip.open(path, 'wt') as f:
+                json.dump(self.to_dict(), f, indent=2)
+        else:
+            with open(path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
 
-    def add_post(self, post: dict):
-        """Add a post to the results"""
-        self.posts.append(post)
+    def add_record(self, record: dict):
+        """Append a record to the results"""
+        self.data.append(record)

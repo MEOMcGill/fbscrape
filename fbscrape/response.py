@@ -20,19 +20,86 @@ _TEXT_RESOURCE_TYPES = frozenset({
 })
 
 
+def _g(obj, *keys, default=None):
+    """Safe nested getter: walks dict keys / list indices, returns `default` on any miss."""
+    for k in keys:
+        if obj is None:
+            return default
+        if isinstance(k, int):
+            if isinstance(obj, list) and -len(obj) <= k < len(obj):
+                obj = obj[k]
+            else:
+                return default
+        elif isinstance(obj, dict):
+            obj = obj.get(k)
+        else:
+            return default
+    return obj if obj is not None else default
+
+
+def _resolve_story(post: dict) -> dict | None:
+    """Walk a raw post dict to its canonical Story node.
+
+    Two shapes appear in PCTFRQ responses:
+      A) initial page load — `node` is a User containing
+         `timeline_list_feed_units.edges[].node` (Story).
+      B) pagination — `node` IS the Story directly.
+    """
+    node = post.get("node") or {}
+    if "timeline_list_feed_units" in node:
+        return _g(node, "timeline_list_feed_units", "edges", 0, "node")
+    if "post_id" in node:
+        return node
+    return None
+
+
+# Map FB's StoryAttachment style __typename to a short type label. Used by
+# _extract_attachment to dispatch type-specific field extraction. New style
+# renderers default to "unknown" — extend the map when seen.
+_ATTACHMENT_TYPE_BY_STYLE = {
+    "StoryAttachmentPhotoStyleRenderer":                    "photo",
+    "StoryAttachmentUnifiedLightweightVideoStyleRenderer":  "video",
+    "StoryAttachmentAnimatedImageShareStyleRenderer":       "video",
+    "StoryAttachmentAlbumStyleRenderer":                    "album",
+    "StoryAttachmentShareStyleRenderer":                    "link",
+    "StoryAttachmentShareMediumStyleRenderer":              "link",
+    "StoryAttachmentFBReelsStyleRenderer":                  "reel_share",
+    "StoryAttachmentUnavailableStyleRenderer":              "unavailable",
+    "StoryAttachmentCustomUnavailableStyleRenderer":        "unavailable",
+}
+
+# Story.comet_sections.context_layout.story.comet_sections.metadata[] is a
+# non-deterministic list of typed strategies; dispatch by __typename rather
+# than positional index. Add new typenames here as they're observed.
+_METADATA_TIMESTAMP_TYPENAME = "CometFeedStoryLongerTimestampStrategy"
+_METADATA_AUDIENCE_TYPENAME  = "CometFeedStoryAudienceStrategy"
+_METADATA_MUSIC_TYPENAME     = "CometStoryMusicPostLevelAttributionStrategy"
+
+
 class FacebookGraphQLParser:
-    """Parses Facebook GraphQL responses to extract posts"""
+    """Parses Facebook GraphQL responses and flattens posts into output rows.
+
+    The flattening pipeline is layered: per-aspect `_extract_*` methods consume
+    a canonical Story dict and return a partial dict. An endpoint-specific
+    orchestrator (`_flatten_<endpoint>_post`) composes them into the final row.
+    Most FB surfaces share the same Story shape (the "Comet" UI), so the
+    extractors are reused across endpoints — adding a new endpoint flattener
+    is mostly an orchestration call, plus a registry entry.
+    """
+
+    # Endpoint name → orchestrator method name on this class. Public flatten()
+    # routes via this. Adding an endpoint = one new orchestrator + one row here.
+    ENDPOINT_FLATTENERS: dict[str, str] = {
+        "UserTimeline": "_flatten_pctfrq_post",
+        "PageTransparency": "_flatten_pagetransparency_record",
+    }
+
+    # ----- runtime parsing (used by ResponseInterceptor) -----
 
     def parse_timeline_response(self, body: bytes, url: str) -> dict | None:
-        """
-        Parse Facebook GraphQL timeline response
+        """Parse a Facebook GraphQL timeline response body into `{posts: [...]}`.
 
-        Args:
-            body: Response body bytes
-            url: Response URL
-
-        Returns:
-            Dict with 'posts' key, or None if parsing fails
+        Returns None on any decode/parse failure.
         """
         try:
             response_data = parse_json_or_jsonl(body.decode('utf-8'))
@@ -52,187 +119,6 @@ class FacebookGraphQLParser:
             logger.error(f"[PARSER ERROR] {e}")
             logger.error(traceback.print_exc())
             return None
-
-    def flatten_post(self, post: dict) -> dict | None:
-        """
-        Extract basic metadata from a single post (one entry of `posts` list).
-
-        Expects shape: {'node': {'timeline_list_feed_units': {'edges': [{'node': <Story>}]}}}
-
-        Returns a flat dict with: post_id, story_id, url, created_at,
-        author_id, author_name, author_url, text, reactions, top_reactions,
-        shares, attachments. Missing fields become None.
-        """
-        def g(obj, *keys, default=None):
-            for k in keys:
-                if obj is None:
-                    return default
-                if isinstance(k, int):
-                    if isinstance(obj, list) and -len(obj) <= k < len(obj):
-                        obj = obj[k]
-                    else:
-                        return default
-                elif isinstance(obj, dict):
-                    obj = obj.get(k)
-                else:
-                    return default
-            return obj if obj is not None else default
-
-        # Two response shapes:
-        #   A) initial page load: node is a User containing timeline_list_feed_units.edges[].node (Story)
-        #   B) pagination: node IS the Story directly (has post_id at the top)
-        node = g(post, 'node') or {}
-        if 'timeline_list_feed_units' in node:
-            story = g(node, 'timeline_list_feed_units', 'edges', 0, 'node')
-        elif 'post_id' in node:
-            story = node
-        else:
-            story = None
-        if not story:
-            return None
-
-        metadata = g(story, 'comet_sections', 'context_layout', 'story',
-                     'comet_sections', 'metadata', 0, 'story') or {}
-
-        content_story = g(story, 'comet_sections', 'content', 'story') or {}
-
-        text = (g(content_story, 'comet_sections', 'message', 'story', 'message', 'text')
-                or g(content_story, 'comet_sections', 'message_container', 'story', 'message', 'text')
-                or g(content_story, 'message', 'text'))
-
-        # External URLs linked in the post text
-        external_urls = []
-        for ranges_path in (
-            ('comet_sections', 'message', 'story', 'message', 'ranges'),
-            ('comet_sections', 'message_container', 'story', 'message', 'ranges'),
-            ('message', 'ranges'),
-        ):
-            ranges = g(content_story, *ranges_path, default=[]) or []
-            for r in ranges:
-                url = g(r, 'entity', 'external_url')
-                if url and url not in external_urls:
-                    external_urls.append(url)
-            if external_urls:
-                break
-
-        feedback_context = g(story, 'comet_sections', 'feedback', 'story',
-                             'story_ufi_container', 'story', 'feedback_context') or {}
-        summary_fb = g(feedback_context, 'feedback_target_with_context',
-                       'comet_ufi_summary_and_actions_renderer', 'feedback') or {}
-        reactions = g(summary_fb, 'reaction_count', 'count')
-        shares = g(summary_fb, 'share_count', 'count')
-        comments = g(summary_fb, 'comments_count_summary_renderer', 'feedback',
-                     'comment_rendering_instance', 'comments', 'total_count')
-        video_views = g(summary_fb, 'video_view_count')
-        is_live = g(summary_fb, 'video_view_count_renderer', 'feedback',
-                    'associated_video', 'is_live_streaming')
-
-        reaction_counts = {k: 0 for k in ('like', 'love', 'haha', 'wow', 'sad', 'angry', 'care')}
-        for e in g(summary_fb, 'top_reactions', 'edges', default=[]) or []:
-            name = g(e, 'node', 'localized_name')
-            if name:
-                key = name.lower()
-                if key in reaction_counts:
-                    reaction_counts[key] = e.get('reaction_count') or 0
-
-        # Top comments that FB surfaces with the post
-        top_comments = []
-        for tc in g(feedback_context, 'interesting_top_level_comments', default=[]) or []:
-            c = tc.get('comment') or {}
-            c_fb = c.get('feedback') or {}
-            c_reactions = g(c_fb, 'reaction_count', 'count')
-            if c_reactions is None:
-                summed = sum((e.get('reaction_count') or 0)
-                             for e in g(c_fb, 'top_reactions', 'edges', default=[]) or [])
-                c_reactions = summed or None
-            top_comments.append({
-                'text': g(c, 'body', 'text'),
-                'author_id': g(c, 'author', 'id'),
-                'author_name': g(c, 'author', 'name'),
-                'author_url': g(c, 'author', 'url'),
-                'created_at': c.get('created_time'),
-                'reactions': c_reactions,
-            })
-
-        attachments = []
-        video_duration_sec = None
-        for a in g(story, 'attachments', default=[]) or []:
-            media = a.get('media') or {}
-            dur = g(a, 'styles', 'attachment', 'media', 'length_in_second')
-            if dur and video_duration_sec is None:
-                video_duration_sec = dur
-            attachments.append({
-                'type': media.get('__typename'),
-                'id': media.get('id'),
-                'url': (g(a, 'styles', 'attachment', 'media', 'url')
-                        or g(a, 'url')),
-                'accessibility_caption': g(a, 'styles', 'attachment', 'media',
-                                           'accessibility_caption'),
-            })
-
-        # Shared / reposted content
-        att = story.get('attached_story') or {}
-        att_meta = (g(att, 'comet_sections', 'context_layout', 'story',
-                      'comet_sections', 'metadata', 0, 'story') or {})
-        att_content = g(att, 'comet_sections', 'content', 'story') or {}
-        att_actor = g(att_content, 'actors', 0) or {}
-        att_text = (g(att_content, 'comet_sections', 'message', 'story', 'message', 'text')
-                    or g(att_content, 'comet_sections', 'message_container', 'story', 'message', 'text')
-                    or g(att_content, 'message', 'text'))
-        shared = {
-            'shared_post_id': att.get('post_id') or att.get('id'),
-            'shared_post_url': att.get('permalink_url') or att_meta.get('url'),
-            'shared_post_created_at': att_meta.get('creation_time'),
-            'shared_post_author_id': g(att, 'feedback', 'owning_profile', 'id') or att_actor.get('id'),
-            'shared_post_author_name': g(att, 'feedback', 'owning_profile', 'name') or att_actor.get('name'),
-            'shared_post_text': att_text,
-        } if att else {k: None for k in (
-            'shared_post_id', 'shared_post_url', 'shared_post_created_at',
-            'shared_post_author_id', 'shared_post_author_name', 'shared_post_text',
-        )}
-
-        permalink_url = story.get('permalink_url')
-        is_reel = bool(permalink_url and '/reel/' in permalink_url)
-
-        privacy = None
-        for m in g(story, 'comet_sections', 'context_layout', 'story',
-                   'comet_sections', 'metadata', default=[]) or []:
-            desc = g(m, 'story', 'privacy_scope', 'description')
-            if desc:
-                privacy = desc
-                break
-
-        created_at = metadata.get('creation_time')
-        created_at_utc = (
-            datetime.fromtimestamp(created_at, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            if isinstance(created_at, (int, float)) else None
-        )
-
-        return {
-            'post_id': story.get('post_id'),
-            'story_id': story.get('id'),
-            'url': metadata.get('url') or permalink_url,
-            'permalink_url': permalink_url,
-            'created_at': created_at,
-            'created_at_utc': created_at_utc,
-            'privacy': privacy,
-            'is_reel': is_reel,
-            'is_live': is_live,
-            'video_duration_sec': video_duration_sec,
-            'video_views': video_views,
-            'author_id': g(story, 'feedback', 'owning_profile', 'id'),
-            'author_name': g(story, 'feedback', 'owning_profile', 'name'),
-            'author_url': g(content_story, 'actors', 0, 'url'),
-            'text': text,
-            'external_urls': external_urls or None,
-            'reactions': reactions,
-            **reaction_counts,
-            'shares': shares,
-            'comments': comments,
-            'top_comments': top_comments or None,
-            **shared,
-            'attachments': attachments,
-        }
 
     def is_post_node(self, node: dict) -> bool | None:
         """
@@ -269,11 +155,478 @@ class FacebookGraphQLParser:
             logger.error(f"Failed to parse post node: {e}")
             return None
 
+    # ----- public flatten API -----
+
+    def flatten(self, record: dict, endpoint: str) -> dict | None:
+        """Flatten one raw record dict into a row dict.
+
+        Args:
+            record: One element of `ScrapingResult.data`. For post-stream
+                endpoints (UserTimeline, Search) this is a `data.<root>` dict
+                wrapping a Story; for single-record endpoints (PageTransparency)
+                this is the record dict directly.
+            endpoint: Endpoint name from the originating Query (e.g. "UserTimeline").
+
+        Returns the row dict, or None if the record can't be resolved.
+        Routes to `ENDPOINT_FLATTENERS[endpoint]`.
+        """
+        method = self.ENDPOINT_FLATTENERS.get(endpoint)
+        if not method:
+            raise ValueError(
+                f"No flattener registered for endpoint: {endpoint!r}. "
+                f"Registered: {list(self.ENDPOINT_FLATTENERS)}"
+            )
+        return getattr(self, method)(record)
+
+    # ----- endpoint orchestrators -----
+
+    def _flatten_pctfrq_post(self, post: dict) -> dict | None:
+        """Orchestrator for ProfileCometTimelineFeedRefetchQuery (UserTimeline)."""
+        story = _resolve_story(post)
+        if not story:
+            return None
+        out: dict = {}
+        out.update(self._extract_ids_and_urls(story))
+        out.update(self._extract_times(story))
+        out.update(self._extract_audience(story))
+        out.update(self._extract_author(story))
+        out.update(self._extract_message(story))
+        out.update(self._extract_music(story))
+        out.update(self._extract_flags(story))
+        out.update(self._extract_engagement(story))
+        out["top_comments"] = self._extract_top_comments(story)
+        out["attachments"]  = self._extract_attachments(story)
+        out["shared_post"]  = self._extract_shared_post(story)
+        return out
+
+    def _flatten_pagetransparency_record(self, record: dict) -> dict | None:
+        """Orchestrator for ProfileTransparencyDialogQuery (PageTransparency).
+
+        `record` is the `data.page` dict from the GraphQL response. Returns a
+        single-row dict — PageTransparency is a single-record endpoint, not
+        a post stream. None on shape mismatch (no `id` field).
+        """
+        if not isinstance(record, dict) or not record.get("id"):
+            return None
+
+        info = record.get("pages_transparency_info") or {}
+        admin_locations = info.get("admin_locations") or {}
+        history_items = info.get("history_items") or []
+
+        # Page creation date — first item with item_type == "CREATION".
+        creation_event_time: int | None = None
+        for item in history_items:
+            if isinstance(item, dict) and item.get("item_type") == "CREATION":
+                creation_event_time = item.get("event_time")
+                break
+
+        # Name change history — every NAME_CHANGE item, oldest-first preserved
+        # from the response order.
+        name_changes = [
+            {
+                "event_time": item.get("event_time"),
+                "target_name": item.get("target_name"),
+            }
+            for item in history_items
+            if isinstance(item, dict) and item.get("item_type") == "NAME_CHANGE"
+        ]
+
+        admin_country_counts = [
+            {
+                "country": _g(c, "country", "iso_name"),
+                "country_id": _g(c, "country", "id"),
+                "count": c.get("count"),
+            }
+            for c in (admin_locations.get("admin_country_counts") or [])
+            if isinstance(c, dict)
+        ]
+
+        delegate = record.get("profile_plus_for_delegate_page") or {}
+
+        return {
+            "page_id": record.get("id"),
+            "name": record.get("name"),
+            "page_type_name_for_content": record.get("page_type_name_for_content"),
+            "is_viewer_admin": record.get("is_viewer_admin"),
+            "verification_status": record.get("verification_status"),
+            "profile_picture_url": _g(record, "profile_picture", "uri"),
+            "page_transparency_settings_uri": record.get("page_transparency_settings_uri"),
+            "should_show_responsible_for_org_content": record.get(
+                "should_show_responsible_for_org_content"
+            ),
+            "category_text": delegate.get("category_text"),
+            "delegate_id": delegate.get("id"),
+            # pages_transparency_info fields
+            "transparency_id": info.get("id"),
+            "transparency_title": info.get("transparency_title"),
+            "is_person_profile": info.get("is_person_profile"),
+            "is_profile_action_report": info.get("is_profile_action_report"),
+            "linked_profile_id": info.get("linked_profile_id"),
+            "should_use_page_rename": info.get("should_use_page_rename"),
+            "genai_chatbot_disclosure": info.get("genai_chatbot_disclosure"),
+            "enabled_features": info.get("enabled_features") or [],
+            "has_active_ads": info.get("has_active_ads"),
+            "has_run_political_ads": info.get("has_run_political_ads"),
+            "page_id_for_admin": info.get("page_id_for_admin"),
+            "state_media_country_label": info.get("state_media_country_label"),
+            "confirmed_page_owner_consumer": record.get("confirmed_page_owner_consumer"),
+            "confirmed_page_partner_names": record.get("confirmed_page_partner_names") or [],
+            "creation_event_time": creation_event_time,
+            "name_changes": name_changes,
+            "admin_country_counts": admin_country_counts,
+            "admin_num_opt_out": admin_locations.get("num_opt_out"),
+            "admin_num_unknown": admin_locations.get("num_unknown"),
+        }
+
+    # ----- per-aspect extractors -----
+
+    def _metadata_by_typename(self, story: dict, typename: str) -> dict | None:
+        """First entry in `metadata[]` matching `__typename`, or None.
+
+        FB's metadata[] ordering is non-deterministic across posts and may grow
+        new strategies (location, sponsored, etc.); dispatching by typename
+        avoids brittle positional indexing.
+        """
+        md = _g(story, "comet_sections", "context_layout", "story",
+                "comet_sections", "metadata", default=[]) or []
+        for m in md:
+            if isinstance(m, dict) and m.get("__typename") == typename:
+                return m
+        return None
+
+    def _extract_ids_and_urls(self, story: dict) -> dict:
+        ts_meta = self._metadata_by_typename(story, _METADATA_TIMESTAMP_TYPENAME) or {}
+        canonical_url = _g(ts_meta, "story", "url")
+        permalink_url = story.get("permalink_url")
+        return {
+            "post_id":       story.get("post_id"),
+            "story_id":      story.get("id"),
+            "url":           canonical_url or permalink_url,
+            "permalink_url": permalink_url,
+        }
+
+    def _extract_times(self, story: dict) -> dict:
+        ts_meta = self._metadata_by_typename(story, _METADATA_TIMESTAMP_TYPENAME) or {}
+        created_at = _g(ts_meta, "story", "creation_time")
+        created_at_utc = (
+            datetime.fromtimestamp(created_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if isinstance(created_at, (int, float)) else None
+        )
+        return {"created_at": created_at, "created_at_utc": created_at_utc}
+
+    def _extract_audience(self, story: dict) -> dict:
+        aud = self._metadata_by_typename(story, _METADATA_AUDIENCE_TYPENAME) or {}
+        return {"privacy": _g(aud, "story", "privacy_scope", "description")}
+
+    def _extract_author(self, story: dict) -> dict:
+        op = _g(story, "feedback", "owning_profile") or {}
+        a0 = _g(story, "actors", 0) or {}
+        return {
+            "author_id":            op.get("id") or a0.get("id"),
+            "author_name":          op.get("name") or a0.get("name"),
+            "author_url":           a0.get("url"),
+            "author_type":          a0.get("__typename"),
+            "author_promode_badge": a0.get("show_promode_badge"),
+        }
+
+    def _extract_message(self, story: dict) -> dict:
+        """Text + entity-annotated ranges (hashtags, mentions, external URLs).
+
+        FB stores all three as typed entities in the same `message.ranges[]`,
+        each carrying `entity.__typename` ∈ {Hashtag, User, ExternalUrl}.
+        """
+        cs = _g(story, "comet_sections", "content", "story") or {}
+        text = (
+            _g(cs, "comet_sections", "message", "story", "message", "text")
+            or _g(cs, "comet_sections", "message_container", "story", "message", "text")
+            or _g(cs, "message", "text")
+        )
+        ranges = []
+        for path in (
+            ("comet_sections", "message", "story", "message", "ranges"),
+            ("comet_sections", "message_container", "story", "message", "ranges"),
+            ("message", "ranges"),
+        ):
+            ranges = _g(cs, *path, default=[]) or []
+            if ranges:
+                break
+
+        hashtags: list[str] = []
+        mentions: list[dict] = []
+        external_urls: list[str] = []
+        seen_h: set[str] = set()
+        seen_m: set[str] = set()
+        seen_u: set[str] = set()
+        for r in ranges:
+            entity = r.get("entity") or {}
+            tn = entity.get("__typename")
+            if tn == "Hashtag":
+                # Hashtag has no name field — derive from URL last segment.
+                url = entity.get("url") or ""
+                name = url.rsplit("/", 1)[-1] if url else None
+                if name and name not in seen_h:
+                    seen_h.add(name)
+                    hashtags.append(name)
+            elif tn == "User":
+                uid = entity.get("id")
+                if uid and uid not in seen_m:
+                    seen_m.add(uid)
+                    mentions.append({
+                        "id":   uid,
+                        "name": entity.get("name"),
+                        "url":  entity.get("url"),
+                    })
+            elif tn == "ExternalUrl":
+                url = entity.get("external_url")
+                if url and url not in seen_u:
+                    seen_u.add(url)
+                    external_urls.append(url)
+
+        return {
+            "text":          text,
+            "hashtags":      hashtags or None,
+            "mentions":      mentions or None,
+            "external_urls": external_urls or None,
+        }
+
+    def _extract_music(self, story: dict) -> dict:
+        m = self._metadata_by_typename(story, _METADATA_MUSIC_TYPENAME) or {}
+        meta = _g(m, "story", "story_media_metadata") or {}
+        return {
+            "music_artist": meta.get("artist_name"),
+            "music_title":  meta.get("song_title"),
+        }
+
+    def _extract_flags(self, story: dict) -> dict:
+        permalink_url = story.get("permalink_url") or ""
+        is_reel = "/reel/" in permalink_url
+        is_live = _g(self._summary_feedback(story),
+                     "video_view_count_renderer", "feedback",
+                     "associated_video", "is_live_streaming")
+        return {
+            "is_reel":   is_reel,
+            "is_live":   is_live,
+            "is_repost": bool(story.get("attached_story")),
+        }
+
+    def _summary_feedback(self, story: dict) -> dict:
+        """Engagement-bearing feedback (reactions, shares, comments_count, video_views)."""
+        return (_g(story, "comet_sections", "feedback", "story",
+                   "story_ufi_container", "story", "feedback_context",
+                   "feedback_target_with_context",
+                   "comet_ufi_summary_and_actions_renderer", "feedback") or {})
+
+    def _extract_engagement(self, story: dict) -> dict:
+        sf = self._summary_feedback(story)
+        rxn_counts = {k: 0 for k in ("like", "love", "haha", "wow", "sad", "angry", "care")}
+        for e in _g(sf, "top_reactions", "edges", default=[]) or []:
+            name = _g(e, "node", "localized_name")
+            if name:
+                key = name.lower()
+                if key in rxn_counts:
+                    rxn_counts[key] = e.get("reaction_count") or 0
+        # Video duration: first attachment carrying a non-zero length wins.
+        duration = None
+        for a in story.get("attachments") or []:
+            d = _g(a, "styles", "attachment", "media", "length_in_second")
+            if d:
+                duration = d
+                break
+        return {
+            "reactions":          _g(sf, "reaction_count", "count"),
+            **rxn_counts,
+            "shares":             _g(sf, "share_count", "count"),
+            "comments":           _g(sf, "comments_count_summary_renderer", "feedback",
+                                     "comment_rendering_instance", "comments", "total_count"),
+            "video_views":        _g(sf, "video_view_count"),
+            "video_duration_sec": duration,
+        }
+
+    def _extract_top_comments(self, story: dict) -> list[dict] | None:
+        """Top-level comments FB surfaces with the post (interesting_top_level_comments)."""
+        fbc = _g(story, "comet_sections", "feedback", "story",
+                 "story_ufi_container", "story", "feedback_context") or {}
+        out = []
+        for tc in fbc.get("interesting_top_level_comments") or []:
+            c = tc.get("comment") or {}
+            c_fb = c.get("feedback") or {}
+            r = _g(c_fb, "reaction_count", "count")
+            if r is None:
+                # Some shapes only carry per-reaction edges; sum as fallback.
+                summed = sum((e.get("reaction_count") or 0)
+                             for e in _g(c_fb, "top_reactions", "edges", default=[]) or [])
+                r = summed or None
+            out.append({
+                "text":        _g(c, "body", "text"),
+                "author_id":   _g(c, "author", "id"),
+                "author_name": _g(c, "author", "name"),
+                "author_url":  _g(c, "author", "url"),
+                "created_at":  c.get("created_time"),
+                "reactions":   r,
+            })
+        return out or None
+
+    def _extract_attachments(self, story: dict) -> list[dict] | None:
+        out = [self._extract_attachment(a) for a in (story.get("attachments") or [])]
+        return out or None
+
+    # Uniform attachment shape — every type fills the same keys, type-specific
+    # extras get None when not applicable. Keeps polars schema stable.
+    _ATTACHMENT_KEYS = (
+        "type", "id", "url",
+        "image_url", "image_lowres_url", "thumbnail_url",
+        "width", "height", "accessibility_caption",
+        "video_duration_sec", "video_is_live", "video_permalink_url", "video_captions_url",
+        "link_title", "link_description", "link_source", "link_destination_url",
+        "subattachments",
+    )
+
+    def _empty_attachment(self) -> dict:
+        return {k: None for k in self._ATTACHMENT_KEYS}
+
+    def _extract_attachment(self, att: dict) -> dict:
+        """Extract one attachment, recursing into album subattachments and
+        reel-share inner attachments.
+        """
+        styles = att.get("styles") or {}
+        sa = styles.get("attachment") or {}
+        style_typename = styles.get("__typename")
+        atype = _ATTACHMENT_TYPE_BY_STYLE.get(style_typename, "unknown")
+
+        # Bare-media fallback: album sub-nodes & reel inner attachments don't
+        # carry the outer styles wrapper.
+        media = sa.get("media") or att.get("media") or {}
+
+        out = self._empty_attachment()
+        out.update({
+            "type":                  atype,
+            "id":                    media.get("id") or att.get("id"),
+            "url":                   sa.get("url") or att.get("url")
+                                     or media.get("permalink_url") or media.get("url"),
+            "width":                 media.get("width"),
+            "height":                media.get("height"),
+            "accessibility_caption": media.get("accessibility_caption"),
+            "video_duration_sec":    media.get("length_in_second"),
+            "video_is_live":         media.get("is_live_streaming"),
+            "video_permalink_url":   media.get("permalink_url"),
+            "video_captions_url":    media.get("captions_url"),
+            "link_title":            _g(sa, "title_with_entities", "text"),
+            "link_description":      _g(sa, "description", "text"),
+            "link_source":           _g(sa, "source", "text"),
+            "link_destination_url":  _g(sa, "story_attachment_link_renderer",
+                                        "attachment", "web_link", "url"),
+        })
+
+        # Photos / album cover: single photos serve the URL on photo_image
+        # (viewer_image carries dimensions only); album subnodes invert this
+        # — viewer_image has the URL, photo_image isn't there. Try both.
+        if atype in ("photo", "album"):
+            out["image_url"] = (_g(media, "photo_image", "uri")
+                                or _g(media, "viewer_image", "uri"))
+            out["image_lowres_url"] = _g(media, "image", "uri")
+            # width/height may live on viewer_image / photo_image rather than top-level
+            if not out["width"]:
+                out["width"]  = _g(media, "viewer_image", "width") or _g(media, "photo_image", "width")
+                out["height"] = _g(media, "viewer_image", "height") or _g(media, "photo_image", "height")
+
+        # Videos & animated GIFs: thumbnail is a string URL on first_frame_thumbnail
+        # when present, else nested {image: {uri}} on preferred_thumbnail.
+        if atype == "video":
+            ff = media.get("first_frame_thumbnail")
+            out["thumbnail_url"] = (ff if isinstance(ff, str)
+                                    else _g(media, "preferred_thumbnail", "image", "uri"))
+
+        # Link previews: thumbnail lives on media.large_share_image (full) or
+        # media.image (favicon-sized). Destination URL falls back to the
+        # l.facebook.com redirect when the resolved web_link.url is missing.
+        if atype == "link":
+            out["image_url"]     = _g(media, "large_share_image", "uri") or _g(media, "image", "uri")
+            out["thumbnail_url"] = out["image_url"]
+            out["link_destination_url"] = (
+                out["link_destination_url"]
+                or _g(sa, "story_attachment_link_renderer", "attachment", "url")
+            )
+
+        # Albums: recurse over all_subattachments[].nodes (stripped media-only shape).
+        subs = _g(sa, "all_subattachments", "nodes", default=[]) or []
+        if subs:
+            out["subattachments"] = [self._extract_album_subnode(s) for s in subs]
+
+        # Reel shares: inner attachments live under style_infos[].fb_shorts_story.attachments[].
+        if atype == "reel_share":
+            for si in (sa.get("style_infos") or []):
+                inner_atts = _g(si, "fb_shorts_story", "attachments", default=[]) or []
+                if inner_atts:
+                    out["subattachments"] = [self._extract_attachment(i) for i in inner_atts]
+                    # Hoist the first inner reel's permalink/thumbnail/duration to the outer
+                    # attachment so a single-row consumer doesn't have to recurse to find them.
+                    inner_media = inner_atts[0].get("media") or {}
+                    out["url"]                = out["url"] or inner_media.get("permalink_url")
+                    out["thumbnail_url"]      = out["thumbnail_url"] or _g(inner_media, "thumbnailImage", "uri")
+                    out["video_duration_sec"] = out["video_duration_sec"] or inner_media.get("length_in_second")
+                    break
+
+        return out
+
+    def _extract_album_subnode(self, sub: dict) -> dict:
+        """Album subattachments use a stripped shape (no outer styles wrapper)."""
+        media = sub.get("media") or {}
+        out = self._empty_attachment()
+        out.update({
+            "type":                  "photo" if media.get("__typename") == "Photo" else "unknown",
+            "id":                    media.get("id"),
+            "url":                   sub.get("url"),
+            "image_url":             _g(media, "viewer_image", "uri"),
+            "image_lowres_url":      _g(media, "image", "uri"),
+            "width":                 _g(media, "viewer_image", "width") or _g(media, "image", "width"),
+            "height":                _g(media, "viewer_image", "height") or _g(media, "image", "height"),
+            "accessibility_caption": media.get("accessibility_caption"),
+        })
+        return out
+
+    def _extract_shared_post(self, story: dict) -> dict | None:
+        """Run extractors on `attached_story` (FB's repost/share slot).
+
+        FB serves an abbreviated Story under attached_story — only
+        comet_sections.context_layout (metadata) and footer plus
+        feedback.owning_profile and permalink_url. The full content section
+        (text, attachments, top_reactions) is NOT inlined; FB expects the UI
+        to fetch the original post on click. So most extractors return None
+        for shared posts; that's fine — the row still carries the shared-
+        post id, url, creation time, privacy, and author.
+
+        attached_story IS already a Story-shaped dict; pass it straight to the
+        extractors (no _resolve_story call — that requires a top-level post_id
+        which attached_story doesn't carry).
+        """
+        att = story.get("attached_story")
+        if not att:
+            return None
+        out: dict = {}
+        out.update(self._extract_ids_and_urls(att))
+        out.update(self._extract_times(att))
+        out.update(self._extract_audience(att))
+        out.update(self._extract_author(att))
+        out.update(self._extract_message(att))
+        out.update(self._extract_music(att))
+        out.update(self._extract_flags(att))
+        out.update(self._extract_engagement(att))
+        out["top_comments"] = self._extract_top_comments(att)
+        out["attachments"]  = self._extract_attachments(att)
+        return out
+
+
 class ResponseInterceptor:
     """Intercepts and handles browser network responses"""
 
     def __init__(self):
         self.posts = []
+        # post_ids of every post in `self.posts`. Maintained by `add_posts`
+        # so the auto-extract path and the hybrid replay path share dedup.
+        # Without this, FB cursor-degraded responses (which can re-serve the
+        # same posts) inflate `len(self.posts)` and defeat no-progress
+        # backstops in the pagination loop. Cleared in `flush()`.
+        self.seen_post_ids: set[str] = set()
         self.graphql_request_count = 0
         self.last_response_time: datetime | None = None
         self.parser = FacebookGraphQLParser()
@@ -305,6 +658,18 @@ class ResponseInterceptor:
         # a natural PCTFRQ request is observed; reset on flush().
         # Shape: {"post_data": str | None, "headers": dict[str, str]}
         self.latest_pctfrq_request: dict | None = None
+        # Latest captured SearchCometResultsPaginatedResultsQuery request, if any.
+        # Same role as latest_pctfrq_request, but for the Search endpoint's
+        # hybrid mode. Reset on flush().
+        self.latest_scrq_request: dict | None = None
+        # Latest captured natural GraphQL POST (any friendly-name). Populated
+        # on every browser-issued GraphQL POST observed. Used by single-shot
+        # endpoints (e.g., PageTransparency) that synthesize the request body
+        # rather than waiting for a specific friendly-name to fire naturally
+        # — they only need the auth-bearing fields (fb_dtsg, lsd, __user,
+        # __csr, __dyn, cookies, etc.), which are cross-cutting across all
+        # GraphQL POSTs from the same session. Reset on flush().
+        self.latest_natural_graphql_request: dict | None = None
         # Capture full request+response of every response, opt-in only.
         # Off by default (production hybrid does not need it). Enable with
         # FB_NETWORK_CAPTURE_ALL=1 for offline forensic analysis. When off,
@@ -355,6 +720,8 @@ class ResponseInterceptor:
             self.last_response_time = datetime.now(timezone.utc)
             self._track_request_tokens(response.request)
             await self._track_pctfrq_template(response.request)
+            await self._track_scrq_template(response.request)
+            await self._track_any_graphql_request(response.request)
 
         # Full network capture is opt-in via FB_NETWORK_CAPTURE_ALL=1. Off by
         # default to keep production memory tight. When on, every response is
@@ -389,7 +756,7 @@ class ResponseInterceptor:
             if self.extract_posts:
                 parsed = self.parser.parse_timeline_response(body, url)
                 if parsed:
-                    self.posts.extend(parsed['posts'])
+                    self.add_posts(parsed['posts'])
                 else:
                     logger.warning(f"[PARSER] Returned None - parser needs implementation")
 
@@ -509,11 +876,26 @@ class ResponseInterceptor:
         """Get collected posts"""
         return self.posts
 
-    def add_posts(self, posts: list[dict]):
+    def add_posts(self, posts: list[dict]) -> int:
         """Append posts parsed elsewhere (e.g. by a hybrid replay path)
         to the same accumulator that auto-intercepted posts populate.
-        Preferred over directly mutating `self.posts`."""
-        self.posts.extend(posts)
+        Preferred over directly mutating `self.posts`.
+
+        Dedups on `post_id` against `self.seen_post_ids`. Posts without a
+        `post_id` are appended as-is (defensive — the parser should always
+        set one, but if it ever doesn't we'd rather keep the post than
+        silently drop it). Returns the count of posts actually added.
+        """
+        added = 0
+        for post in posts:
+            pid = post.get("post_id")
+            if pid:
+                if pid in self.seen_post_ids:
+                    continue
+                self.seen_post_ids.add(pid)
+            self.posts.append(post)
+            added += 1
+        return added
 
     def _track_request_tokens(self, request):
         """Parse `__csr` and `__dyn` from a natural GraphQL POST body and
@@ -586,6 +968,76 @@ class ResponseInterceptor:
             "headers": headers,
         }
 
+    async def _track_scrq_template(self, request):
+        """If this request is a `SearchCometResultsPaginatedResultsQuery`, save
+        a small replay-template snapshot (post_data + headers) to
+        `self.latest_scrq_request`. Mirrors `_track_pctfrq_template` for the
+        Search endpoint's hybrid mode.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+
+        is_scrq = headers.get("x-fb-friendly-name") == "SearchCometResultsPaginatedResultsQuery"
+        post_data = None
+        if not is_scrq:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            if post_data:
+                try:
+                    form = parse_qs(post_data, keep_blank_values=True)
+                    name = form.get("fb_api_req_friendly_name") or []
+                    if name and name[-1] == "SearchCometResultsPaginatedResultsQuery":
+                        is_scrq = True
+                except Exception:
+                    pass
+        if not is_scrq:
+            return
+
+        if post_data is None:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+        self.latest_scrq_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
+    async def _track_any_graphql_request(self, request):
+        """Save (post_data, headers) for any natural GraphQL POST to
+        `self.latest_natural_graphql_request`. Called from intercept_response
+        on every GraphQL request — last-write-wins.
+
+        Used by single-shot endpoints (e.g., PageTransparency) to harvest
+        auth-bearing fields from organic traffic without waiting for a
+        specific friendly-name to fire. The endpoint then synthesizes its
+        own body by overriding `fb_api_req_friendly_name`, `variables`, and
+        `doc_id` while inheriting cross-cutting fields (fb_dtsg, lsd,
+        __user, __csr, __dyn, etc.) from the captured template.
+
+        Skips non-POST requests (preflights, GETs).
+        """
+        if request.method != "POST":
+            return
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+        try:
+            post_data = request.post_data
+        except Exception:
+            post_data = None
+        if not post_data:
+            return
+        self.latest_natural_graphql_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
     def has_graphql_activity(self) -> bool:
         """Check if any GraphQL requests have been intercepted"""
         return self.graphql_request_count > 0
@@ -601,12 +1053,15 @@ class ResponseInterceptor:
     def flush(self):
         """Clear collected data and reset counters"""
         self.posts = []
+        self.seen_post_ids = set()
         self.graphql_request_count = 0
         self.last_response_time = None
         self.viewer_seen = False
         self.latest_csr = None
         self.latest_dyn = None
         self.latest_pctfrq_request = None
+        self.latest_scrq_request = None
+        self.latest_natural_graphql_request = None
         # network_capture is opt-in (FB_NETWORK_CAPTURE_ALL=1); reset anyway
         # so a fresh scrape starts with a clean slate when capture is enabled.
         self.network_capture = []

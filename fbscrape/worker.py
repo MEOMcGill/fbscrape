@@ -42,6 +42,8 @@ class Worker:
     ENDPOINT_MODE_METHODS = {
         ("UserTimeline", "manual"): "user_timeline_manual",
         ("UserTimeline", "hybrid"): "user_timeline_hybrid",
+        ("Search", "hybrid"): "search_hybrid",
+        ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
         # ("GroupTimeline", "manual"): "group_timeline_manual",
     }
@@ -276,7 +278,25 @@ class Worker:
                     self.scroll_count += endpoint_scrolls
                     logger.debug(f"Worker {self.id}: task complete, endpoint_scrolls={endpoint_scrolls}, total scroll_count={self.scroll_count}")
 
-                    return ScrapingResult.from_outcome(task, outcome)
+                    result = ScrapingResult.from_outcome(task, outcome)
+
+                    # Cursor reset is a soft signal that this account/session
+                    # has been throttled into a degraded response stream.
+                    # Mirrors the RateLimitError path (lock + rotate) but as
+                    # a result-string branch since the loop returned cleanly
+                    # with partial posts. High-level scraper owns the resume
+                    # retry policy — Worker just locks and yields control.
+                    if outcome.result == 'cursor_reset':
+                        logger.warning(
+                            f"Worker {self.id}: cursor_reset on "
+                            f"{self.current_account.display_name} "
+                            f"(records={len(outcome.data)}); locking 30 min and rotating"
+                        )
+                        await self.rotate_account(
+                            lock_until="datetime('now', '+10 minutes')"
+                        )
+
+                    return result
 
             except AccountDisabledError as e:
                 # Detector (_wait_for_log_in_outcome) already wrote a specific error_msg
@@ -314,7 +334,7 @@ class Worker:
                 # on a fresh BrowserSession (the `async with BrowserSession(...)`
                 # block exits and the next iteration opens a new one). Discard
                 # partial posts.
-                # TODO: progress save / resume — preserve pre-hang posts so a
+                # TODO: progress save / resume — preserve pre-hang records so a
                 # restart picks up where the wedged session left off instead of
                 # from scratch.
                 logger.warning(

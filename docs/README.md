@@ -2,6 +2,10 @@
 
 Index of the docs in this directory. The top-level `README.md`, `CONTRIBUTING.md`, and `CLAUDE.md` stay at the repo root — start there if you're new to the project.
 
+## Adding endpoints
+
+- [`adding_endpoints.md`](adding_endpoints.md) — playbook for onboarding a new scrape endpoint. Paste-in checklist for the user (capture format, required artifacts) and wiring guide for Claude (the 7 touch points across registry / browser session / worker / scraper / interceptor / parser / CLI). Hybrid-first; manual mode is deprecated for new endpoints.
+
 ## Architecture
 
 Reference for someone modifying the core scrape flow.
