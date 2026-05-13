@@ -8,6 +8,21 @@ import os
 from tabulate import tabulate
 import gzip
 
+
+def _open_scrape_input(path: str):
+    """Open a saved scrape result for reading as text.
+
+    Sniffs the first two bytes — gzip magic (`1f 8b`) wins regardless of
+    file extension, so a misnamed `.json` file containing gzip bytes
+    (saved before ScrapingResult.save's auto-`.gz`-append landed) still
+    decodes correctly. Falls back to plain text open otherwise.
+    """
+    with open(path, 'rb') as f:
+        magic = f.read(2)
+    if magic == b'\x1f\x8b':
+        return gzip.open(path, 'rt')
+    return open(path, 'rt')
+
 from .accounts_pool import AccountsPool
 from .utils import gather, get_home_dir_path, utc
 
@@ -843,7 +858,7 @@ def scrape():
                    'column in --input-file.')
 @click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
-@click.option('--scroll-threshold', default=500, type=int, help='Scrolls (or hybrid paginations) before rotating account')
+@click.option('--scroll-threshold', default=5000, type=int, help='Scrolls (or hybrid paginations) before rotating account')
 @click.option('--stall-timeout-seconds', default=None, type=int, help='[manual] bail out if no GraphQL response for N seconds (default 300, ignored for --mode hybrid)')
 @click.option('--headless', is_flag=True, help='Run browsers headless')
 @click.option('--mobile', is_flag=True, help='Use mobile emulation')
@@ -927,6 +942,7 @@ def scrape_user_timeline(
             f"{min(starts)}_{max(ends)}",
         )
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
 
     if skip_existing:
         # Mirror the filename format used by the save loop below. Note: a file
@@ -1006,16 +1022,12 @@ def scrape_user_timeline(
             ):
                 data: ScrapingResult = result
                 handle = data.query.query.get('handle')
-                click.echo(f"{handle}: {data.result} ({len(data.data)} posts, {data.time_taken})")
-
                 filename = (
                     f"{handle.replace('.', '_')}"
                     f"_{data.query.endpoint}_{data.query.mode}"
                     f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json.gz"
                 )
                 data.save(os.path.join(output_dir, filename), compress=True)
-
-        click.echo(f"\nResults saved to: {output_dir}")
 
     run_async(_scrape())
 
@@ -1028,43 +1040,122 @@ def _sanitize_query_for_filename(s: str) -> str:
 def _resolve_page_transparency_targets(
     pairs: tuple[str, ...], input_file: str | None,
 ) -> list[dict]:
-    """Resolve (handle, page_id) targets from CLI flags or --input-file.
+    """Resolve page_id targets (with optional handle) from CLI or --input-file.
 
-    Positional args are accepted as `handle:page_id` strings (one per
-    target). The file form expects `handle` and `page_id` columns and is
-    mutually exclusive with positional pairs.
+    Positional args are accepted in two forms:
+      - bare `<page_id>` (e.g. `899800046546098`)
+      - `<handle>:<page_id>` (e.g. `habsfanhub:899800046546098`)
+
+    File form expects a `page_id` column (required) and optional `handle`
+    column. Mutually exclusive with positional args.
     """
     if pairs and input_file:
         raise click.UsageError(
-            "Cannot use both positional 'handle:page_id' pairs and --input-file."
+            "Cannot use both positional args and --input-file."
         )
     if not pairs and not input_file:
         raise click.UsageError(
-            "Must provide either positional 'handle:page_id' pairs or --input-file."
+            "Must provide either positional args ('<page_id>' or "
+            "'<handle>:<page_id>') or --input-file."
+        )
+
+    if input_file:
+        return _load_scrape_targets(
+            input_file,
+            key_field='page_id',
+            extra_keys=('handle',),
+            required_extra_keys=(),
+        )
+
+    targets = []
+    for s in pairs:
+        s = s.strip()
+        if not s:
+            raise click.UsageError("Empty positional arg.")
+        if ':' in s:
+            handle, page_id = s.split(':', 1)
+            handle = handle.strip() or None
+            page_id = page_id.strip()
+        else:
+            handle = None
+            page_id = s
+        if not page_id:
+            raise click.UsageError(f"Positional arg {s!r}: page_id required.")
+        target: dict = {'page_id': page_id}
+        if handle:
+            target['handle'] = handle
+        targets.append(target)
+    return targets
+
+
+def _resolve_profile_authenticity_targets(
+    user_ids: tuple[str, ...], input_file: str | None,
+) -> list[dict]:
+    """Resolve user_id targets from CLI flags or --input-file.
+
+    Positional args are accepted as bare numeric user IDs. The file form
+    expects a `user_id` column and is mutually exclusive with positional args.
+    """
+    if user_ids and input_file:
+        raise click.UsageError(
+            "Cannot use both positional user_id args and --input-file."
+        )
+    if not user_ids and not input_file:
+        raise click.UsageError(
+            "Must provide either positional user_id args or --input-file."
+        )
+
+    if input_file:
+        return _load_scrape_targets(
+            input_file,
+            key_field='user_id',
+            extra_keys=(),
+        )
+
+    targets = []
+    for s in user_ids:
+        s = s.strip()
+        if not s:
+            raise click.UsageError("Empty user_id positional arg.")
+        targets.append({'user_id': s})
+    return targets
+
+
+def _resolve_handle_pair_targets(
+    pairs: tuple[str, ...], input_file: str | None, paired_key: str,
+) -> list[dict]:
+    """Generic 'handle:<paired>' resolver shared by single-shot endpoints."""
+    if pairs and input_file:
+        raise click.UsageError(
+            f"Cannot use both positional 'handle:{paired_key}' pairs and --input-file."
+        )
+    if not pairs and not input_file:
+        raise click.UsageError(
+            f"Must provide either positional 'handle:{paired_key}' pairs or --input-file."
         )
 
     if input_file:
         return _load_scrape_targets(
             input_file,
             key_field='handle',
-            extra_keys=('page_id',),
-            required_extra_keys=('page_id',),
+            extra_keys=(paired_key,),
+            required_extra_keys=(paired_key,),
         )
 
     targets = []
     for s in pairs:
         if ':' not in s:
             raise click.UsageError(
-                f"Positional arg {s!r} must be 'handle:page_id'."
+                f"Positional arg {s!r} must be 'handle:{paired_key}'."
             )
-        handle, page_id = s.split(':', 1)
+        handle, paired = s.split(':', 1)
         handle = handle.strip()
-        page_id = page_id.strip()
-        if not handle or not page_id:
+        paired = paired.strip()
+        if not handle or not paired:
             raise click.UsageError(
-                f"Positional arg {s!r}: both handle and page_id required."
+                f"Positional arg {s!r}: both handle and {paired_key} required."
             )
-        targets.append({'handle': handle, 'page_id': page_id})
+        targets.append({'handle': handle, paired_key: paired})
     return targets
 
 
@@ -1086,7 +1177,7 @@ def _resolve_page_transparency_targets(
               help='Directory to save results (default: data/posts/{start}_{end})')
 @click.option('--max-sessions', default=2, type=int,
               help='Max concurrent browser sessions')
-@click.option('--scroll-threshold', default=500, type=int,
+@click.option('--scroll-threshold', default=5000, type=int,
               help='Hybrid paginations before rotating account')
 @click.option('--headless', is_flag=True, help='Run browsers headless')
 @click.option('--mobile', is_flag=True, help='Use mobile emulation')
@@ -1148,7 +1239,7 @@ def scrape_search(
       fbscrape scrape search --input-file queries.yaml --start-date 2025-01-01
     """
     from .scraper import FacebookScraper
-    from .logger import set_log_level
+    from .logger import set_log_level, logger
     from .models import ScrapingResult
 
     set_log_level(log_level)
@@ -1167,6 +1258,7 @@ def scrape_search(
             f"{min(starts)}_{max(ends)}",
         )
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
 
     if skip_existing:
         before = len(targets)
@@ -1181,9 +1273,9 @@ def scrape_search(
         ]
         skipped = before - len(targets)
         if skipped:
-            click.echo(f"--skip-existing: {skipped}/{before} queries already have output files in {output_dir}")
+            logger.info(f"--skip-existing: {skipped}/{before} queries already have output files in {output_dir}")
         if not targets:
-            click.echo("Nothing to scrape.")
+            logger.info("Nothing to scrape.")
             return
 
     mode_params = {
@@ -1229,16 +1321,12 @@ def scrape_search(
             ):
                 data: ScrapingResult = result
                 qt = data.query.query.get('query_text')
-                click.echo(f"{qt!r}: {data.result} ({len(data.data)} posts, {data.time_taken})")
-
                 filename = (
                     f"{_sanitize_query_for_filename(qt)}"
                     f"_{data.query.endpoint}_{data.query.mode}"
                     f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json"
                 )
                 data.save(os.path.join(output_dir, filename))
-
-        click.echo(f"\nResults saved to: {output_dir}")
 
     run_async(_scrape())
 
@@ -1252,7 +1340,7 @@ def scrape_search(
               help='Directory to save results (default: data/page_transparency/)')
 @click.option('--max-sessions', default=2, type=int,
               help='Max concurrent browser sessions')
-@click.option('--scroll-threshold', default=500, type=int,
+@click.option('--scroll-threshold', default=5000, type=int,
               help='Paginations before rotating account')
 @click.option('--headless', is_flag=True, help='Run browsers headless')
 @click.option('--mobile', is_flag=True, help='Use mobile emulation')
@@ -1288,15 +1376,16 @@ def scrape_page_transparency(
     \b
     Examples:
       fbscrape scrape page-transparency habsfanhub:899800046546098
-      fbscrape scrape page-transparency habsfanhub:899800046546098 zuck:4 --headless
+      fbscrape scrape page-transparency 899800046546098 100044331674441 --headless
+      fbscrape scrape page-transparency habsfanhub:899800046546098
 
     \b
-    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
-    `handle` and `page_id` columns:
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with a
+    required `page_id` column and an optional `handle` column:
       fbscrape scrape page-transparency --input-file pages.csv
     """
     from .scraper import FacebookScraper
-    from .logger import set_log_level
+    from .logger import set_log_level, logger
     from .models import ScrapingResult
 
     set_log_level(log_level)
@@ -1308,6 +1397,7 @@ def scrape_page_transparency(
             get_home_dir_path(), "data", "page_transparency",
         )
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
 
     mode_params = {
         "post_nav_sleep_seconds": post_nav_sleep_seconds,
@@ -1329,27 +1419,130 @@ def scrape_page_transparency(
         ) as scraper:
             async for result in gather(
                 scraper.page_transparency(
-                    handle=t['handle'],
                     page_id=t['page_id'],
+                    handle=t.get('handle'),
                     **mode_params,
                 )
                 for t in targets
             ):
                 data: ScrapingResult = result
+                page_id = data.query.query.get('page_id')
                 handle = data.query.query.get('handle')
-                click.echo(
-                    f"{handle}: {data.result} "
-                    f"({len(data.data)} records, {data.time_taken})"
-                )
+                label = handle or page_id
 
                 ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
                 filename = (
-                    f"{handle.replace('.', '_')}"
+                    f"{label.replace('.', '_')}"
                     f"_pagetransparency_{ts}.json"
                 )
                 data.save(os.path.join(output_dir, filename))
 
-        click.echo(f"\nResults saved to: {output_dir}")
+    run_async(_scrape())
+
+
+@scrape.command(name='profile-authenticity')
+@click.argument('user_ids', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read user_id rows from a CSV, Parquet, YAML, or '
+                   'JSON/JSONL file with a `user_id` column.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/profile_authenticity/)')
+@click.option('--max-sessions', default=5, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--scale', type=int, default=None,
+              help='[hybrid] image scale variable (default 3, matches FB UI)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='[hybrid] pause after navigating to the profile, before '
+                   'capturing the GraphQL template (default 3)')
+@click.option('--template-capture-timeout', type=float, default=None,
+              help='[hybrid] max seconds to wait for any natural GraphQL POST '
+                   'to harvest auth-bearing fields (default 20)')
+@click.option('--request-timeout-ms', type=int, default=None,
+              help='[hybrid] per-request timeout for the authenticity POST '
+                   'in milliseconds (default 30000)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='[hybrid] per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_profile_authenticity(
+    ctx, user_ids, input_file, output_dir, max_sessions, scroll_threshold,
+    headless, mobile, log_level, scale, post_nav_sleep_seconds,
+    template_capture_timeout, request_timeout_ms, operation_timeout_seconds,
+    wait_for_account,
+):
+    """Scrape Facebook profile authenticity info for one or more profiles.
+
+    \b
+    Single-shot — no pagination, no date range. Each target is a numeric
+    user_id (sent as `variables.userID` in the synthesized
+    ProfileCometDirectoryAuthenticityModalQuery). Bootstrap navigation hits
+    https://www.facebook.com/<user_id>/, which FB redirects to the
+    canonical profile — no handle resolution needed.
+
+    \b
+    Examples:
+      fbscrape scrape profile-authenticity 100044331674441
+      fbscrape scrape profile-authenticity 100044331674441 4 --headless
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    a `user_id` column:
+      fbscrape scrape profile-authenticity --input-file profiles.csv
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_profile_authenticity_targets(user_ids, input_file)
+
+    if output_dir is None:
+        output_dir = os.path.join(
+            get_home_dir_path(), "data", "profile_authenticity",
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "scale": scale,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "template_capture_timeout": template_capture_timeout,
+        "request_timeout_ms": request_timeout_ms,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.profile_authenticity(
+                    user_id=t['user_id'],
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                user_id = data.query.query.get('user_id')
+
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = f"{user_id}_profileauthenticity_{ts}.json"
+                data.save(os.path.join(output_dir, filename))
 
     run_async(_scrape())
 
@@ -1358,13 +1551,22 @@ def scrape_page_transparency(
 
 @cli.command()
 @click.argument('input_path')
-@click.option('--output', default=None, help='Output file (default: alongside input with _flat suffix)')
+@click.option('--output', default=None,
+              help='Output path. May be a file (single named output) or a folder (per-file outputs land inside). '
+                   'For directory inputs, must be a folder unless --concat is set. '
+                   'Heuristic: existing dir or trailing "/" → folder; .parquet/.csv/.jsonl suffix → file; '
+                   'otherwise → folder (created if absent).')
 @click.option('--format', 'fmt', type=click.Choice(['csv', 'jsonl', 'parquet', 'all']), default='csv', help='Output format (default csv). "all" writes csv + jsonl + parquet.')
+@click.option('--concat', is_flag=True,
+              help='Concatenate a directory of inputs into a single output file. Requires --output to be a file path. '
+                   'With --format all, the file extension in --output is replaced per format '
+                   '(foo.parquet → foo.csv, foo.jsonl, foo.parquet).')
 @click.option('--endpoint', default=None, help='Override endpoint flattener (default: read from saved query.endpoint, fallback to UserTimeline)')
-def flatten(input_path, output, fmt, endpoint):
+def flatten(input_path, output, fmt, concat, endpoint):
     """Flatten a scraped posts JSON (or a directory of them) into a tabular dataset.
 
     \b
+    Accepts .json or .json.gz files (single file or a directory of either).
     Routes through FacebookGraphQLParser.ENDPOINT_FLATTENERS based on the
     saved file's query.endpoint. Output rows are passed through
     pl.json_normalize to flatten nested dicts (shared_post, engagement) into
@@ -1375,8 +1577,11 @@ def flatten(input_path, output, fmt, endpoint):
     \b
     Examples:
       fbscrape flatten data/posts/foo.json
+      fbscrape flatten data/posts/foo.json.gz
       fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
       fbscrape flatten data/posts/foo.json --format all
+      fbscrape flatten data/posts/ --output data/flat/ --format parquet
+      fbscrape flatten data/posts/ --output data/merged.parquet --concat
     """
     import json
     import polars as pl
@@ -1385,25 +1590,82 @@ def flatten(input_path, output, fmt, endpoint):
     if not os.path.exists(input_path):
         raise click.UsageError(f"Path not found: {input_path}")
 
-    if os.path.isdir(input_path):
+    input_is_dir = os.path.isdir(input_path)
+
+    if input_is_dir:
         files = sorted(
             os.path.join(input_path, f)
             for f in os.listdir(input_path)
-            if f.endswith('.json')
+            if f.endswith('.json') or f.endswith('.json.gz')
         )
         if not files:
-            raise click.UsageError(f"No .json files in {input_path}")
-        if output:
-            raise click.UsageError("--output cannot be used with a directory; outputs are written alongside each input")
+            raise click.UsageError(f"No .json or .json.gz files in {input_path}")
     else:
         files = [input_path]
 
-    parser = FacebookGraphQLParser()
-    total_in = total_out = 0
-
     formats = ['csv', 'jsonl', 'parquet'] if fmt == 'all' else [fmt]
-    if output and len(formats) > 1:
-        raise click.UsageError('--output cannot be combined with --format all')
+
+    # Longest-first so _strip_out_ext peels '.parquet.zstd' before '.parquet'.
+    _RECOGNIZED_OUT_EXTS = ('.parquet.zstd', '.parquet', '.jsonl', '.csv')
+
+    def _ext_for(active_fmt: str) -> str:
+        # zstd is the only parquet compression we write — make it explicit
+        # in auto-derived filenames so downstream tooling can route by suffix.
+        return 'parquet.zstd' if active_fmt == 'parquet' else active_fmt
+
+    def _classify_output_kind(out):
+        if out is None:
+            return None
+        if os.path.isdir(out):
+            return 'FOLDER'
+        if out.endswith(os.sep) or out.endswith('/'):
+            return 'FOLDER'
+        if out.lower().endswith(_RECOGNIZED_OUT_EXTS):
+            return 'FILE'
+        return 'FOLDER'
+
+    out_kind = _classify_output_kind(output)
+
+    if concat and not input_is_dir:
+        raise click.UsageError("--concat requires a directory input.")
+    if concat and out_kind is None:
+        raise click.UsageError("--concat requires --output (a file path).")
+    if concat and out_kind == 'FOLDER':
+        raise click.UsageError("--concat requires --output to be a file path, not a folder.")
+    if input_is_dir and out_kind == 'FILE' and not concat:
+        raise click.UsageError(
+            "With a directory input, --output must be a folder unless --concat is set."
+        )
+    if not input_is_dir and out_kind == 'FILE' and len(formats) > 1:
+        raise click.UsageError("--output as a file cannot be combined with --format all; pass a folder instead.")
+
+    if concat:
+        mode = 'CONCAT'
+    elif out_kind == 'FILE':
+        mode = 'FILE_OUT'
+    elif out_kind == 'FOLDER':
+        mode = 'FOLDER_OUT'
+    else:
+        mode = 'SIBLING'
+
+    if mode == 'FOLDER_OUT':
+        os.makedirs(output, exist_ok=True)
+    elif mode in ('FILE_OUT', 'CONCAT'):
+        parent = os.path.dirname(output)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    def _strip_json_ext(path: str) -> str:
+        for ext in ('.json.gz', '.json'):
+            if path.endswith(ext):
+                return path[:-len(ext)]
+        return os.path.splitext(path)[0]
+
+    def _strip_out_ext(path: str) -> str:
+        for ext in _RECOGNIZED_OUT_EXTS:
+            if path.lower().endswith(ext):
+                return path[:-len(ext)]
+        return path
 
     def _serialize_complex_cols(df: pl.DataFrame) -> pl.DataFrame:
         """JSON-stringify any List / Struct columns so write_csv accepts them.
@@ -1430,21 +1692,7 @@ def flatten(input_path, output, fmt, endpoint):
                 exprs.append(pl.col(col))
         return df.select(exprs)
 
-    for f in files:
-        with open(f) as fh:
-            data = json.load(fh)
-
-        # Endpoint priority: CLI flag > saved query.endpoint > UserTimeline default.
-        ep = endpoint or (data.get('query') or {}).get('endpoint') or 'UserTimeline'
-        # Result-records list lives under 'data' on new files, 'posts' on legacy
-        # files (pre-rename). Accept either so old saves keep flattening.
-        records = data.get('data')
-        if records is None:
-            records = data.get('posts', [])
-        rows = [r for p in records if (r := parser.flatten(p, ep))]
-        total_in += len(records)
-        total_out += len(rows)
-
+    def _build_df(rows):
         # json_normalize flattens nested dicts (shared_post.* → shared_post__*).
         # Lists stay as List columns; strict=False tolerates schema drift; the
         # full-scan infer (infer_schema_length=None) avoids type-flip errors
@@ -1460,25 +1708,93 @@ def flatten(input_path, output, fmt, endpoint):
             redundant = [c for c in df.columns if c in parents and df.schema[c] == pl.Null]
             if redundant:
                 df = df.drop(redundant)
+        return df
 
+    def _write(df, rows, out_path, active_fmt):
+        if active_fmt == 'csv':
+            _serialize_complex_cols(df).write_csv(out_path)
+        elif active_fmt == 'jsonl':
+            # Preserve raw nesting — write the original row dicts, not the
+            # normalized DataFrame. `default=str` handles datetimes etc.
+            with open(out_path, 'w') as out:
+                for r in rows:
+                    out.write(json.dumps(r, default=str) + '\n')
+        elif active_fmt == 'parquet':
+            df.write_parquet(out_path, compression='zstd')
+
+    parser = FacebookGraphQLParser()
+
+    if mode == 'CONCAT':
+        all_rows = []
+        endpoints_seen = set()
+        total_in = 0
+        per_file_summary = []
+        for f in files:
+            with _open_scrape_input(f) as fh:
+                data = json.load(fh)
+            ep = endpoint or (data.get('query') or {}).get('endpoint') or 'UserTimeline'
+            endpoints_seen.add(ep)
+            records = data.get('data')
+            if records is None:
+                records = data.get('posts', [])
+            rows = [r for p in records if (r := parser.flatten(p, ep))]
+            all_rows.extend(rows)
+            total_in += len(records)
+            per_file_summary.append((f, len(rows), len(records), ep))
+
+        if not endpoint and len(endpoints_seen) > 1:
+            raise click.UsageError(
+                f"--concat requires homogeneous endpoints across inputs "
+                f"(found: {sorted(endpoints_seen)}). Pass --endpoint to override."
+            )
+
+        df = _build_df(all_rows)
+        ep_label = sorted(endpoints_seen)[0] if endpoints_seen else (endpoint or 'UserTimeline')
+        for f, nrows, nrecs, ep in per_file_summary:
+            click.echo(f"  {f}: {nrows}/{nrecs} (endpoint={ep})")
+        # Single-format concat honors --output literally; --format all derives
+        # sibling filenames from the stem so the user's chosen extension only
+        # picks the stem, not the encoding.
         for active_fmt in formats:
-            if output and len(files) == 1:
+            if len(formats) == 1:
                 out_path = output
             else:
-                base = os.path.splitext(f)[0]
-                out_path = f"{base}_flat.{active_fmt}"
+                stem = _strip_out_ext(output)
+                out_path = f"{stem}.{_ext_for(active_fmt)}"
+            _write(df, all_rows, out_path, active_fmt)
+            click.echo(f"-> {out_path} ({len(all_rows)} records, endpoint={ep_label})")
+        click.echo(f"\nTotal: {len(all_rows)}/{total_in} records flattened (concatenated from {len(files)} files)")
+        return
 
-            if active_fmt == 'csv':
-                _serialize_complex_cols(df).write_csv(out_path)
-            elif active_fmt == 'jsonl':
-                # Preserve raw nesting — write the original row dicts, not the
-                # normalized DataFrame. `default=str` handles datetimes etc.
-                with open(out_path, 'w') as out:
-                    for r in rows:
-                        out.write(json.dumps(r, default=str) + '\n')
-            elif active_fmt == 'parquet':
-                df.write_parquet(out_path, compression='zstd')
+    total_in = total_out = 0
+    for f in files:
+        with _open_scrape_input(f) as fh:
+            data = json.load(fh)
 
+        # Endpoint priority: CLI flag > saved query.endpoint > UserTimeline default.
+        ep = endpoint or (data.get('query') or {}).get('endpoint') or 'UserTimeline'
+        # Result-records list lives under 'data' on new files, 'posts' on legacy
+        # files (pre-rename). Accept either so old saves keep flattening.
+        records = data.get('data')
+        if records is None:
+            records = data.get('posts', [])
+        rows = [r for p in records if (r := parser.flatten(p, ep))]
+        total_in += len(records)
+        total_out += len(rows)
+
+        df = _build_df(rows)
+
+        for active_fmt in formats:
+            ext = _ext_for(active_fmt)
+            if mode == 'FILE_OUT':
+                out_path = output
+            elif mode == 'FOLDER_OUT':
+                stem = os.path.basename(_strip_json_ext(f))
+                out_path = os.path.join(output, f"{stem}_flat.{ext}")
+            else:  # SIBLING
+                out_path = f"{_strip_json_ext(f)}_flat.{ext}"
+
+            _write(df, rows, out_path, active_fmt)
             click.echo(f"{f} -> {out_path} ({len(rows)}/{len(records)} records, endpoint={ep})")
 
     click.echo(f"\nTotal: {total_out}/{total_in} records flattened")
@@ -1496,8 +1812,10 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
     """Download media (images and videos) from a scraped posts JSON or directory.
 
     \b
-    fbcdn URLs are signed and expire ~30 days after scraping, so run this soon
-    after a scrape. No account cookies needed — URLs are self-authenticating.
+    Accepts .json or .json.gz files (single file or a directory of either).
+    fbcdn URLs are signed and expire ~4-5 days after scraping, so run this within
+    a few days of the scrape or expect HTTP 403 ("Bad URL hash") on the stale
+    subset. No account cookies needed — URLs are self-authenticating.
 
     \b
     Filenames: {post_id}_img_00.jpg, {post_id}_vid_00.mp4, {post_id}_thumb_00.jpg
@@ -1505,6 +1823,7 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
     \b
     Examples:
       fbscrape download-media data/posts/foo.json
+      fbscrape download-media data/posts/foo.json.gz
       fbscrape download-media data/posts/2025-06-01_2026-02-17/ --include-thumbnails
     """
     import json as _json
@@ -1520,23 +1839,29 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
         files = sorted(
             os.path.join(input_path, f)
             for f in os.listdir(input_path)
-            if f.endswith('.json')
+            if f.endswith('.json') or f.endswith('.json.gz')
         )
         if not files:
-            raise click.UsageError(f"No .json files in {input_path}")
+            raise click.UsageError(f"No .json or .json.gz files in {input_path}")
     else:
         files = [input_path]
+
+    def _strip_json_ext(name: str) -> str:
+        for ext in ('.json.gz', '.json'):
+            if name.endswith(ext):
+                return name[:-len(ext)]
+        return os.path.splitext(name)[0]
 
     async def _run():
         totals = {"total": 0, "saved": 0, "skipped": 0, "failed": 0}
         for f in files:
-            with open(f) as fh:
+            with _open_scrape_input(f) as fh:
                 data = _json.load(fh)
             # New files put records under 'data'; legacy files used 'posts'.
             posts = data.get('data')
             if posts is None:
                 posts = data.get('posts', [])
-            handle = (data.get('query') or {}).get('query', {}).get('handle') or os.path.splitext(os.path.basename(f))[0]
+            handle = (data.get('query') or {}).get('query', {}).get('handle') or _strip_json_ext(os.path.basename(f))
 
             if out_dir:
                 target_dir = out_dir if len(files) == 1 else os.path.join(out_dir, handle)

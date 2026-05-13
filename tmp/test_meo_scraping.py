@@ -50,10 +50,10 @@ def load_facebook_seeds(only_actives: bool = True) -> list[dict]:
     return seeds
 
 
-START_DATE = "2024-10-01"
-END_DATE = "2026-04-29"
-MAX_SESSIONS = 5
-SCROLL_THRESHOLD = 500
+START_DATE = "2024-01-01"
+END_DATE = "2024-10-01"
+MAX_SESSIONS = 2
+SCROLL_THRESHOLD = 1000
 HEADLESS = True
 MOBILE = False
 LOG_LEVEL = "DEBUG"
@@ -135,7 +135,7 @@ async def main():
             data: ScrapingResult = result
             handle = data.query.query.get("handle")
 
-            print(f"{handle}: {data.result} ({len(data.posts)} posts, {data.time_taken})")
+            print(f"{handle}: {data.result} ({len(data.data)} posts, {data.time_taken})")
 
             data_to_save = data.to_dict()
             by_handle = {s["Handle"]: s for s in SEEDS}

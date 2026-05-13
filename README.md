@@ -1,16 +1,17 @@
 # fbscrape
 
-A Python library for scraping Facebook user timelines using Playwright and Camoufox with account pooling, rotation, and concurrent scraping.
+A Python library for scraping Facebook using Camoufox with account pooling, rotation, and concurrent scraping.
 
 ## Features
 
+- **Four endpoints** - `UserTimeline`, `Search`, `PageTransparency`, `ProfileAuthenticity`
 - **High-level API** - Simple `FacebookScraper` class handles all complexity
 - **Concurrent scraping** - WorkerPool manages multiple browser sessions
 - **Account management** - SQLite-backed pool with automatic rotation
 - **Scroll threshold rotation** - Rotate accounts after N scrolls to avoid detection
-- **GraphQL interception** - Extracts data from Facebook's API responses
+- **GraphQL interception** - Replay-based pagination via captured request templates
 - **Cookie persistence** - Reuse sessions across runs
-- **CLI tools** - Manage accounts from command line
+- **CLI tools** - Manage accounts and run scrapes from the command line
 
 ## Installation
 
@@ -40,7 +41,7 @@ async def main():
             start_date="2024-01-01",
             end_date="2025-01-01"
         )
-        print(f"Scraped {len(result.posts)} posts")
+        print(f"Scraped {len(result.data)} posts")
 
 
 if __name__ == "__main__":
@@ -64,7 +65,7 @@ async def main():
             for h in handles
         ):
             handle = result.query.query["handle"]
-            print(f"{handle}: {len(result.posts)} posts")
+            print(f"{handle}: {len(result.data)} posts")
 
 
 if __name__ == "__main__":
@@ -73,7 +74,9 @@ if __name__ == "__main__":
 
 ### Low-Level API (BrowserSession)
 
-For more control, use `BrowserSession` directly:
+For more control, use `BrowserSession` directly. The per-endpoint methods are
+`user_timeline_hybrid` / `user_timeline_manual` / `search_hybrid` /
+`page_transparency_hybrid` / `profile_authenticity_hybrid`:
 
 ```python
 from fbscrape.browser_session import BrowserSession
@@ -86,12 +89,12 @@ async def main():
     account = await pool.get_available()
 
     async with BrowserSession(account, pool, headless=True) as session:
-        result = await session.user_timeline(
+        outcome = await session.user_timeline_hybrid(
             handle="zuck",
             start_date="2024-01-01",
             end_date="2025-01-01"
         )
-        print(f"Scraped {len(result.posts)} posts")
+        print(f"Scraped {len(outcome.data)} posts")
 
     await pool.release_account(account.identifier)
 
@@ -100,12 +103,82 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+Returns `ScrapeOutcome` (no `query` field). To build a `ScrapingResult`,
+construct a `Query` yourself and call `ScrapingResult.from_outcome(query, outcome)`.
+
+## Endpoints
+
+`fbscrape` supports four endpoints, all registered in `Query.ENDPOINT_REGISTRY`.
+Two are paginated post streams; two are single-shot record fetches.
+
+| Endpoint | Required `query` | Mode(s) | Output shape |
+|---|---|---|---|
+| `UserTimeline` | `handle`, `start_date`, `end_date` | `manual`, `hybrid` *(default)* | `data: list[dict]` — one element per post |
+| `Search` | `query_text`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per search-result post |
+| `PageTransparency` | `page_id` (handle optional) | `hybrid` | `data: [transparency_dict]` — single-element list |
+| `ProfileAuthenticity` | `user_id` | `hybrid` | `data: [authenticity_dict]` — single-element list |
+
+### `user_id` vs `page_id` — the distinction that bites
+
+`ProfileAuthenticity` and `PageTransparency` look similar but expect **different
+identifiers**:
+
+- **`user_id`** (e.g. `100044331674441`, `61577505662345`) — the profile id,
+  what `https://www.facebook.com/profile.php?id=…` resolves to. Used by
+  `ProfileAuthenticity`. Modern accounts start with `61…`; classic accounts
+  with `100…`.
+- **`page_id`** (e.g. `899800046546098`, `382264105226668`) — the Page-side id,
+  a separate node in FB's graph. Used by `PageTransparency`.
+
+Passing a user_id to `PageTransparency` does **not** error — FB returns
+`{"data":{"page":null}}` because `page(id: <user_id>)` resolves to no node,
+and `fbscrape` surfaces this as `result="parse_error"`.
+
+### Two-stage pipeline: user_id → page_id → transparency
+
+When all you have is a list of user_ids and you want page-transparency data
+for the subset that has a Page side, chain the two single-shot endpoints:
+
+```python
+import asyncio
+from fbscrape import FacebookScraper, gather
+from fbscrape.response import FacebookGraphQLParser
+
+
+async def main():
+    user_ids = ["100044331674441", "61577505662345", ...]
+    parser = FacebookGraphQLParser()
+
+    async with FacebookScraper(db="accounts.db", max_browser_sessions=3) as scraper:
+        # Stage 1 — authenticity for every user_id.
+        page_ids: list[str] = []
+        async for r in gather(scraper.profile_authenticity(uid) for uid in user_ids):
+            if not r.data:
+                continue
+            row = parser.flatten(r.data[0], endpoint="ProfileAuthenticity")
+            if row and row.get("delegate_page_id"):
+                page_ids.append(row["delegate_page_id"])
+
+        # Stage 2 — transparency for the subset that has a Page side.
+        async for r in gather(scraper.page_transparency(page_id=pid) for pid in page_ids):
+            print(r.query.query["page_id"], r.result, len(r.data))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+The `delegate_page_id` field on the authenticity response is the bridge —
+it carries the Page id for profiles that have a Page side, and is `null` for
+pure personal profiles (no transparency record exists for those).
+
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                     FacebookScraper                               │
-│  user_timeline(handle, start_date, end_date) → ScrapingResult    │
+│  user_timeline / search / page_transparency /                    │
+│  profile_authenticity → ScrapingResult                            │
 └────────────────────────────┬─────────────────────────────────────┘
                              │
                              ▼
@@ -130,8 +203,8 @@ if __name__ == "__main__":
 │                      BrowserSession                               │
 │  - Playwright browser with Camoufox                              │
 │  - Login, cookie management                                       │
-│  - Scrolling with GraphQL response interception                  │
-│  - Returns ScrapingResult with posts                             │
+│  - GraphQL response interception + replay-based pagination       │
+│  - Returns ScrapeOutcome with `data: list[dict]`                 │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -153,6 +226,43 @@ if __name__ == "__main__":
 fbscrape --db /path/to/accounts.db <command>
 fbscrape --help
 ```
+
+### Scraping
+
+```bash
+# UserTimeline — paginated, date-bounded (default mode is hybrid)
+fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
+fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --headless --max-sessions 2
+
+# Force the scroll-driven path (deprecated; UserTimeline only)
+fbscrape scrape user-timeline zuck --start-date 2024-01-01 --mode manual
+
+# Search — paginated, date-bounded, hybrid only
+fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
+fbscrape scrape search --input-file queries.csv
+
+# PageTransparency — single-shot, takes a page_id (handle optional)
+fbscrape scrape page-transparency 899800046546098
+fbscrape scrape page-transparency habsfanhub:899800046546098
+fbscrape scrape page-transparency --input-file pages.csv --headless
+
+# ProfileAuthenticity — single-shot, takes a user_id
+fbscrape scrape profile-authenticity 100044331674441
+fbscrape scrape profile-authenticity --input-file users.csv --headless
+
+# Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz)
+fbscrape flatten data/posts/zuck_UserTimeline_hybrid_2024-01-01_2025-01-01.json --format all
+fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
+fbscrape flatten data/posts/ --output data/merged.parquet --concat
+
+# Download media (within ~3 days of scrape — fbcdn URLs expire ~4-5 days out)
+fbscrape download-media data/posts/zuck_UserTimeline_hybrid_…json --include-thumbnails
+```
+
+`--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
+depend on the subcommand: `handle` + optional `start_date` / `end_date` for
+`user-timeline`; `query_text` + dates for `search`; `page_id` (required) +
+`handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
 
 ### Account Management
 
@@ -353,7 +463,7 @@ async with FacebookScraper(db="db/accounts.db") as scraper:
         # while scraping", "graphql_error: ...", "error: ...") indicate
         # per-task non-rotation outcomes — the future still resolves
         # successfully with those.
-        print(result.query.query["handle"], result.result, len(result.posts))
+        print(result.query.query["handle"], result.result, len(result.data))
 ```
 
 Renderer hangs (`RendererHangError`) are caught internally and trigger a same-account restart — they do not surface to user code unless they exceed the retry budget, in which case `RetryBudgetExhaustedError` is raised instead.

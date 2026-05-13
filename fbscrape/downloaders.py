@@ -1,10 +1,13 @@
 """Async media downloader for scraped Facebook posts.
 
-Walks raw scraped post dicts, extracts image / video / thumbnail URLs from the
-GraphQL response tree, and downloads them concurrently to disk.
+Walks scraped post dicts via FacebookGraphQLParser._extract_attachments — so URL
+discovery (high-res photo path, reel-share inner videos, album recursion) stays
+in one place and tracks parser updates automatically.
 
-FB CDN URLs are self-signed (`oh=` signature, `oe=` expiry) — anyone holding the
-URL can fetch it within ~30 days of scraping. No cookies needed.
+FB CDN URLs are self-signed (`oh=` signature, `oe=` expiry-as-hex-unix). No cookies
+needed, but TTL is short: empirically ~4-5 days from scrape time. Expired URLs
+return HTTP 403 with `Bad URL hash` — run download soon after scraping or pipeline
+it into the scrape itself.
 """
 
 import asyncio
@@ -15,6 +18,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from .logger import logger
+from .response import FacebookGraphQLParser, _resolve_story
 
 HEADERS = {
     "User-Agent": (
@@ -28,6 +32,8 @@ HEADERS = {
 IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "heic")
 VIDEO_EXTS = ("mp4", "mov", "webm")
 
+_parser = FacebookGraphQLParser()
+
 
 def _ext_from_url(url: str, default: str) -> str:
     path = urlparse(url).path.lower()
@@ -37,34 +43,11 @@ def _ext_from_url(url: str, default: str) -> str:
     return default
 
 
-def _resolve_story(post: dict) -> dict | None:
-    """Mirrors FacebookGraphQLParser.flatten_post's story resolution."""
-    node = post.get("node") or {}
-    if "timeline_list_feed_units" in node:
-        try:
-            return node["timeline_list_feed_units"]["edges"][0]["node"]
-        except (KeyError, IndexError, TypeError):
-            return None
-    if "post_id" in node or "id" in node:
-        return node
-    return None
-
-
-def _pick_progressive_video(vdrf: dict) -> str | None:
-    """Return the highest-priority progressive mp4 URL if any."""
-    vdrr = (vdrf or {}).get("videoDeliveryResponseResult") or {}
-    for p in vdrr.get("progressive_urls") or []:
-        url = p.get("progressive_url")
-        if url:
-            return url  # first entry is typically highest quality
-    return None
-
-
 def extract_media_from_post(post: dict, include_thumbnails: bool = False) -> list[dict]:
     """Walk a raw post dict; return list of media entries.
 
     Each entry: {post_id, kind ('image'|'video'|'video_thumb'), idx, url, ext}.
-    Dedupes by URL so nested (carousel inner) videos don't get pulled twice.
+    Dedupes by URL so reel-share hoists and carousel recursion don't double-count.
     """
     story = _resolve_story(post)
     if not story:
@@ -89,37 +72,19 @@ def extract_media_from_post(post: dict, include_thumbnails: bool = False) -> lis
             "ext": _ext_from_url(url, ext_default),
         })
 
-    for a in story.get("attachments") or []:
-        styles = (a.get("styles") or {}).get("attachment") or {}
-        media = styles.get("media") or {}
+    def _walk(att: dict):
+        atype = att.get("type")
+        if atype in ("photo", "album"):
+            _add("image", att.get("image_url"), "jpg")
+        if atype == "video":
+            _add("video", att.get("video_url"), "mp4")
+            if include_thumbnails:
+                _add("video_thumb", att.get("thumbnail_url"), "jpg")
+        for sub in att.get("subattachments") or []:
+            _walk(sub)
 
-        # Single photo
-        _add("image", ((media.get("photo_image") or {}).get("uri")), "jpg")
-
-        # Video (progressive mp4)
-        _add("video", _pick_progressive_video(media.get("videoDeliveryResponseFragment") or {}), "mp4")
-
-        # Video preferred thumbnail
-        if include_thumbnails:
-            _add("video_thumb", ((media.get("preferred_thumbnail") or {}).get("image") or {}).get("uri"), "jpg")
-            # Sometimes a first_frame_thumbnail URL string too
-            ffs = media.get("first_frame_thumbnail")
-            if isinstance(ffs, str):
-                _add("video_thumb", ffs, "jpg")
-
-        # Multi-photo carousel (all_subattachments)
-        for sub in ((styles.get("all_subattachments") or {}).get("nodes") or []):
-            sub_media = sub.get("media") or {}
-            _add("image", (sub_media.get("image") or {}).get("uri"), "jpg")
-            # Rare: a sub carousel video
-            _add("video", _pick_progressive_video(sub_media.get("videoDeliveryResponseFragment") or {}), "mp4")
-
-        # Nested carousel via style_infos (common for mixed media albums)
-        for si in (styles.get("style_infos") or []):
-            for inner in ((si.get("containing_story") or {}).get("attachments") or []):
-                inner_media = ((inner.get("styles") or {}).get("attachment") or {}).get("media") or (inner.get("media") or {})
-                _add("image", ((inner_media.get("photo_image") or {}).get("uri")), "jpg")
-                _add("video", _pick_progressive_video(inner_media.get("videoDeliveryResponseFragment") or {}), "mp4")
+    for att in _parser._extract_attachments(story) or []:
+        _walk(att)
 
     return entries
 

@@ -44,6 +44,7 @@ class Worker:
         ("UserTimeline", "hybrid"): "user_timeline_hybrid",
         ("Search", "hybrid"): "search_hybrid",
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
+        ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
         # ("GroupTimeline", "manual"): "group_timeline_manual",
     }
@@ -296,6 +297,24 @@ class Worker:
                             lock_until="datetime('now', '+10 minutes')"
                         )
 
+                    # Response-shape error: the hybrid loop saw a response shape
+                    # it doesn't know how to read (all posts in a batch had a
+                    # metadata-strategy typename outside _METADATA_TIMESTAMP_TYPENAMES).
+                    # Structural bug, not instance-specific — do NOT mark the
+                    # account inactive, do NOT rotate, do NOT burn a retry slot.
+                    # The next account would hit the same shape. Returning the
+                    # partial result terminates the multi-leg loop in
+                    # FacebookScraper.user_timeline naturally (it only resumes
+                    # on `cursor_reset`).
+                    if outcome.result == 'response_shape_error':
+                        logger.error(
+                            f"Worker {self.id}: response_shape_error on "
+                            f"{self.current_account.display_name} "
+                            f"(records={len(outcome.data)}) — structural bug, "
+                            f"not instance-specific, not retrying. "
+                            f"Returning partial result."
+                        )
+
                     return result
 
             except AccountDisabledError as e:
@@ -390,11 +409,11 @@ class Worker:
             NoAccountError: If no account available for rotation
         """
         logger.debug(f"Worker {self.id}: rotating account, current={self.current_account.display_name if self.current_account else 'None'}")
-        # Release current account with cooldown to prevent immediate re-acquisition
+        # Release the current account with cooldown to prevent immediate re-acquisition
         if self.current_account:
             await self.pool.lock_until(
                 self.current_account.identifier,
-                "datetime('now', '+5 minutes')" if lock_until is None else lock_until,
+                "datetime('now', '+2 minutes')" if lock_until is None else lock_until,
             )
             await self.pool.release_account(self.current_account.identifier)
             logger.info(f"Worker {self.id} released account {self.current_account.display_name} (5s cooldown)")

@@ -254,10 +254,10 @@ class FacebookScraper:
                 start=timedelta(),
             ),
         )
-        logger.debug(
-            f"Completed UserTimeline (mode={mode}) for handle={handle}, "
-            f"result={combined.result}, posts={len(combined.data)}, "
-            f"legs={len(legs)}"
+        logger.info(
+            f"Completed UserTimeline (mode={mode}) for handle={handle}: "
+            f"{combined.result} ({len(combined.data)} posts, "
+            f"{len(legs)} legs, {combined.time_taken})"
         )
         return combined
 
@@ -313,16 +313,16 @@ class FacebookScraper:
         )
         future = await self.worker_pool.submit_task(query)
         result = await future
-        logger.debug(
-            f"Completed Search (mode={mode}) for query_text={query_text!r}, "
-            f"result={result.result}, posts={len(result.data)}"
+        logger.info(
+            f"Completed Search (mode={mode}) for query_text={query_text!r}: "
+            f"{result.result} ({len(result.data)} posts, {result.time_taken})"
         )
         return result
 
     async def page_transparency(
         self,
-        handle: str,
         page_id: str,
+        handle: str | None = None,
         mode: str = "hybrid",
         **params,
     ) -> ScrapingResult:
@@ -336,16 +336,16 @@ class FacebookScraper:
         creation date in `history_items[item_type==CREATION]`, name-change
         history, admin country breakdown, ad activity flags, verification).
 
-        Caller supplies both `handle` and `page_id`:
-          - `handle` drives the bootstrap navigation. Keeps the replay POST
-            firing alongside organic GraphQL traffic on the same profile
-            page rather than as a cold request.
-          - `page_id` is the numeric page id (e.g. `"899800046546098"`),
-            sent as `variables.pageID`. We don't resolve handle → page_id.
+        `page_id` is the only required input — bootstrap navigation hits
+        `https://www.facebook.com/<page_id>/` and FB redirects to the
+        canonical page URL. Pass `handle` only if you want the vanity URL
+        in the navigation (closer to a real user typing it).
 
         Args:
-            handle: Facebook page handle (e.g. "habsfanhub").
-            page_id: Numeric page id as a string.
+            page_id: Numeric page id (e.g. `"899800046546098"`), sent as
+                `variables.pageID`.
+            handle: Optional vanity handle (e.g. "habsfanhub"). When given,
+                used for the bootstrap navigation URL instead of `page_id`.
             mode: Currently only "hybrid" is supported.
             **params: mode-specific tuning knobs. Allowed keys and defaults
                   live in Query.ENDPOINT_REGISTRY[("PageTransparency", mode)]["params"].
@@ -363,25 +363,84 @@ class FacebookScraper:
 
         cleaned_params = {k: v for k, v in params.items() if v is not None}
 
+        query_dict: dict = {"page_id": page_id}
+        if handle is not None:
+            query_dict["handle"] = handle
+
         query = Query(
             endpoint="PageTransparency",
             mode=mode,
-            query={
-                "handle": handle,
-                "page_id": page_id,
-            },
+            query=query_dict,
+            params=cleaned_params,
+        )
+
+        label = handle or page_id
+        logger.debug(
+            f"Submitting PageTransparency task (mode={mode}) for "
+            f"page_id={page_id} (nav={label})"
+        )
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed PageTransparency (mode={mode}) for page_id={page_id}: "
+            f"{result.result} ({len(result.data)} records, {result.time_taken})"
+        )
+        return result
+
+    async def profile_authenticity(
+        self,
+        user_id: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Scrape Facebook profile authenticity info for a given user/profile.
+
+        Targets `ProfileCometDirectoryAuthenticityModalQuery` — the data
+        behind FB's "About this profile / authenticity" modal. Single-shot,
+        no pagination, no date filter. Returns a `ScrapingResult` whose
+        `data` is a 1-element list containing the authenticity record
+        (display name, delegate page id, profile join date, profile
+        updated-since, category, meta-verified section, about fields).
+
+        Args:
+            user_id: Numeric user id (e.g. `"100044331674441"`). Sent as
+                `variables.userID` and used as the bootstrap navigation URL
+                (`https://www.facebook.com/<user_id>/` — FB redirects to
+                the canonical profile, so no handle resolution is needed).
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific tuning knobs. Allowed keys and defaults
+                  live in Query.ENDPOINT_REGISTRY[("ProfileAuthenticity", mode)]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[authenticity_dict]` on success or
+            `[]` on failure (with `result` carrying the reason).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="ProfileAuthenticity",
+            mode=mode,
+            query={"user_id": user_id},
             params=cleaned_params,
         )
 
         logger.debug(
-            f"Submitting PageTransparency task (mode={mode}) for "
-            f"handle={handle}, page_id={page_id}"
+            f"Submitting ProfileAuthenticity task (mode={mode}) for "
+            f"user_id={user_id}"
         )
         future = await self.worker_pool.submit_task(query)
         result = await future
-        logger.debug(
-            f"Completed PageTransparency (mode={mode}) for handle={handle}, "
-            f"result={result.result}, records={len(result.data)}"
+        logger.info(
+            f"Completed ProfileAuthenticity (mode={mode}) for user_id={user_id}: "
+            f"{result.result} ({len(result.data)} records, {result.time_taken})"
         )
         return result
 

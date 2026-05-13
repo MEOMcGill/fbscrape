@@ -69,7 +69,7 @@ async def login_automatic(session: "BrowserSession") -> bool:
     """
     logger.debug(f"login_automatic() for {session.account.display_name}")
     # Check if already logged in
-    if await check_logged_in(session, timeout=5.0):
+    if await check_logged_in(session, timeout=10):
         logger.debug("Already logged in")
         await _on_login_success(session)
         return True

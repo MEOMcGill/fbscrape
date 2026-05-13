@@ -109,11 +109,13 @@ class Query:
             },
         },
         "PageTransparency": {
-            # Caller supplies the numeric page_id directly; handle drives the
-            # bootstrap navigation (warm-up + natural traffic pattern) so the
-            # transparency POST replays alongside organic GraphQL traffic
-            # rather than as a cold request.
-            "query_required": ["handle", "page_id"],
+            # Caller supplies the numeric page_id; bootstrap navigation hits
+            # https://www.facebook.com/<page_id>/ directly (FB redirects to
+            # the canonical page URL), so no handle is required. `handle` is
+            # still accepted as an optional query field — when present, it's
+            # used for the navigation URL (better matches a real user typing
+            # the vanity URL) and for output filenames.
+            "query_required": ["page_id"],
             "modes": {
                 # Hybrid only — single-shot replay, no pagination, no date
                 # filter. The natural ProfileTransparencyDialogQuery only
@@ -123,6 +125,28 @@ class Query:
                 # navigation and synthesize the transparency body.
                 "hybrid": {
                     "params": {
+                        "post_nav_sleep_seconds": 3.0,
+                        "template_capture_timeout": 20.0,
+                        "request_timeout_ms": 30000,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
+        "ProfileAuthenticity": {
+            # Caller supplies the numeric user_id; bootstrap navigation hits
+            # https://www.facebook.com/<user_id>/ directly (FB redirects to
+            # the canonical profile), so no handle is needed.
+            "query_required": ["user_id"],
+            "modes": {
+                # Hybrid only — single-shot replay, no pagination, no date
+                # filter. The natural ProfileCometDirectoryAuthenticityModalQuery
+                # only fires from a UI click, so we don't wait for it; we
+                # capture auth-bearing fields from any natural GraphQL POST
+                # and synthesize the authenticity body.
+                "hybrid": {
+                    "params": {
+                        "scale": 3,
                         "post_nav_sleep_seconds": 3.0,
                         "template_capture_timeout": 20.0,
                         "request_timeout_ms": 30000,
@@ -319,14 +343,23 @@ class ScrapingResult:
         """Convert to JSON string"""
         return json.dumps(self.to_dict())
 
-    def save(self, path: str, compress: bool = False):
-        """Save to JSON file"""
+    def save(self, path: str, compress: bool = False) -> str:
+        """Save to JSON file. Returns the final path written.
+
+        When `compress=True` and `path` does not already end with `.gz`, the
+        extension is appended automatically — otherwise gzip bytes would land
+        in a `.json`-named file and downstream tools (`open()` / `json.load`)
+        would crash with `UnicodeDecodeError` on the magic bytes.
+        """
         if compress:
+            if not path.endswith('.gz'):
+                path = path + '.gz'
             with gzip.open(path, 'wt') as f:
                 json.dump(self.to_dict(), f, indent=2)
         else:
             with open(path, 'w') as f:
                 json.dump(self.to_dict(), f, indent=2)
+        return path
 
     def add_record(self, record: dict):
         """Append a record to the results"""

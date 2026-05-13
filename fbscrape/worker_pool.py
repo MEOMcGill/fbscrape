@@ -13,6 +13,7 @@ from .logger import logger
 from .models import Query
 from .worker import Worker
 
+IDLE_RELEASE_TIMEOUT_SECONDS = 60  # 1 minute; idle workers release accounts after this
 
 class WorkerPool:
     """
@@ -146,6 +147,7 @@ class WorkerPool:
             worker: Worker instance to execute tasks
         """
         logger.info(f"WorkerPool: {worker.id} loop started")
+        idle_seconds: int = 0
         try: # wrap in try/finally so clean exit of workers runs regardless of exit strategy (e.g., double Ctrl+C)
             while not self._shutdown:
                 try:
@@ -156,10 +158,18 @@ class WorkerPool:
                     )
                 except asyncio.TimeoutError:
                     # No task available, check shutdown flag and continue
-                    continue
+                    idle_seconds += 1
+                    if idle_seconds >= IDLE_RELEASE_TIMEOUT_SECONDS:
+                        logger.info(
+                            f"WorkerPool: {worker.id} idle for "
+                            f"{IDLE_RELEASE_TIMEOUT_SECONDS}s — releasing account and exiting"
+                        )
+                        break
+                    else:
+                        continue
 
                 logger.info(f"WorkerPool: {worker.id} processing {query.endpoint} - {query.query}")
-
+                idle_seconds = 0
                 try:
                     result = await worker.execute_task(query)
                     future.set_result(result)

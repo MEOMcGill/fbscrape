@@ -66,3 +66,19 @@ class RetryBudgetExhaustedError(FacebookScraperError):
     attempt raised a typed login/ban/rate-limit/checkpoint error. Per-task
     signal — distinct from NoAccountError (pool-level: nothing left to try)."""
     pass
+
+
+class ResponseShapeError(FacebookScraperError):
+    """The parser saw a response shape it doesn't know how to read — e.g.
+    all posts in a batch carry an unrecognized metadata-strategy typename,
+    so `_extract_times` returns no creation_time for any of them.
+
+    Structural bug, NOT instance-specific. Account is fine, rate limits are
+    fine; the next account would hit the same shape. Worker is expected to
+    treat the scrape as terminally failed: preserve partial data, do not
+    rotate, do not retry. Defined here as a typed signal for downstream
+    callers that want to pattern-match; the hybrid loop itself returns a
+    `'response_shape_error'` result string to keep the partial-data flow
+    consistent with other terminal classifications (ETIMEDOUT, cursor_reset,
+    etc.) rather than raising mid-scrape."""
+    pass

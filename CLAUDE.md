@@ -1,13 +1,13 @@
 # Project Context
 
-**Last Updated:** 2026-05-06
+**Last Updated:** 2026-05-13
 
 `fbscrape` is a Facebook timeline scraper built on Camoufox (stealth Firefox) with persistent SQLite-backed account rotation, support for parallel browser sessions, and two pluggable scrape strategies per endpoint.
 
 This document describes how the codebase works *today*. For evolving design decisions, deeper rationale, and historical research, see [`docs/`](docs/).+
 
 **Notes**:
-- if an update is made to the codebase (e.g. an endpoint is added, behavior is modified, or something is remove), update the CLAUDE.md file where necessary and the documentation so it stays up to date and tracks all changes made to the codebase.
+- if an update is made to the codebase (e.g. an endpoint is added, behavior is modified, or something is remove), update the CLAUDE.md file where necessary and the README.md documentation and the various documentation in the ```docs``` folder so it stays up to date and tracks all changes made to the codebase.
 - do not make updates to the codebase unless specifically asked to or given permission to
 ---
 
@@ -58,7 +58,7 @@ Both produce identical `ScrapingResult` shape — caller code doesn't care which
 - Navigates, fires one bootstrap scroll to provoke a natural PCTFRQ, captures its form body + headers as a replay template (via `ResponseInterceptor.latest_pctfrq_request`).
 - Disables post auto-extraction (`extract_posts=False`) so unfiltered natural responses don't leak off-range posts into the result.
 - Replay loop: every replay sends `cursor=null` (first iter) or `end_cursor` (subsequent), `beforeTime=min(end_of_day(end_date), now_utc)`, `count=N`. `afterTime` stays at the captured `null` (matches FB's UI; including it is a fingerprint).
-- Stop conditions: (a) `end_cursor` null in response, (b) oldest post in batch < `start_unix`, (c) no-progress streak hits `max_no_progress_streak`, (d) **cursor-reset detector** fires (oldest post jumps newer by > `HYBRID_CURSOR_RESET_JUMP_SECONDS`, signaling FB silently degraded the response stream — see Key Design Decision 16).
+- Stop conditions: (a) `end_cursor` null in response, (b) oldest post in batch < `start_unix`, (c) no-progress streak hits `max_no_progress_streak`, (d) **cursor-reset detector** fires (oldest post jumps newer by > `HYBRID_CURSOR_RESET_JUMP_SECONDS`, signaling FB silently degraded the response stream — see Key Design Decision 16), (e) **response-shape error** — parser found posts but every one had an unrecognized timestamp metadata-strategy typename, terminal/non-retryable (see Key Design Decision 18).
 - Token splicing: `__csr` / `__dyn` from any natural GraphQL POST (organic scroll bursts every N paginations refresh them) overridden into replay bodies.
 - HTTP errors mapped to typed exceptions (see *Account lifecycle* below). 5xx retried with backoff.
 
@@ -66,13 +66,23 @@ See [`docs/hybrid/overview.md`](docs/hybrid/overview.md) for empirical evidence 
 
 ### Single-shot scrape strategy for `PageTransparency`
 
-`mode="hybrid"` only — there is no pagination, no scroll, no date filter. `Query.query` carries `handle` + numeric `page_id` (caller supplies both; we don't resolve handle → page_id).
+`mode="hybrid"` only — there is no pagination, no scroll, no date filter. `Query.query` carries the numeric `page_id`; `handle` is optional (when supplied, it's used for the navigation URL; otherwise FB redirects `/<page_id>/` to the canonical page).
 
-- Navigates to `https://www.facebook.com/<handle>/` (warm-up + natural traffic). Skips bootstrap scroll — the natural `ProfileTransparencyDialogQuery` only fires from a UI click, so waiting for it is pointless.
+- Navigates to `https://www.facebook.com/<handle or page_id>/` (warm-up + natural traffic). Skips bootstrap scroll — the natural `ProfileTransparencyDialogQuery` only fires from a UI click, so waiting for it is pointless.
 - Captures `{post_data, headers}` from *any* natural GraphQL POST (`ResponseInterceptor.latest_natural_graphql_request`). Cross-cutting auth-bearing fields (`fb_dtsg`, `lsd`, `__user`, `__csr`, `__dyn`, etc.) are session-wide, not per-query.
 - Synthesizes the transparency body by overriding `fb_api_req_friendly_name=ProfileTransparencyDialogQuery`, `variables={"pageID": <page_id>, "scale": 3}`, `doc_id=PAGE_TRANSPARENCY_DOC_ID` on the captured template; everything else inherits. Splices freshest `__csr` / `__dyn` (same as the paginated paths). Header `x-fb-friendly-name` is overridden to match the form field.
 - Single `page.request.post()` to `/api/graphql/`. HTTP-status classification reuses `_hybrid_send_replay` (401 → `FailedLoginError`, 403 → `AccountBannedError`, 429 → `RateLimitError`, 5xx → bounded retry).
 - Returns `ScrapeOutcome(result='success', data=[transparency_dict])` — `data` is a 1-element list, not a post stream.
+
+### Single-shot scrape strategy for `ProfileAuthenticity`
+
+Same shape as `PageTransparency` — single-shot, no pagination, no scroll, no date filter. `Query.query` carries the numeric `user_id` only; no handle is needed (FB redirects `/<user_id>/` to the canonical profile).
+
+- Navigates to `https://www.facebook.com/<user_id>/` (warm-up + natural traffic). Skips bootstrap scroll — the natural `ProfileCometDirectoryAuthenticityModalQuery` only fires from a UI click on FB's "About this profile / authenticity" modal.
+- Reuses the same `latest_natural_graphql_request` template-capture path as PageTransparency (cross-cutting auth-bearing fields are session-wide).
+- Synthesizes the authenticity body by overriding `fb_api_req_friendly_name=ProfileCometDirectoryAuthenticityModalQuery`, `variables={"scale": <scale>, "userID": <user_id>}`, `doc_id=PROFILE_AUTHENTICITY_DOC_ID`. Splices freshest `__csr` / `__dyn`. Header `x-fb-friendly-name` is overridden to match the form field.
+- Single `page.request.post()` to `/api/graphql/`. HTTP-status classification reuses `_hybrid_send_replay`.
+- Returns `ScrapeOutcome(result='success', data=[authenticity_dict])` — the dict is `data.user` from the GraphQL response. Top-level fields include `id`, `name`, `delegate_page_id`, and a nested `profile_directory_authenticity_modal` with `header_fields[]` (profile join date, profile-updated-since, category, transparency link), `meta_verified_section`, and `about_fields[]`. The flattener dispatches `header_fields[]` by `profile_field_type` (`PROFILE_JOIN_DATE` → `profile_join_date`, `PROFILE_UPDATED_SINCE` → `profile_updated_since`, `CATEGORY` → `category`, `TRANSPARENCY` → `transparency_present` bool).
 
 ### Endpoint × mode registry (`Query.ENDPOINT_REGISTRY`)
 
@@ -89,7 +99,7 @@ ENDPOINT_REGISTRY[endpoint] = {
 }
 ```
 
-Today's registered endpoints: `UserTimeline` (`manual` + `hybrid`), `Search` (`hybrid` only), `PageTransparency` (`hybrid` only — single-shot, no pagination). Adding a new endpoint = one nested dict entry + a `BrowserSession` method per mode + a row in `Worker.ENDPOINT_MODE_METHODS` + a flattener entry. See [`docs/adding_endpoints.md`](docs/adding_endpoints.md) for the full playbook.
+Today's registered endpoints: `UserTimeline` (`manual` + `hybrid`), `Search` (`hybrid` only), `PageTransparency` (`hybrid` only — single-shot, no pagination), `ProfileAuthenticity` (`hybrid` only — single-shot, no pagination). Adding a new endpoint = one nested dict entry + a `BrowserSession` method per mode + a row in `Worker.ENDPOINT_MODE_METHODS` + a flattener entry. See [`docs/adding_endpoints.md`](docs/adding_endpoints.md) for the full playbook.
 
 `Query.__post_init__` validates the endpoint, mode, required query fields, and param keys; fills defaults from the registry. Unknown params raise `ValueError`.
 
@@ -127,7 +137,7 @@ Set up on every `BrowserSession`. Hooks into `page.on("response")`. Tracks:
 - `viewer_seen` — `True` once any GraphQL response body contains a non-null `data.viewer` (canonical login-success marker, doesn't depend on DOM).
 - `latest_csr` / `latest_dyn` — freshest tokens parsed from any natural GraphQL POST (manual replays via `page.request.post` bypass the page event stream and don't pollute these). Hybrid splices into replay bodies.
 - `latest_pctfrq_request` / `latest_scrq_request` — `{post_data, headers}` of the most recent natural PCTFRQ / SCRQ. UserTimeline / Search hybrid poll these for template capture.
-- `latest_natural_graphql_request` — `{post_data, headers}` of the most recent natural GraphQL POST regardless of friendly-name. Used by single-shot endpoints (PageTransparency) that synthesize their own body and only need cross-cutting auth-bearing fields.
+- `latest_natural_graphql_request` — `{post_data, headers}` of the most recent natural GraphQL POST regardless of friendly-name. Used by single-shot endpoints (PageTransparency, ProfileAuthenticity) that synthesize their own body and only need cross-cutting auth-bearing fields.
 - `network_capture` — full request+response of every observed response. **Off by default**; opt-in via `FB_NETWORK_CAPTURE_ALL=1` env var. Used for offline forensic analysis (see `tmp/hybrid/`).
 - `flush()` — resets transient state between scrapes; preserves `extract_posts` (it's a behavior flag, not transient state).
 
@@ -140,8 +150,9 @@ Raw `ScrapingResult.data` records are deeply nested GraphQL trees. `FacebookGrap
 **Endpoint registry.**
 ```python
 FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
-    "UserTimeline":     "_flatten_pctfrq_post",
-    "PageTransparency": "_flatten_pagetransparency_record",
+    "UserTimeline":         "_flatten_pctfrq_post",
+    "PageTransparency":     "_flatten_pagetransparency_record",
+    "ProfileAuthenticity":  "_flatten_profile_authenticity_record",
     # Search: "_flatten_search_result_post" later
 }
 ```
@@ -149,9 +160,9 @@ The CLI reads `query.endpoint` from the saved JSON and routes through this regis
 
 **Field coverage (UserTimeline orchestrator).** Per row: ids/urls/times, privacy, author (id/name/url/type/promode_badge), text + `hashtags` / `mentions` / `external_urls` (extracted from `message.ranges` typed entities), `music_artist`/`music_title` (when posted with audio attribution), `is_reel`/`is_live`/`is_repost`, full reaction breakdown (like/love/haha/wow/sad/angry/care + total), shares, comments, video_views, video_duration_sec, `top_comments` (list of dicts), `attachments` (recursive list — see below), `shared_post` (recursive dict — abbreviated by FB so usually only ids/urls/times/author).
 
-**Uniform attachment shape.** Every attachment fills the same keys regardless of type — type-specific extras get None when not applicable. Types: `photo`, `video`, `link`, `album`, `reel_share`, `unavailable`, `unknown`. Photos/album-covers carry `image_url` (high-res) + `image_lowres_url`; videos carry `thumbnail_url` + `video_permalink_url` + `video_duration_sec` + `video_captions_url`; link previews carry `link_title`/`link_description`/`link_source`/`link_destination_url` + a `thumbnail_url`. Albums recurse via `subattachments[]`; reel shares hoist the inner reel's permalink/thumbnail/duration to the outer attachment for ergonomic single-level access.
+**Uniform attachment shape.** Every attachment fills the same keys regardless of type — type-specific extras get None when not applicable. Types: `photo`, `video`, `link`, `album`, `reel_share`, `unavailable`, `unknown`. Photos/album-covers carry `image_url` (high-res) + `image_lowres_url`; videos carry `video_url` (progressive mp4) + `thumbnail_url` + `video_permalink_url` + `video_duration_sec` + `video_captions_url`; link previews carry `link_title`/`link_description`/`link_source`/`link_destination_url` + a `thumbnail_url`. Albums recurse via `subattachments[]` (mixed-media albums populate `video_url` on video subnodes); reel shares hoist the inner reel's permalink/thumbnail/duration/video_url to the outer attachment for ergonomic single-level access. `download-media` consumes this shape directly via `FacebookGraphQLParser._extract_attachments`, so URL discovery stays in one place.
 
-**Metadata dispatch by `__typename`.** `comet_sections.context_layout.story.comet_sections.metadata[]` is a non-deterministic list of typed strategies (`CometFeedStoryLongerTimestampStrategy`, `CometFeedStoryAudienceStrategy`, `CometStoryMusicPostLevelAttributionStrategy`, etc.). `_metadata_by_typename` dispatches by typename rather than positional index; new strategies (location, sponsored, …) plug in as new constants.
+**Metadata dispatch by `__typename`.** `comet_sections.context_layout.story.comet_sections.metadata[]` is a non-deterministic list of typed strategies. `_metadata_by_typenames(story, typenames)` dispatches by typename rather than positional index. Each constant is a **tuple of candidate typenames** (`_METADATA_TIMESTAMP_TYPENAMES`, `_METADATA_AUDIENCE_TYPENAMES`, `_METADATA_MUSIC_TYPENAMES`) checked in order — first match wins. This absorbs FB's sibling strategy renames without code changes: e.g. the timestamp surface returns `CometFeedStoryLongerTimestampStrategy` for some renderings and `CometFeedStoryMinimizedTimestampStrategy` for others, with an identical `story.creation_time` payload. New strategies (location, sponsored, …) plug in either as new constants or as extra entries in an existing tuple.
 
 **Output flow (CLI).** Rows go through `pl.json_normalize(rows, separator='__', infer_schema_length=None)` so nested dicts (`shared_post.*`) become `__`-separated columns; lists stay typed (`pl.List[pl.Struct]`). Parquet writes natively with `compression='zstd'`. CSV serializes List/Struct cells as JSON strings (round-trippable via `json.loads`). JSONL writes the raw pre-normalized row dicts to preserve original nesting.
 
@@ -171,15 +182,16 @@ Set `FB_NETWORK_CAPTURE_ALL=1` to record every browser response (XHR + JS + CSS 
 6. **Lock for lazy init** — `asyncio.Lock` around `WorkerPool` lazy-init prevents `gather()`-induced double-init.
 7. **5-minute rotation cooldown** — `lock_until` on rotation prevents immediately re-acquiring the same account.
 8. **Stall watchdog on GraphQL silence (manual only)** — keyed off `last_response_time`. Fires whether FB silences the endpoint or returns empty bodies. Hybrid uses different stop conditions (`end_cursor` null, oldest post < `start_unix`, no-progress streak).
-9. **Self-signed fbcdn URLs** — media downloads need no cookies/auth, but URLs expire ~30 days post-scrape — run `download-media` soon after.
+9. **Self-signed fbcdn URLs, short TTL** — media URLs in scraped posts carry an `oh=` HMAC signature and an `oe=` expiry (hex-encoded unix seconds); no cookies/auth needed to fetch them. Empirically the TTL is **~4-5 days from scrape time**, not 30 — verified across 12k URLs from a 2026-05 scrape batch (uniform 4d for ~91%, 5d for ~9%, across all hosts and media kinds). Expired URLs return HTTP 403 with `Bad URL hash`. Practical consequences: (a) run `download-media` within ~3 days of the scrape or pipeline it into the same run, (b) raw post JSONs older than ~5 days are media-irrecoverable without re-scraping the handle. The `time_started` in each saved file's outer dict marks the issue moment; per-URL expiry can be decoded with `int(url.split('oe=')[1].split('&')[0], 16)`.
 10. **Endpoint × mode registry** — `Query.ENDPOINT_REGISTRY` is the single source of truth for endpoints, modes, and per-(endpoint, mode) param defaults. Per-mode methods on `BrowserSession` (`user_timeline_manual`, `user_timeline_hybrid`) handle dispatch via `Worker.ENDPOINT_MODE_METHODS`.
 11. **Query is constructed exactly once** — `FacebookScraper.user_timeline` builds the canonical Query, validates, fills defaults. `BrowserSession` returns a `ScrapeOutcome` (Query-agnostic); `Worker` attaches the original Query via `ScrapingResult.from_outcome`. No drift between caller-spec and recorded-spec.
 12. **Hybrid: `cursor=null` + `beforeTime` always set** — empirically confirmed FB's UI uses `cursor=null` whenever a date filter is active. Replays mirror that: every replay carries a non-null `beforeTime` (= `min(end_of_day(end_date), now_utc)`) so FB honors `cursor=null` on the first replay, returning the most-recent in-range batch including SSR-equivalent posts. `afterTime` stays at the captured `null` (FB's UI never sets it). See [`docs/hybrid/overview.md`](docs/hybrid/overview.md).
 13. **Hybrid: post auto-extraction off** — `ResponseInterceptor.extract_posts = False` for the duration of a hybrid scrape. Prevents the natural bootstrap PCTFRQ (no date filter) from leaking off-range posts into the result. All posts come from replays with explicit filters.
 14. **`__csr` / `__dyn` are HasteBitMap telemetry, not auth** — from FB's bundled JS, both are bitmaps of bootloaded resources / dynamic JS modules. FB's own request builder will conditionally `delete v.__csr` before sending. We currently live-splice the freshest values from natural GraphQL POSTs; the `freeze_tokens` experiment in TODOs validates whether splicing matters.
 15. **Per-call timeouts wrap renderer-prone awaits** — every `scroll()`, `check_error_conditions()`, `page.request.post()`, etc. is wrapped in `asyncio.wait_for(operation_timeout_seconds)` so a wedged renderer can't hang a scrape forever. Per-call patch; the proper fix (external watchdog task) is in TODOs.
-16. **Hybrid: cursor-reset detection + multi-leg resume** — empirically, after a variable number of paginations (median ~33 across 21 dumped scrapes, range 2–214) FB silently returns a degraded response: `has_next_page: true` and a fresh `end_cursor`, but the response shape collapses (e.g. 28 JSONL → 4 lines, ~5× smaller body) and `oldest_in_batch` jumps newer with zero post overlap vs. the prior batch. Cursor handoff is intact and there are no `errors[]` — neither existing stop fires, so the loop would run forever against a degraded stream. Detector lives in `_hybrid_pagination_loop`: if oldest_in_batch jumps newer by more than `HYBRID_CURSOR_RESET_JUMP_SECONDS` (= 7 days) vs. the previous iter, dump a 20-iter rolling window to `tmp/hybrid/cursor_reset/<handle>/<UTC_ts>/` and return `'cursor_reset'`. `oldest_in_batch` / `newest_in_batch` are extracted via `_hybrid_iter_wrapping_creation_times`, which routes through the parser's `_extract_times` (same wrapping-only metadata-strategy lookup the flattener uses), so a recent share of an older post yields only the share's own date — no false-positive triggers from `attached_story.creation_time`. `Worker.execute_task` recognizes the cursor_reset result string and locks the account for 30 min, then `FacebookScraper.user_timeline` resumes via a fresh `WorkerPool.submit_task` with `end_date` advanced backward to the oldest collected post's day, capped at `MAX_CURSOR_RESET_RESUMES` (= 5) resumes per high-level scrape. Cross-leg post-id dedup prevents boundary-day duplicates. Terminal result strings: `'cursor_reset_max_retries'`, `'cursor_reset_no_progress'` (oldest post day didn't advance past current end_date), `'cursor_reset_no_posts'` (reset on a leg that collected nothing). Diagnostic dump stays on across legs to keep observing the symptom.
+16. **Hybrid: cursor-reset detection + multi-leg resume** — empirically, after a variable number of paginations (median ~33 across 21 dumped scrapes, range 2–214) FB silently returns a degraded response: `has_next_page: true` and a fresh `end_cursor`, but the response shape collapses (e.g. 28 JSONL → 4 lines, ~5× smaller body) and `oldest_in_batch` jumps newer with zero post overlap vs. the prior batch. Cursor handoff is intact and there are no `errors[]` — neither existing stop fires, so the loop would run forever against a degraded stream. Detector lives in `_hybrid_pagination_loop`: if oldest_in_batch jumps newer by more than `HYBRID_CURSOR_RESET_JUMP_SECONDS` (= 7 days) vs. the previous iter, dump a 20-iter rolling window to `tmp/hybrid/cursor_reset/<handle>/<UTC_ts>/` and return `'cursor_reset'`. `oldest_in_batch` / `newest_in_batch` are extracted via `_hybrid_iter_wrapping_creation_times`, which routes through the parser's `_extract_times` (same wrapping-only metadata-strategy lookup the flattener uses — it walks the timestamp typenames in `_METADATA_TIMESTAMP_TYPENAMES`, currently `Longer` + `Minimized`), so a recent share of an older post yields only the share's own date — no false-positive triggers from `attached_story.creation_time`. `Worker.execute_task` recognizes the cursor_reset result string and locks the account for 30 min, then `FacebookScraper.user_timeline` resumes via a fresh `WorkerPool.submit_task` with `end_date` advanced backward to the oldest collected post's day, capped at `MAX_CURSOR_RESET_RESUMES` (= 5) resumes per high-level scrape. Cross-leg post-id dedup prevents boundary-day duplicates. Terminal result strings: `'cursor_reset_max_retries'`, `'cursor_reset_no_progress'` (oldest post day didn't advance past current end_date), `'cursor_reset_no_posts'` (reset on a leg that collected nothing). Diagnostic dump stays on across legs to keep observing the symptom.
 17. **Post-id dedup at `ResponseInterceptor.add_posts`** — `add_posts` filters by `post_id` against `self.seen_post_ids` before appending. The auto-extract path in `intercept_response` routes through `add_posts`, so manual mode benefits identically. Without dedup, FB cursor-degraded responses (which can re-serve overlapping posts) would inflate `len(self.posts)` and let the no-progress backstop fail to fire. Posts without a `post_id` are appended as-is — defensive against parser quirks.
+18. **Response-shape error is terminal, not retryable** — when the hybrid loop sees `posts_in_resp > 0` but `oldest_in_batch is None` (the parser accepted posts as Story-shaped, but every one carried a timestamp metadata-strategy typename outside `_METADATA_TIMESTAMP_TYPENAMES`), the loop returns `'response_shape_error'`. `Worker.execute_task` recognizes this result string and **preserves partial data, does not rotate, does not mark inactive, does not burn a retry slot** — the condition signals a structural bug (FB shape change / unrecognized strategy typename), not an instance-specific failure, so rotating accounts wouldn't help. `FacebookScraper.user_timeline`'s multi-leg loop terminates naturally because it only resumes on `'cursor_reset'`. The typed exception `ResponseShapeError` exists in `exceptions.py` as a signal for callers that want to pattern-match, but the loop returns a result string rather than raising so the partial-data flow stays consistent with other terminal classifications (`ETIMEDOUT`, `cursor_reset`, etc.).
 
 For account state, lifecycle, and exception → DB-write semantics: [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 
@@ -305,26 +317,45 @@ fbscrape scrape user-timeline --input-file handles.yaml --start-date 2024-01-01
 fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
 fbscrape scrape search --input-file queries.csv
 
-# Page transparency (single-shot — pass `handle:page_id` pairs or --input-file
-# with `handle` + `page_id` columns; no date range)
+# Page transparency (single-shot — pass bare `page_id` args (or `handle:page_id`
+# when you have the vanity handle), or --input-file with a `page_id` column
+# (handle column optional); no date range)
+fbscrape scrape page-transparency 899800046546098
 fbscrape scrape page-transparency habsfanhub:899800046546098
 fbscrape scrape page-transparency --input-file pages.csv --headless
+
+# Profile authenticity (single-shot — pass bare user_id args or --input-file
+# with a `user_id` column; no date range, no handle needed)
+fbscrape scrape profile-authenticity 100044331674441
+fbscrape scrape profile-authenticity --input-file profiles.csv --headless
 ```
 
 `--input-file` recognizes the columns `handle` (required), `start_date`, and `end_date`; everything else is ignored. If the file supplies `start_date` / `end_date` for any row, the matching CLI flag (`--start-date` / `--end-date`) must NOT be set. Rows missing `start_date` fall back to the `--start-date` flag; rows missing `end_date` fall back to `--end-date` and ultimately to today (UTC).
 
 Hybrid-mode flags (all optional, fall back to registry defaults): `--pagination-count`, `--scroll-burst-{every,min,max}`, `--max-paginations` (default `-1` = no cap), `--pagination-sleep-{mean,std}`, `--template-capture-timeout`, `--post-nav-sleep-seconds`, `--request-timeout-ms`, `--max-no-progress-streak`, `--operation-timeout-seconds`. `--stall-timeout-seconds` is manual-only.
 
-Post-processing:
+Post-processing (both `flatten` and `download-media` accept `.json` or `.json.gz`,
+single file or directory of either):
 ```bash
 # Flatten raw JSON into tabular dataset. Endpoint inferred from saved query.endpoint;
-# overridable with --endpoint. Parquet uses zstd; CSV serializes list/struct columns
-# as JSON strings (round-trippable via json.loads).
+# overridable with --endpoint. Parquet uses zstd (auto-derived filenames carry the
+# .parquet.zstd suffix; explicit --output filenames are honored literally). CSV
+# serializes list/struct columns as JSON strings (round-trippable via json.loads).
 fbscrape flatten data/posts/foo.json --format all
+fbscrape flatten data/posts/foo.json.gz --format parquet
 fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
 fbscrape flatten data/posts/foo.json --endpoint UserTimeline --format jsonl
 
-# Download images/videos/thumbnails (run soon after scraping — URLs expire ~30 days)
+# --output may be a file path or a folder. For directory inputs it must be a folder
+# unless --concat is set (in which case all inputs are merged into one file).
+# Heuristic: existing dir or trailing "/" → folder; .parquet/.csv/.jsonl suffix → file;
+# otherwise → folder (created if absent).
+fbscrape flatten data/posts/ --output data/flat/ --format parquet           # per-file → folder
+fbscrape flatten data/posts/ --output data/merged.parquet --concat          # all → one file
+fbscrape flatten data/posts/ --output data/all.parquet --concat --format all  # → all.{csv,jsonl,parquet}
+
+# Download images/videos/thumbnails. URLs expire ~4-5 days after scrape — run within
+# ~3 days or expect HTTP 403 ("Bad URL hash") on the stale subset.
 fbscrape download-media data/posts/foo.json --include-thumbnails
 fbscrape download-media data/posts/2025-06-01_2026-02-17/ --concurrency 12
 ```

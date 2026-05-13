@@ -59,6 +59,7 @@ def _resolve_story(post: dict) -> dict | None:
 _ATTACHMENT_TYPE_BY_STYLE = {
     "StoryAttachmentPhotoStyleRenderer":                    "photo",
     "StoryAttachmentUnifiedLightweightVideoStyleRenderer":  "video",
+    "StoryAttachmentVideoStyleRenderer":                    "video",
     "StoryAttachmentAnimatedImageShareStyleRenderer":       "video",
     "StoryAttachmentAlbumStyleRenderer":                    "album",
     "StoryAttachmentShareStyleRenderer":                    "link",
@@ -70,10 +71,26 @@ _ATTACHMENT_TYPE_BY_STYLE = {
 
 # Story.comet_sections.context_layout.story.comet_sections.metadata[] is a
 # non-deterministic list of typed strategies; dispatch by __typename rather
-# than positional index. Add new typenames here as they're observed.
-_METADATA_TIMESTAMP_TYPENAME = "CometFeedStoryLongerTimestampStrategy"
-_METADATA_AUDIENCE_TYPENAME  = "CometFeedStoryAudienceStrategy"
-_METADATA_MUSIC_TYPENAME     = "CometStoryMusicPostLevelAttributionStrategy"
+# than positional index. Each lookup accepts a TUPLE of candidate typenames
+# so FB's sibling strategy renames (e.g. `Longer` vs `Minimized` for the
+# timestamp — same `story.creation_time` payload, different __typename) are
+# absorbed without code changes. First-match wins, so order = preference.
+_METADATA_TIMESTAMP_TYPENAMES = (
+    "CometFeedStoryLongerTimestampStrategy",
+    "CometFeedStoryMinimizedTimestampStrategy",
+)
+_METADATA_AUDIENCE_TYPENAMES  = ("CometFeedStoryAudienceStrategy",)
+_METADATA_MUSIC_TYPENAMES     = ("CometStoryMusicPostLevelAttributionStrategy",)
+
+
+def _pick_progressive_video(media: dict | None) -> str | None:
+    """Return the highest-priority progressive mp4 URL from a media dict, if any."""
+    vdrr = _g(media or {}, "videoDeliveryResponseFragment", "videoDeliveryResponseResult") or {}
+    for p in vdrr.get("progressive_urls") or []:
+        url = p.get("progressive_url")
+        if url:
+            return url
+    return None
 
 
 class FacebookGraphQLParser:
@@ -92,6 +109,7 @@ class FacebookGraphQLParser:
     ENDPOINT_FLATTENERS: dict[str, str] = {
         "UserTimeline": "_flatten_pctfrq_post",
         "PageTransparency": "_flatten_pagetransparency_record",
+        "ProfileAuthenticity": "_flatten_profile_authenticity_record",
     }
 
     # ----- runtime parsing (used by ResponseInterceptor) -----
@@ -278,24 +296,106 @@ class FacebookGraphQLParser:
             "admin_num_unknown": admin_locations.get("num_unknown"),
         }
 
+    def _flatten_profile_authenticity_record(self, record: dict) -> dict | None:
+        """Orchestrator for ProfileCometDirectoryAuthenticityModalQuery (ProfileAuthenticity).
+
+        `record` is the `data.user` dict from the GraphQL response. Returns
+        a single-row dict — ProfileAuthenticity is a single-record endpoint.
+        None on shape mismatch (no `id` field).
+
+        Header-field dispatch by `profile_field_type`:
+          - PROFILE_JOIN_DATE     → `profile_join_date` (e.g. "May 7, 2013")
+          - PROFILE_UPDATED_SINCE → `profile_updated_since` (e.g. "6 hours ago")
+          - CATEGORY              → `category` (e.g. "Personal blog")
+          - TRANSPARENCY          → `transparency_present` (bool — the entry
+                                    exists but `value` is null; it's a link
+                                    placeholder in the FB UI)
+        """
+        if not isinstance(record, dict) or not record.get("id"):
+            return None
+
+        modal = record.get("profile_directory_authenticity_modal") or {}
+        header_fields = modal.get("header_fields") or []
+
+        by_type: dict[str, dict] = {}
+        for hf in header_fields:
+            if not isinstance(hf, dict):
+                continue
+            tn = hf.get("profile_field_type")
+            if isinstance(tn, str):
+                by_type[tn] = hf
+
+        join = by_type.get("PROFILE_JOIN_DATE") or {}
+        updated = by_type.get("PROFILE_UPDATED_SINCE") or {}
+        category = by_type.get("CATEGORY") or {}
+
+        meta_verified = modal.get("meta_verified_section") or {}
+
+        about_fields = [
+            {
+                "label": f.get("label"),
+                "profile_field_type": f.get("profile_field_type"),
+                "value": f.get("value"),
+                "subtitle": f.get("subtitle"),
+            }
+            for f in (modal.get("about_fields") or [])
+            if isinstance(f, dict)
+        ]
+
+        header_fields_clean = [
+            {
+                "label": hf.get("label"),
+                "profile_field_type": hf.get("profile_field_type"),
+                "value": hf.get("value"),
+                "subtitle": hf.get("subtitle"),
+            }
+            for hf in header_fields
+            if isinstance(hf, dict)
+        ]
+
+        return {
+            "user_id": record.get("id"),
+            "name": record.get("name"),
+            "delegate_page_id": record.get("delegate_page_id"),
+            "profile_join_date": join.get("value"),
+            "profile_updated_since": updated.get("value"),
+            "category": category.get("value"),
+            "transparency_present": "TRANSPARENCY" in by_type,
+            "is_meta_verified": bool(meta_verified.get("show_section")),
+            "meta_verified_headline": meta_verified.get("headline"),
+            "meta_verified_body": meta_verified.get("body"),
+            "header_description": modal.get("header_description"),
+            "about_title": modal.get("about_title"),
+            "about_fields": about_fields,
+            "header_fields": header_fields_clean,
+            "section_token": modal.get("section_token"),
+            "collection_token": modal.get("collection_token"),
+        }
+
     # ----- per-aspect extractors -----
 
-    def _metadata_by_typename(self, story: dict, typename: str) -> dict | None:
-        """First entry in `metadata[]` matching `__typename`, or None.
+    def _metadata_by_typenames(
+        self, story: dict, typenames: tuple[str, ...]
+    ) -> dict | None:
+        """First entry in `metadata[]` whose `__typename` matches any candidate
+        in `typenames`, checked in order — earlier candidates win. Returns None
+        if no match.
 
-        FB's metadata[] ordering is non-deterministic across posts and may grow
-        new strategies (location, sponsored, etc.); dispatching by typename
-        avoids brittle positional indexing.
+        FB's metadata[] ordering is non-deterministic across posts and the
+        strategy typename varies by rendering context (e.g. `Longer` vs
+        `Minimized` for the timestamp; same inner shape, different label).
+        Passing a tuple lets us absorb sibling renames without code changes.
         """
         md = _g(story, "comet_sections", "context_layout", "story",
                 "comet_sections", "metadata", default=[]) or []
-        for m in md:
-            if isinstance(m, dict) and m.get("__typename") == typename:
-                return m
+        for tn in typenames:
+            for m in md:
+                if isinstance(m, dict) and m.get("__typename") == tn:
+                    return m
         return None
 
     def _extract_ids_and_urls(self, story: dict) -> dict:
-        ts_meta = self._metadata_by_typename(story, _METADATA_TIMESTAMP_TYPENAME) or {}
+        ts_meta = self._metadata_by_typenames(story, _METADATA_TIMESTAMP_TYPENAMES) or {}
         canonical_url = _g(ts_meta, "story", "url")
         permalink_url = story.get("permalink_url")
         return {
@@ -306,7 +406,7 @@ class FacebookGraphQLParser:
         }
 
     def _extract_times(self, story: dict) -> dict:
-        ts_meta = self._metadata_by_typename(story, _METADATA_TIMESTAMP_TYPENAME) or {}
+        ts_meta = self._metadata_by_typenames(story, _METADATA_TIMESTAMP_TYPENAMES) or {}
         created_at = _g(ts_meta, "story", "creation_time")
         created_at_utc = (
             datetime.fromtimestamp(created_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -315,7 +415,7 @@ class FacebookGraphQLParser:
         return {"created_at": created_at, "created_at_utc": created_at_utc}
 
     def _extract_audience(self, story: dict) -> dict:
-        aud = self._metadata_by_typename(story, _METADATA_AUDIENCE_TYPENAME) or {}
+        aud = self._metadata_by_typenames(story, _METADATA_AUDIENCE_TYPENAMES) or {}
         return {"privacy": _g(aud, "story", "privacy_scope", "description")}
 
     def _extract_author(self, story: dict) -> dict:
@@ -390,7 +490,7 @@ class FacebookGraphQLParser:
         }
 
     def _extract_music(self, story: dict) -> dict:
-        m = self._metadata_by_typename(story, _METADATA_MUSIC_TYPENAME) or {}
+        m = self._metadata_by_typenames(story, _METADATA_MUSIC_TYPENAMES) or {}
         meta = _g(m, "story", "story_media_metadata") or {}
         return {
             "music_artist": meta.get("artist_name"),
@@ -476,7 +576,7 @@ class FacebookGraphQLParser:
         "type", "id", "url",
         "image_url", "image_lowres_url", "thumbnail_url",
         "width", "height", "accessibility_caption",
-        "video_duration_sec", "video_is_live", "video_permalink_url", "video_captions_url",
+        "video_url", "video_duration_sec", "video_is_live", "video_permalink_url", "video_captions_url",
         "link_title", "link_description", "link_source", "link_destination_url",
         "subattachments",
     )
@@ -535,6 +635,7 @@ class FacebookGraphQLParser:
             ff = media.get("first_frame_thumbnail")
             out["thumbnail_url"] = (ff if isinstance(ff, str)
                                     else _g(media, "preferred_thumbnail", "image", "uri"))
+            out["video_url"] = _pick_progressive_video(media)
 
         # Link previews: thumbnail lives on media.large_share_image (full) or
         # media.image (favicon-sized). Destination URL falls back to the
@@ -558,12 +659,13 @@ class FacebookGraphQLParser:
                 inner_atts = _g(si, "fb_shorts_story", "attachments", default=[]) or []
                 if inner_atts:
                     out["subattachments"] = [self._extract_attachment(i) for i in inner_atts]
-                    # Hoist the first inner reel's permalink/thumbnail/duration to the outer
-                    # attachment so a single-row consumer doesn't have to recurse to find them.
+                    # Hoist the first inner reel's permalink/thumbnail/duration/video_url to the
+                    # outer attachment so a single-row consumer doesn't have to recurse to find them.
                     inner_media = inner_atts[0].get("media") or {}
                     out["url"]                = out["url"] or inner_media.get("permalink_url")
                     out["thumbnail_url"]      = out["thumbnail_url"] or _g(inner_media, "thumbnailImage", "uri")
                     out["video_duration_sec"] = out["video_duration_sec"] or inner_media.get("length_in_second")
+                    out["video_url"]          = out["video_url"] or _pick_progressive_video(inner_media)
                     break
 
         return out
@@ -571,13 +673,17 @@ class FacebookGraphQLParser:
     def _extract_album_subnode(self, sub: dict) -> dict:
         """Album subattachments use a stripped shape (no outer styles wrapper)."""
         media = sub.get("media") or {}
+        typename = media.get("__typename")
         out = self._empty_attachment()
         out.update({
-            "type":                  "photo" if media.get("__typename") == "Photo" else "unknown",
+            "type":                  ("photo" if typename == "Photo"
+                                      else "video" if typename == "Video"
+                                      else "unknown"),
             "id":                    media.get("id"),
             "url":                   sub.get("url"),
             "image_url":             _g(media, "viewer_image", "uri"),
             "image_lowres_url":      _g(media, "image", "uri"),
+            "video_url":             _pick_progressive_video(media),
             "width":                 _g(media, "viewer_image", "width") or _g(media, "image", "width"),
             "height":                _g(media, "viewer_image", "height") or _g(media, "image", "height"),
             "accessibility_caption": media.get("accessibility_caption"),
