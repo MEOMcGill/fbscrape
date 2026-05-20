@@ -4,7 +4,9 @@ CLI for managing Facebook scraper accounts
 
 import asyncio
 import click
+import json
 import os
+from datetime import datetime, timezone
 from tabulate import tabulate
 import gzip
 
@@ -22,6 +24,59 @@ def _open_scrape_input(path: str):
     if magic == b'\x1f\x8b':
         return gzip.open(path, 'rt')
     return open(path, 'rt')
+
+
+def _find_unstick_cursor(
+    data: list[dict],
+    endpoint: str,
+    rank: int = 3,
+) -> tuple[str, dict] | None:
+    """Pick the per-edge cursor of the rank-th chronologically-oldest post
+    with a non-null `cursor` field in `data`.
+
+    Used to escape a `no_new_posts_streak` deadlock when the saved
+    `last_cursor` anchors at a position where FB serves only already-
+    collected posts. Swapping `last_cursor` to a deeper anchor jumps the
+    next resume past the dedup wall and into uncovered territory.
+
+    The default `rank=3` skips the very-oldest post (which is often a
+    bootstrap-edge highlight outlier — FB injects one chronologically
+    out-of-position anchor post per batch). If the rank-th post lacks a
+    cursor (every 3rd post in our saved files does — also a bootstrap-
+    edge artifact in the parser's fan-out), walks forward to the next
+    cursored post.
+
+    Returns `(cursor, diagnostic)` where diagnostic is a small dict for
+    logging — or None when the file has too few timestamped/cursored
+    posts to satisfy `rank`.
+    """
+    # Local import to avoid putting fbscrape.response in cli.py's top-level imports.
+    from .response import FacebookGraphQLParser
+    parser = FacebookGraphQLParser()
+
+    items: list[tuple[int, int, str | None]] = []  # (created_at, idx, cursor)
+    for i, rec in enumerate(data):
+        try:
+            flat = parser.flatten(rec, endpoint=endpoint)
+        except Exception:
+            continue
+        ct = flat.get('created_at') if flat else None
+        cursor = rec.get('cursor')
+        if isinstance(ct, (int, float)):
+            items.append((int(ct), i, cursor))
+    items.sort(key=lambda x: x[0])  # oldest first
+
+    if len(items) < rank:
+        return None
+
+    for cur_rank, (ct, idx, cursor) in enumerate(items[rank - 1:], start=rank):
+        if cursor:
+            return (cursor, {
+                "chosen_rank": cur_rank,
+                "chosen_idx":  idx,
+                "chosen_created_at": ct,
+            })
+    return None
 
 from .accounts_pool import AccountsPool
 from .utils import gather, get_home_dir_path, utc
@@ -860,7 +915,10 @@ def scrape():
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=5000, type=int, help='Scrolls (or hybrid paginations) before rotating account')
 @click.option('--stall-timeout-seconds', default=None, type=int, help='[manual] bail out if no GraphQL response for N seconds (default 300, ignored for --mode hybrid)')
-@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--headless/--no-headless', default=True,
+              help='Run browsers headless (default). Pass --no-headless to '
+                   'see the browser window — useful for debugging login flows '
+                   'or watching a scrape live.')
 @click.option('--mobile', is_flag=True, help='Use mobile emulation')
 @click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
 @click.option('--mode', type=click.Choice(['manual', 'hybrid']), default='hybrid',
@@ -877,6 +935,10 @@ def scrape():
               help='[hybrid] maximum scrolls per organic burst (default 5)')
 @click.option('--max-paginations', type=int, default=None,
               help='[hybrid] safety cap on paginations per session (default -1 = no cap)')
+@click.option('--max-posts', type=int, default=None,
+              help='[hybrid] cap on total accumulated posts (default -1 = no cap). '
+                   'Checked at batch boundaries, so actual count can exceed by up '
+                   'to pagination_count-1.')
 @click.option('--pagination-sleep-mean', type=float, default=None,
               help='[hybrid] mean inter-pagination sleep seconds (default 2.5)')
 @click.option('--pagination-sleep-std', type=float, default=None,
@@ -899,15 +961,24 @@ def scrape():
               help='Skip targets whose output JSON file already exists in --output-dir '
                    '(filename matches handle, endpoint, mode, start_date, end_date). '
                    'Useful for resuming a partially-completed batch.')
+@click.option('--continue', 'continue_', is_flag=True,
+              help='[hybrid only] For each target, if a matching output file '
+                   'exists in --output-dir, resume the scrape from its '
+                   '`last_cursor` and seed the dedup set with its post_ids. '
+                   'New posts are merged into the existing file. The cursor '
+                   'is fed into leg 0 only; post-cursor_reset legs continue '
+                   'to start fresh with adjusted end_date. Mutually exclusive '
+                   'with --skip-existing. Errors when combined with '
+                   '--mode manual (no cursor concept).')
 @click.pass_context
 def scrape_user_timeline(
     ctx, handles, input_file, start_date, end_date, output_dir, max_sessions,
     scroll_threshold, stall_timeout_seconds, headless, mobile, log_level,
     mode, pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
-    max_paginations, pagination_sleep_mean, pagination_sleep_std,
+    max_paginations, max_posts, pagination_sleep_mean, pagination_sleep_std,
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
-    skip_existing,
+    skip_existing, continue_,
 ):
     """Scrape a user's timeline between two dates.
 
@@ -931,6 +1002,17 @@ def scrape_user_timeline(
     from .models import ScrapingResult
 
     set_log_level(log_level)
+
+    if skip_existing and continue_:
+        raise click.UsageError(
+            "--skip-existing and --continue are mutually exclusive: one drops "
+            "targets that already have output, the other resumes them. Pick one."
+        )
+    if continue_ and mode == 'manual':
+        raise click.UsageError(
+            "--continue requires --mode hybrid (manual scroll-driven mode has "
+            "no cursor concept). Re-run with --mode hybrid (the default)."
+        )
 
     targets = _resolve_targets(handles, input_file, start_date, end_date)
 
@@ -979,6 +1061,7 @@ def scrape_user_timeline(
         "pagination_count": pagination_count,
         "scroll_burst_every": scroll_burst_every,
         "max_paginations": max_paginations,
+        "max_posts": max_posts,
         "pagination_sleep_mean": pagination_sleep_mean,
         "pagination_sleep_std": pagination_sleep_std,
         "template_capture_timeout": template_capture_timeout,
@@ -1000,6 +1083,19 @@ def scrape_user_timeline(
         mode_params['stall_timeout_seconds'] = stall_timeout_seconds
     mode_params = {k: v for k, v in mode_params.items() if v is not None}
 
+    def _existing_output_path(target: dict) -> str | None:
+        """Return path to a prior `.json` / `.json.gz` for this target, or None."""
+        stem = (
+            f"{target['handle'].replace('.', '_')}"
+            f"_UserTimeline_{mode}"
+            f"_{target['start_date']}_{target['end_date']}"
+        )
+        for ext in ('.json.gz', '.json'):
+            p = os.path.join(output_dir, f"{stem}{ext}")
+            if os.path.exists(p):
+                return p
+        return None
+
     async def _scrape():
         pool = AccountsPool(ctx.obj['db'])
         async with FacebookScraper(
@@ -1016,18 +1112,328 @@ def scrape_user_timeline(
                     start_date=t['start_date'],
                     end_date=t['end_date'],
                     mode=mode,
+                    resume_from=_existing_output_path(t) if continue_ else None,
                     **mode_params,
                 )
                 for t in targets
             ):
                 data: ScrapingResult = result
                 handle = data.query.query.get('handle')
-                filename = (
+                stem = (
                     f"{handle.replace('.', '_')}"
                     f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json.gz"
+                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}"
                 )
-                data.save(os.path.join(output_dir, filename), compress=True)
+                # Merge prior data when --continue resumed this target.
+                if continue_:
+                    prior = None
+                    for ext in ('.json.gz', '.json'):
+                        p = os.path.join(output_dir, f"{stem}{ext}")
+                        if os.path.exists(p):
+                            with _open_scrape_input(p) as f:
+                                prior = json.load(f)
+                            break
+                    if prior is not None:
+                        prior_data = prior.get('data') or prior.get('posts') or []
+                        if prior_data:
+                            data.data = prior_data + data.data
+                            logger.info(
+                                f"@{handle}: merged {len(prior_data)} prior + "
+                                f"{len(data.data) - len(prior_data)} new posts "
+                                f"(total {len(data.data)})"
+                            )
+                # Auto-unstick: if this --continue resume bailed on
+                # no_new_posts_streak, the saved cursor is anchored at a
+                # position where FB serves only already-collected posts.
+                # Swap last_cursor to a deeper anchor (rank #3 oldest cursored
+                # post) so the next --continue can break the dedup loop.
+                # Same fix as `fbscrape unstick-cursor`, applied automatically.
+                if continue_ and data.result == 'no_new_posts_streak':
+                    chosen = _find_unstick_cursor(
+                        data.data, endpoint=data.query.endpoint, rank=3,
+                    )
+                    if chosen:
+                        new_cursor, diag = chosen
+                        chosen_iso = datetime.fromtimestamp(
+                            diag["chosen_created_at"], tz=timezone.utc,
+                        ).isoformat()
+                        logger.info(
+                            f"@{handle}: no_new_posts_streak on --continue resume — "
+                            f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
+                            f"data[{diag['chosen_idx']}] @ {chosen_iso}"
+                        )
+                        data.last_cursor = new_cursor
+                data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
+
+    run_async(_scrape())
+
+
+@scrape.command(name='group-timeline')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read (handle, start_date?, end_date?) rows from a CSV, '
+                   'Parquet, YAML, or JSON/JSONL file. `handle` may be a '
+                   'vanity group handle (e.g. "albertaseparatism") or the '
+                   'numeric group id. Mutually exclusive with positional '
+                   'handles. If the file supplies start_date / end_date '
+                   'columns, the matching CLI flag must NOT be set.')
+@click.option('--start-date', default=None,
+              help='Start date YYYY-MM-DD (how far back to scrape). Required '
+                   'unless supplied per-row via --input-file.')
+@click.option('--end-date', default=None,
+              help='End date YYYY-MM-DD (advisory: FB has no server-side date '
+                   'filter for group feeds; this only bounds the client-side '
+                   'stop check). Default: today (UTC).')
+@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
+@click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int, help='Paginations before rotating account')
+@click.option('--headless/--no-headless', default=True,
+              help='Run browsers headless (default). Pass --no-headless to '
+                   'see the browser window — useful for debugging login flows '
+                   'or watching a scrape live.')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--pagination-count', type=int, default=None,
+              help='posts per pagination request (default 3, matches FB UI)')
+@click.option('--sorting-setting', type=str, default=None,
+              help='Group feed sort, sent as variables.sortingSetting on every '
+                   'replay. Known-valid: "TOP_POSTS" (default — FB UI default; '
+                   'algorithmic ranking; lowest-fingerprint choice; termination '
+                   'relies on --max-consecutive-out-of-range since posts arrive '
+                   'non-monotonically), "CHRONOLOGICAL" (stream-line tail '
+                   'descending by post creation_time; closest to true creation-'
+                   'time ordering but empirically associated with account '
+                   'suspensions on this endpoint — opt-in only), "RECENT_ACTIVITY" '
+                   '(sorts by most recent comment/reaction; treated as non-'
+                   'chronological). Other values may be accepted by FB silently.')
+@click.option('--scroll-burst-every', type=int, default=None,
+              help='organic scroll burst every N paginations (default 10, set very high to disable)')
+@click.option('--scroll-burst-min', type=int, default=None,
+              help='minimum scrolls per organic burst (default 2)')
+@click.option('--scroll-burst-max', type=int, default=None,
+              help='maximum scrolls per organic burst (default 5)')
+@click.option('--max-paginations', type=int, default=None,
+              help='safety cap on paginations per session (default -1 = no cap)')
+@click.option('--max-posts', type=int, default=None,
+              help='cap on total accumulated posts (default -1 = no cap). '
+                   'Checked at batch boundaries, so actual count can exceed '
+                   'by up to pagination_count-1.')
+@click.option('--pagination-sleep-mean', type=float, default=None,
+              help='mean inter-pagination sleep seconds (default 2.5)')
+@click.option('--pagination-sleep-std', type=float, default=None,
+              help='std dev of inter-pagination sleep (default 0.5)')
+@click.option('--template-capture-timeout', type=float, default=None,
+              help='max seconds to wait for first GroupsCometFeedRegularStoriesPaginationQuery (default 20)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the group, before bootstrap scroll (default 3)')
+@click.option('--request-timeout-ms', type=int, default=None,
+              help='per-request timeout for page.request.post in milliseconds (default 30000)')
+@click.option('--max-no-progress-streak', type=int, default=None,
+              help='bail after N consecutive paginations with no new posts (default 30)')
+@click.option('--max-consecutive-out-of-range', type=int, default=None,
+              help='bail after N posts in a row outside [start_date, end_date] '
+                   '(default 20). Primary date-tail stop under non-chronological '
+                   'sorts (TOP_POSTS, RECENT_ACTIVITY) where oldest-in-batch is '
+                   'unreliable; kept enabled on CHRONOLOGICAL too as belt-and-'
+                   'suspenders against bootstrap-edge highlights. -1 disables.')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 900)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up instead of '
+                   'raising NoAccountError when the pool is empty/locked.')
+@click.option('--skip-existing', is_flag=True,
+              help='Skip targets whose output JSON file already exists in --output-dir.')
+@click.option('--continue', 'continue_', is_flag=True,
+              help='For each target, if a matching output file exists in '
+                   '--output-dir, resume the scrape from its `last_cursor` and '
+                   'seed the dedup set with its post_ids. New posts are merged '
+                   'into the existing file. Mutually exclusive with '
+                   '--skip-existing. Per FB docs, cursors are ephemeral '
+                   '(server-side state), so a stale cursor may yield empty '
+                   'results or trip the cursor-reset detector — partial data '
+                   'is still preserved in either case.')
+@click.pass_context
+def scrape_group_timeline(
+    ctx, handles, input_file, start_date, end_date, output_dir, max_sessions,
+    scroll_threshold, headless, mobile, log_level,
+    pagination_count, sorting_setting, scroll_burst_every, scroll_burst_min,
+    scroll_burst_max, max_paginations, max_posts, pagination_sleep_mean,
+    pagination_sleep_std, template_capture_timeout, post_nav_sleep_seconds,
+    request_timeout_ms, max_no_progress_streak, max_consecutive_out_of_range,
+    operation_timeout_seconds, wait_for_account, skip_existing, continue_,
+):
+    """Scrape a group's feed between two dates (hybrid mode only).
+
+    \b
+    Examples:
+      fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 --end-date 2025-01-01
+      fbscrape scrape group-timeline 787909081545196 --start-date 2024-01-01
+
+    \b
+    Read targets from a file:
+      fbscrape scrape group-timeline --input-file groups.csv
+
+    Notes:
+      - `handle` accepts a vanity group handle OR the numeric group id.
+      - GraphQL has no server-side date filter for group feeds, so
+        --end-date is advisory; termination relies on client-side stop
+        conditions (oldest-in-batch on CHRONOLOGICAL, consecutive-out-of-
+        range on non-chronological sorts).
+      - Default --sorting-setting is "TOP_POSTS" (matches FB's UI;
+        empirically safer than CHRONOLOGICAL for sustained scraping).
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    if skip_existing and continue_:
+        raise click.UsageError(
+            "--skip-existing and --continue are mutually exclusive: one drops "
+            "targets that already have output, the other resumes them. Pick one."
+        )
+
+    mode = 'hybrid'  # Only mode supported for GroupTimeline.
+    targets = _resolve_targets(handles, input_file, start_date, end_date)
+
+    if output_dir is None:
+        starts = [t['start_date'] for t in targets]
+        ends = [t['end_date'] for t in targets]
+        output_dir = os.path.join(
+            get_home_dir_path(), "data", "posts",
+            f"{min(starts)}_{max(ends)}",
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    if skip_existing:
+        before = len(targets)
+        targets = [
+            t for t in targets
+            if not os.path.exists(os.path.join(
+                output_dir,
+                f"{t['handle'].replace('.', '_')}"
+                f"_GroupTimeline_{mode}"
+                f"_{t['start_date']}_{t['end_date']}.json",)
+            ) and not os.path.exists(os.path.join(
+                output_dir,
+                f"{t['handle'].replace('.', '_')}"
+                f"_GroupTimeline_{mode}"
+                f"_{t['start_date']}_{t['end_date']}.json.gz")
+            )
+        ]
+        skipped = before - len(targets)
+        if skipped:
+            logger.info(f"--skip-existing: {skipped}/{before} targets already have output files in {output_dir}")
+        if not targets:
+            logger.info("Nothing to scrape.")
+            return
+
+    mode_params = {
+        "pagination_count": pagination_count,
+        "sorting_setting": sorting_setting,
+        "scroll_burst_every": scroll_burst_every,
+        "max_paginations": max_paginations,
+        "max_posts": max_posts,
+        "pagination_sleep_mean": pagination_sleep_mean,
+        "pagination_sleep_std": pagination_sleep_std,
+        "template_capture_timeout": template_capture_timeout,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "request_timeout_ms": request_timeout_ms,
+        "max_no_progress_streak": max_no_progress_streak,
+        "max_consecutive_out_of_range": max_consecutive_out_of_range,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    if scroll_burst_min is not None or scroll_burst_max is not None:
+        from .models import Query
+        default_min, default_max = Query.ENDPOINT_REGISTRY["GroupTimeline"]["modes"]["hybrid"]["params"]["scroll_burst_size_range"]
+        mode_params["scroll_burst_size_range"] = (
+            scroll_burst_min if scroll_burst_min is not None else default_min,
+            scroll_burst_max if scroll_burst_max is not None else default_max,
+        )
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    def _existing_output_path(target: dict) -> str | None:
+        """Return path to a prior `.json` / `.json.gz` for this target, or None."""
+        stem = (
+            f"{target['handle'].replace('.', '_')}"
+            f"_GroupTimeline_{mode}"
+            f"_{target['start_date']}_{target['end_date']}"
+        )
+        for ext in ('.json.gz', '.json'):
+            p = os.path.join(output_dir, f"{stem}{ext}")
+            if os.path.exists(p):
+                return p
+        return None
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.group_timeline(
+                    handle=t['handle'],
+                    start_date=t['start_date'],
+                    end_date=t['end_date'],
+                    resume_from=_existing_output_path(t) if continue_ else None,
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+                stem = (
+                    f"{handle.replace('.', '_')}"
+                    f"_{data.query.endpoint}_{data.query.mode}"
+                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}"
+                )
+                # Merge prior data when --continue resumed this target. Re-
+                # discover the file by stem (it hasn't been overwritten yet —
+                # the new scrape's save() runs below).
+                if continue_:
+                    prior = None
+                    for ext in ('.json.gz', '.json'):
+                        p = os.path.join(output_dir, f"{stem}{ext}")
+                        if os.path.exists(p):
+                            with _open_scrape_input(p) as f:
+                                prior = json.load(f)
+                            break
+                    if prior is not None:
+                        prior_data = prior.get('data') or prior.get('posts') or []
+                        if prior_data:
+                            data.data = prior_data + data.data
+                            logger.info(
+                                f"@{handle}: merged {len(prior_data)} prior + "
+                                f"{len(data.data) - len(prior_data)} new posts "
+                                f"(total {len(data.data)})"
+                            )
+                # Auto-unstick: see scrape user-timeline for the rationale.
+                # When --continue bails on no_new_posts_streak, swap to a
+                # deeper anchor (rank #3 oldest cursored post) so the next
+                # --continue can break the dedup loop.
+                if continue_ and data.result == 'no_new_posts_streak':
+                    chosen = _find_unstick_cursor(
+                        data.data, endpoint=data.query.endpoint, rank=3,
+                    )
+                    if chosen:
+                        new_cursor, diag = chosen
+                        chosen_iso = datetime.fromtimestamp(
+                            diag["chosen_created_at"], tz=timezone.utc,
+                        ).isoformat()
+                        logger.info(
+                            f"@{handle}: no_new_posts_streak on --continue resume — "
+                            f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
+                            f"data[{diag['chosen_idx']}] @ {chosen_iso}"
+                        )
+                        data.last_cursor = new_cursor
+                data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
 
     run_async(_scrape())
 
@@ -1192,6 +1598,10 @@ def _resolve_handle_pair_targets(
               help='[hybrid] maximum scrolls per organic burst (default 5)')
 @click.option('--max-paginations', type=int, default=None,
               help='[hybrid] safety cap on paginations per session (default -1 = no cap)')
+@click.option('--max-posts', type=int, default=None,
+              help='[hybrid] cap on total accumulated posts (default -1 = no cap). '
+                   'Checked at batch boundaries, so actual count can exceed by up '
+                   'to pagination_count-1.')
 @click.option('--pagination-sleep-mean', type=float, default=None,
               help='[hybrid] mean inter-pagination sleep seconds (default 2.5)')
 @click.option('--pagination-sleep-std', type=float, default=None,
@@ -1216,7 +1626,7 @@ def scrape_search(
     ctx, queries, input_file, start_date, end_date, output_dir, max_sessions,
     scroll_threshold, headless, mobile, log_level,
     pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
-    max_paginations, pagination_sleep_mean, pagination_sleep_std,
+    max_paginations, max_posts, pagination_sleep_mean, pagination_sleep_std,
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
     skip_existing,
@@ -1282,6 +1692,7 @@ def scrape_search(
         "pagination_count": pagination_count,
         "scroll_burst_every": scroll_burst_every,
         "max_paginations": max_paginations,
+        "max_posts": max_posts,
         "pagination_sleep_mean": pagination_sleep_mean,
         "pagination_sleep_std": pagination_sleep_std,
         "template_capture_timeout": template_capture_timeout,
@@ -1800,6 +2211,119 @@ def flatten(input_path, output, fmt, concat, endpoint):
     click.echo(f"\nTotal: {total_out}/{total_in} records flattened")
 
 
+@cli.command(name='unstick-cursor')
+@click.argument('paths', nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option('--rank', type=int, default=3, show_default=True,
+              help='Anchor at the Nth chronologically-oldest post with a cursor. '
+                   'Default 3 skips the rank-1 post (often a bootstrap-edge '
+                   'highlight outlier) and gives a small buffer. Higher = '
+                   'anchor deeper into the file.')
+@click.option('--only-if-stuck', is_flag=True,
+              help='Only modify files whose result == "no_new_posts_streak". '
+                   'Files with other results are reported and skipped.')
+@click.option('--dry-run', is_flag=True,
+              help='Show the swap that would happen without writing the file.')
+@click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
+def unstick_cursor(paths, rank, only_if_stuck, dry_run, log_level):
+    """Unstick a saved scrape's last_cursor by swapping it to the per-edge
+    cursor of a deeper post in the file.
+
+    \b
+    Use when a --continue scrape is deadlocked — i.e., it consistently bails
+    on no_new_posts_streak because the saved cursor anchors at a position
+    where FB serves only posts already in the file's dedup seed. The fix
+    picks a chronologically-deeper anchor (default: 3rd-oldest cursored post)
+    so the next --continue resumes past the dedup wall and into uncovered
+    territory.
+
+    \b
+    Examples:
+      fbscrape unstick-cursor data/posts/foo.json.gz
+      fbscrape unstick-cursor data/posts/*.json.gz --only-if-stuck
+      fbscrape unstick-cursor foo.json.gz --rank 5 --dry-run
+
+    \b
+    Schema requirements (transparent — no checks needed before running):
+      - File must be a ScrapingResult JSON (gzipped or plain).
+      - File must have at least `rank` posts with parseable creation_time
+        and a per-edge `cursor` field.
+    """
+    import hashlib
+    from .logger import set_log_level, logger
+    set_log_level(log_level)
+
+    fixed: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    errored: list[tuple[str, str]] = []
+
+    for path in paths:
+        try:
+            with _open_scrape_input(path) as f:
+                d = json.load(f)
+        except Exception as e:
+            errored.append((path, f"failed to load: {e}"))
+            click.echo(f"[ERROR] {path}: {e}")
+            continue
+
+        result = d.get('result')
+        endpoint = (d.get('query') or {}).get('endpoint') or 'GroupTimeline'
+
+        if only_if_stuck and result != 'no_new_posts_streak':
+            skipped.append((path, f"result={result!r}"))
+            click.echo(f"[skip ] {path}  (result={result!r}; --only-if-stuck specified)")
+            continue
+
+        data = d.get('data') or d.get('posts') or []
+        chosen = _find_unstick_cursor(data, endpoint=endpoint, rank=rank)
+        if chosen is None:
+            msg = f"no cursored post at or beyond rank #{rank} (data has {len(data)} entries)"
+            errored.append((path, msg))
+            click.echo(f"[ERROR] {path}: {msg}")
+            continue
+
+        new_cursor, diag = chosen
+        old_lc = d.get('last_cursor')
+        old_fp = hashlib.sha1(old_lc.encode()).hexdigest()[:8] if old_lc else '<null>'
+        new_fp = hashlib.sha1(new_cursor.encode()).hexdigest()[:8]
+        chosen_iso = datetime.fromtimestamp(
+            diag["chosen_created_at"], tz=timezone.utc
+        ).isoformat()
+
+        if dry_run:
+            click.echo(
+                f"[dry  ] {path}\n"
+                f"        result={result!r}  posts={len(data)}\n"
+                f"        would anchor: rank #{diag['chosen_rank']}, "
+                f"data[{diag['chosen_idx']}] @ {chosen_iso}\n"
+                f"        last_cursor: {old_fp} → {new_fp}"
+            )
+            continue
+
+        d['last_cursor'] = new_cursor
+        # Write back with the same compression as input.
+        if path.endswith('.gz'):
+            with gzip.open(path, 'wt') as f:
+                json.dump(d, f, indent=2)
+        else:
+            with open(path, 'w') as f:
+                json.dump(d, f, indent=2)
+
+        fixed.append(path)
+        click.echo(
+            f"[FIXED] {path}\n"
+            f"        result={result!r}  posts={len(data)}\n"
+            f"        anchor: rank #{diag['chosen_rank']}, "
+            f"data[{diag['chosen_idx']}] @ {chosen_iso}\n"
+            f"        last_cursor: {old_fp} → {new_fp}"
+        )
+
+    click.echo("")
+    click.echo(f"=== Summary ===")
+    click.echo(f"  fixed   : {len(fixed)}")
+    click.echo(f"  skipped : {len(skipped)}")
+    click.echo(f"  errored : {len(errored)}")
+
+
 @cli.command(name='download-media')
 @click.argument('input_path')
 @click.option('--out-dir', default=None, help='Directory to save media (default: <input_dir>/media/<handle>/)')
@@ -1885,6 +2409,32 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
             click.echo(f"\nGrand total: {totals}")
 
     run_async(_run())
+
+
+@cli.group()
+def utils():
+    """Developer utilities (parse cURL, etc.)."""
+    pass
+
+
+@utils.command(name='parse-curl')
+@click.argument('curl_string')
+@click.option('--full', is_flag=True, default=False,
+              help='Show every header and body field (default: structured summary).')
+@click.option('--raw', is_flag=True, default=False,
+              help='Do not redact Cookie / fb_dtsg / lsd / jazoest.')
+def parse_curl_cmd(curl_string: str, full: bool, raw: bool) -> None:
+    """Parse a cURL command (e.g. copied from DevTools) and print a cleaned view.
+
+    By default, prints a structured GraphQL-aware summary (method/URL,
+    friendly_name, doc_id, decoded `variables` JSON, key headers, and
+    non-telemetry body fields), with Cookie / fb_dtsg / lsd / jazoest
+    redacted. Pass --full for every header and body field; --raw to disable
+    redaction.
+    """
+    from fbscrape.utils import parse_curl, format_parsed_curl
+    parsed = parse_curl(curl_string)
+    click.echo(format_parsed_curl(parsed, full=full, redact=not raw))
 
 
 def main():

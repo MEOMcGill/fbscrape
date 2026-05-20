@@ -227,27 +227,40 @@ class AccountsPool:
 
         logger.info(f"Set active={active} for {identifier if identifier else 'all accounts'}")
 
-    async def lock_until(self, identifier: str | list[str] | None, until: str):
-        """Lock account(s) until given time (for rate limiting)"""
-        logger.debug(f"lock_until({identifier}, {until})")
+    async def lock_until(
+        self,
+        identifier: str | list[str] | None,
+        until: str,
+        error_msg: str | None = None,
+    ):
+        """Lock account(s) until given time (for rate limiting).
+
+        When `error_msg` is provided, also writes it to the account's
+        `error_msg` column so the DB record explains *why* the lock is in
+        place — useful for after-the-fact diagnosis when the lock has
+        already expired (the lock state is cleared, but the error_msg
+        persists until something else overwrites it).
+        """
+        logger.debug(f"lock_until({identifier}, {until}, error_msg={error_msg!r})")
         identifiers = identifier if isinstance(identifier, list) else [identifier] if identifier else []
 
-        if not identifiers:
-            qs = f"""
-            UPDATE accounts SET
-                locks = json_set(locks, '$.locked_until', {until}),
-                last_used = datetime({utc.ts()}, 'unixepoch')
-            WHERE TRUE
-            """
-        else:
-            qs = f"""
-            UPDATE accounts SET
-                locks = json_set(locks, '$.locked_until', {until}),
-                last_used = datetime({utc.ts()}, 'unixepoch')
-            WHERE {self._identifiers_condition(identifiers)}
-            """
+        # `until` is an SQL expression (interpolated, not parameterised);
+        # error_msg is a user-supplied string and goes through proper
+        # parameter binding.
+        set_clause = (
+            f"locks = json_set(locks, '$.locked_until', {until}),\n"
+            f"                last_used = datetime({utc.ts()}, 'unixepoch')"
+        )
+        if error_msg is not None:
+            set_clause += ",\n                error_msg = :error_msg"
 
-        await execute(self._db_file, qs)
+        if not identifiers:
+            qs = f"UPDATE accounts SET {set_clause} WHERE TRUE"
+        else:
+            qs = f"UPDATE accounts SET {set_clause} WHERE {self._identifiers_condition(identifiers)}"
+
+        params = {"error_msg": error_msg} if error_msg is not None else None
+        await execute(self._db_file, qs, params)
 
     async def unlock(self, identifier: str | list[str] | None):
         """Unlock account(s) - remove rate limit lock"""

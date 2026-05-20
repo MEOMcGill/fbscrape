@@ -1,0 +1,31 @@
+{
+  "query": {
+    "endpoint": "Search",
+    "mode": "hybrid",
+    "query": {
+      "query_text": "mark zuckerberg",
+      "start_date": "2025-06-01",
+      "end_date": "2025-07-01"
+    },
+    "params": {
+      "pagination_count": 5,
+      "scroll_burst_every": 30,
+      "scroll_burst_size_range": [
+        2,
+        5
+      ],
+      "pagination_sleep_mean": 2.5,
+      "pagination_sleep_std": 0.5,
+      "template_capture_timeout": 20.0,
+      "max_paginations": -1,
+      "post_nav_sleep_seconds": 3.0,
+      "request_timeout_ms": 30000,
+      "max_no_progress_streak": 5,
+      "operation_timeout_seconds": 900
+    }
+  },
+  "result": "template_capture_timeout",
+  "data": [],
+  "time_started": "2026-05-14 19:33:14.829912+00:00",
+  "time_taken": "0:00:26.806735"
+}

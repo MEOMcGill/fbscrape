@@ -13,7 +13,7 @@ __pycache__
 auth/*
 db
 meo_facebook_scraper_config.cfg
-#tmp
+tmp
 tmp/creepjs_results
 tmp/hybrid
 tmp/endpoint_additions

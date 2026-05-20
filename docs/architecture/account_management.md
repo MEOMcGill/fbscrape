@@ -128,8 +128,9 @@ detector → worker handler → final state.
 
 | Exception | Raised by | DB written by | Worker handler | End state | retry++ |
 |---|---|---|---|---|---|
-| `AccountDisabledError` | `browser_session.py:512` (`_wait_for_log_in_outcome` on `/checkpoint/disabled/`) | detector via `set_active(False, "Account disabled by Facebook (…)")` | `worker.py:282` → `rotate_account()` only | **Inactive** | **No** (dead account doesn't burn retry budget) |
-| `CheckpointError` | `browser_session.py:518` (`_wait_for_log_in_outcome` on other `/checkpoint/`) | detector via `set_active(False, "Checkpoint challenge — manual intervention required (…)")` | `worker.py:292` → `rotate_account()` | Inactive | Yes |
+| `AccountDisabledError` | `login.py:_wait_for_log_in_outcome` on `/checkpoint/disabled/` | detector via `set_active(False, "Account disabled by Facebook (…)")` | `worker.py` → `rotate_account()` only | **Inactive** | **No** (dead account doesn't burn retry budget) |
+| `AutomationCheckpointError` | `login.py:_dispatch_login_outcome` on `/checkpoint/<id>/` + page body matches `_is_automation_suspected_checkpoint` ("suspect automated behavior") | none (worker writes) | `worker.py` → `rotate_account(lock_until='+24 hours', error_msg='automation suspected …')` | **Active**, locked +24h | Yes |
+| `CheckpointError` | `login.py:_wait_for_log_in_outcome` on other `/checkpoint/` (after automation refinement) | detector via `set_active(False, "Checkpoint challenge — manual intervention required (…)")` | `worker.py` → `rotate_account()` | Inactive | Yes |
 | `TransientLoginError` | `browser_session.py login()` — internal retry exhausted, "URL never settled", or "viewer never came through" | none (account stays Active) | `worker.py:302` → `rotate_account()` | **Active**, locked +5 min by rotate's cooldown | Yes |
 | `FailedLoginError` (generic) | `browser_session.py:_resolve_not_logged_in` last-resort when `login()` returns False | none (worker writes) | `worker.py:313` → `mark_inactive()` + `rotate_account()` | Inactive | Yes |
 | `AccountBannedError` | scraping methods (e.g., `user_timeline`) | none (worker writes) | `worker.py:326` → `mark_inactive()` + `rotate_account()` | Inactive | Yes |
@@ -143,17 +144,18 @@ FacebookScraperError
 ├── NoAccountError
 ├── FailedLoginError
 │   ├── CheckpointError
-│   │   └── AccountDisabledError
+│   │   ├── AccountDisabledError
+│   │   └── AutomationCheckpointError
 │   └── TransientLoginError
 ├── AccountBannedError
 └── RateLimitError
 ```
 
 The clause order in `worker.execute_task` is **most-specific first**:
-`AccountDisabledError → CheckpointError → TransientLoginError → FailedLoginError
-→ AccountBannedError → RateLimitError`. Reordering will silently break the
-state-machine — the broader subclass catches first and clobbers the
-detector-specific behavior.
+`AccountDisabledError → AutomationCheckpointError → CheckpointError →
+TransientLoginError → FailedLoginError → AccountBannedError → RateLimitError`.
+Reordering will silently break the state-machine — the broader subclass catches
+first and clobbers the detector-specific behavior.
 
 ## Pool Selection Rules
 

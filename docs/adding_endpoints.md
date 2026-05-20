@@ -2,7 +2,7 @@
 
 `fbscrape` is built around an endpoint × mode registry (`Query.ENDPOINT_REGISTRY`). Adding a new scrape target (e.g. `GroupTimeline`, `PageInsights`, `EventGuests`) is a wiring exercise across ~7 files. This guide is opinionated: **hybrid-first**. The scroll-driven `manual` mode exists for `UserTimeline` only and is effectively deprecated — do not add a `manual` mode to new endpoints.
 
-The most recently added endpoint is **`Search`** (`SearchCometResultsPaginatedResultsQuery`). It's the cleanest reference for each touch point — when in doubt, grep for `Search` and copy its shape.
+The most recently added endpoint is **`GroupTimeline`** (`GroupsCometFeedRegularStoriesPaginationQuery`). It's the cleanest reference for date-bounded paginated endpoints where FB enforces no server-side date filter — when in doubt, grep for `GroupTimeline` or `group_timeline` and copy its shape. For an URL-filter-driven paginated reference, see `Search`; for a single-shot reference, see `PageTransparency`.
 
 ---
 
@@ -111,8 +111,11 @@ Seven touch points, in order. `Search` is the gold-standard example for each.
 ## Common gotchas
 
 - **Response is JSONL not JSON.** Hybrid responses are often newline-delimited (`{"data":...}\n{"data":...}`). The existing parser handles both via `parse_json_or_jsonl`. Save responses with `.jsonl` extension when that's the case.
+- **Edge-container fan-out.** FB delivers paginated batches as one *bootstrap* line (`data.node = <Container>` with `edges[].node = Story`, possibly multiple stories) plus N *stream* lines (`data.node = Story` directly). `parse_timeline_response` fans both shapes into one entry per Story; if your endpoint uses a new container key, add it to `FacebookGraphQLParser._STORY_EDGE_CONTAINERS` (e.g. `timeline_list_feed_units` for UserTimeline, `group_feed` for GroupTimeline).
 - **Token splicing.** `__csr` / `__dyn` are HasteBitMap telemetry that need to be the freshest values from any natural GraphQL POST. The interceptor tracks them globally (`latest_csr` / `latest_dyn`); your hybrid method just splices them into replay bodies. See Key Design Decision 14 in CLAUDE.md.
 - **Bootstrap scroll.** Most endpoints don't fire their GraphQL query on raw navigation — they need at least one scroll. See the feedback memory in CLAUDE.md.
-- **`cursor=null` + `beforeTime` always set.** For date-filtered endpoints, mirror FB's UI exactly. See Key Design Decision 12 in CLAUDE.md.
+- **`cursor=null` + `beforeTime` always set.** For *server-side* date-filtered endpoints, mirror FB's UI exactly. See Key Design Decision 12 in CLAUDE.md. **Note:** not all paginated endpoints expose a `beforeTime` variable — GroupTimeline doesn't. When the GraphQL has no date filter, pass `end_unix=<value>, inject_before_time=False` to `_hybrid_pagination_loop` — `end_unix` still flows into the date-bound stop conditions (`OldestInBatchBelowStartDate`, `ConsecutiveOutOfRange`) but is NOT injected into the request body, so FB doesn't see an unrecognized variable.
 - **`afterTime=null`.** FB's UI never sets this; including a non-null value is a fingerprint. Leave it as captured.
-- **CLAUDE.md drift.** When the endpoint is added, update CLAUDE.md so future-Claude has accurate context (the "Today: only `UserTimeline` is registered" type lines).
+- **Choose your sort carefully.** FB's UI default sort is often algorithmic (`TOP_POSTS`, `MOST_RELEVANT`, …). For GroupTimeline, empirically the chronological sort (`CHRONOLOGICAL`) correlates with FB suspending accounts on the endpoint — even though it's the cleanest sort for date-bounded scraping. Default to FB's UI choice (lowest fingerprint) and let the `StopCondition` framework handle non-monotonic ordering via `ConsecutiveOutOfRange`. The default condition set in `stop_conditions.assemble_default_stop_conditions` is sort-aware: non-chronological sorts drop `OldestInBatchBelowStartDate` and `CursorReset` (premises don't hold) and add `ConsecutiveOutOfRange` instead.
+- **No multi-leg cursor_reset resume without a server-side date filter.** UserTimeline can resume after `cursor_reset` by advancing `end_date` because `beforeTime` filters server-side. For endpoints without that (GroupTimeline), `cursor_reset` is terminal — the scraper wrapper should NOT loop on it; just preserve partial data.
+- **CLAUDE.md drift.** When the endpoint is added, update CLAUDE.md so future-Claude has accurate context (the "Today's registered endpoints: …" line + the per-endpoint strategy section).

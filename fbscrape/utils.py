@@ -5,6 +5,8 @@ import base64
 import dataclasses
 import os
 import platform
+import shlex
+import urllib.parse
 from pathlib import Path
 import re
 import requests
@@ -328,6 +330,271 @@ def save_jsonl(path: str, data: list[dict]) -> None:
 async def gather(coros):
     for c in asyncio.as_completed(list(coros)):
         yield await c
+
+
+# ============== cURL parser ==============
+
+# Flags whose argument we keep / use.
+_CURL_VALUE_FLAGS_METHOD = {"-X", "--request"}
+_CURL_VALUE_FLAGS_HEADER = {"-H", "--header"}
+_CURL_VALUE_FLAGS_DATA = {"-d", "--data", "--data-raw", "--data-binary",
+                          "--data-urlencode", "--data-ascii"}
+_CURL_VALUE_FLAGS_COOKIE = {"-b", "--cookie"}
+_CURL_VALUE_FLAGS_USERAGENT = {"-A", "--user-agent"}
+_CURL_VALUE_FLAGS_REFERER = {"-e", "--referer"}
+
+# Flags that take a value but we don't surface (just skip the value).
+_CURL_VALUE_FLAGS_OTHER = {
+    "--url", "--output", "-o", "--max-time", "--connect-timeout",
+    "--proxy", "-x", "--resolve", "--retry", "--cert", "--key",
+    "--cacert", "--capath", "--ciphers", "--user", "-u",
+}
+
+# Boolean / no-value flags we silently ignore.
+_CURL_BOOLEAN_FLAGS = {
+    "--compressed", "--location", "-L", "--insecure", "-k", "--silent",
+    "-s", "--verbose", "-v", "--include", "-i", "--head", "-I",
+    "--fail", "-f", "--show-error", "-S", "--no-buffer", "-N",
+    "--globoff", "-g", "--anyauth", "--basic", "--digest", "--ntlm",
+    "--negotiate", "--http1.0", "--http1.1", "--http2", "--http2-prior-knowledge",
+}
+
+
+def parse_curl(curl_string: str) -> dict:
+    """Parse a cURL command string into a structured dict.
+
+    Supports the multi-line `curl ... \\\n  -H ...` form produced by browser
+    "Copy as cURL" actions. URL-encoded form bodies (Content-Type
+    application/x-www-form-urlencoded, or any body when Content-Type is unset)
+    are decoded into a dict; fields whose values parse as JSON
+    (notably `variables`) are recursively decoded.
+
+    Returns:
+        {
+            "method": "POST",
+            "url": "https://...",
+            "headers": {"Header-Name": "value", ...},
+            "body": {"field": "value" or decoded JSON, ...},  # empty dict if no body
+            "raw_body": "av=...&__user=...",  # original --data-raw verbatim, or ""
+        }
+    """
+    tokens = shlex.split(curl_string, posix=True)
+    if not tokens:
+        raise ValueError("Empty cURL string")
+
+    # Drop the leading `curl` (some pastes drop it; tolerate both).
+    if tokens[0].lower() == "curl":
+        tokens = tokens[1:]
+
+    method: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = {}
+    raw_body: str = ""
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok in _CURL_VALUE_FLAGS_METHOD:
+            i += 1
+            method = tokens[i].upper()
+        elif tok in _CURL_VALUE_FLAGS_HEADER:
+            i += 1
+            name, sep, value = tokens[i].partition(":")
+            if sep:
+                headers[name.strip()] = value.strip()
+        elif tok in _CURL_VALUE_FLAGS_DATA:
+            i += 1
+            # Multiple -d on one command concatenate with &.
+            raw_body = tokens[i] if not raw_body else f"{raw_body}&{tokens[i]}"
+        elif tok in _CURL_VALUE_FLAGS_COOKIE:
+            i += 1
+            headers.setdefault("Cookie", tokens[i])
+        elif tok in _CURL_VALUE_FLAGS_USERAGENT:
+            i += 1
+            headers.setdefault("User-Agent", tokens[i])
+        elif tok in _CURL_VALUE_FLAGS_REFERER:
+            i += 1
+            headers.setdefault("Referer", tokens[i])
+        elif tok in _CURL_VALUE_FLAGS_OTHER:
+            i += 1  # consume value, drop it
+        elif tok in _CURL_BOOLEAN_FLAGS:
+            pass
+        elif tok.startswith("-"):
+            # Unknown long-form `--foo=bar` carries its value inline; bare
+            # unknown flags are skipped without consuming a token.
+            pass
+        else:
+            if url is None:
+                url = tok
+        i += 1
+
+    if url is None:
+        raise ValueError("Could not find URL in cURL string")
+
+    if method is None:
+        method = "POST" if raw_body else "GET"
+
+    body: dict = {}
+    if raw_body:
+        content_type = ""
+        for k, v in headers.items():
+            if k.lower() == "content-type":
+                content_type = v.lower()
+                break
+        if not content_type or "application/x-www-form-urlencoded" in content_type:
+            parsed = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
+            for key, values in parsed.items():
+                value = values[0] if len(values) == 1 else values
+                # Only auto-decode JSON containers/strings — leave scalar form
+                # fields (numeric IDs, flags, etc.) as strings so a numeric
+                # `doc_id` doesn't become a Python int.
+                if isinstance(value, str) and value.startswith(("{", "[", '"')):
+                    try:
+                        value = json.loads(value)
+                    except (ValueError, json.JSONDecodeError):
+                        pass
+                body[key] = value
+
+    return {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body,
+        "raw_body": raw_body,
+    }
+
+
+# ============== cURL formatter ==============
+
+_REDACT_HEADERS = {"cookie"}
+_REDACT_BODY_FIELDS = {"fb_dtsg", "lsd", "jazoest"}
+_REDACTED = "<redacted>"
+
+_TELEMETRY_HEADERS = {
+    "user-agent", "accept", "accept-language", "accept-encoding",
+    "origin", "alt-used", "connection", "sec-fetch-dest", "sec-fetch-mode",
+    "sec-fetch-site", "dnt", "sec-gpc", "x-asbd-id", "pragma", "cache-control",
+    "te", "upgrade-insecure-requests",
+}
+_TELEMETRY_BODY_FIELDS = {
+    "__dyn", "__csr", "__hsdp", "__hblp", "__sjsp", "__s", "__hsi", "__ccg",
+    "__a", "__aaid", "__req", "__rev", "__hs", "__spin_r", "__spin_b", "__spin_t",
+    "__comet_req", "__crn", "dpr", "qpl_active_flow_ids", "fb_api_caller_class",
+    "fb_api_analytics_tags", "server_timestamps",
+}
+_BODY_HEADLINE_FIELDS = ("fb_api_req_friendly_name", "doc_id")
+
+
+def _render_value(v) -> str:
+    """Render a body-field value for printing (JSON-pretty if dict/list)."""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, indent=2, ensure_ascii=False)
+    return str(v)
+
+
+def _format_kv_block(items: list[tuple[str, str]], indent: str = "  ") -> str:
+    lines = []
+    for k, v in items:
+        if "\n" in v:
+            # Multiline value (pretty JSON): print key on its own line, value indented.
+            lines.append(f"{indent}{k}:")
+            for vline in v.splitlines():
+                lines.append(f"{indent}{indent}{vline}")
+        else:
+            lines.append(f"{indent}{k}: {v}")
+    return "\n".join(lines)
+
+
+def format_parsed_curl(parsed: dict, *, full: bool = False, redact: bool = True) -> str:
+    """Render `parse_curl()` output as human-readable text.
+
+    full=False (default) → structured summary: METHOD/URL, friendly_name,
+    doc_id, decoded `variables` JSON, interesting headers, and non-telemetry
+    body fields. Drops fingerprint-only headers (Sec-Fetch-*, User-Agent, ...)
+    and telemetry body blobs (__csr, __dyn, __hsdp, ...).
+
+    full=True → every header and every body field. `variables` is still
+    JSON-pretty-printed since it's the whole point of inspecting these.
+
+    redact=True (default) → Cookie header value and fb_dtsg/lsd/jazoest body
+    values are replaced with <redacted>.
+    """
+    method = parsed.get("method", "GET")
+    url = parsed.get("url", "")
+    headers: dict = parsed.get("headers") or {}
+    body: dict = parsed.get("body") or {}
+
+    def maybe_redact_header(name: str, value: str) -> str:
+        if redact and name.lower() in _REDACT_HEADERS:
+            return _REDACTED
+        return value
+
+    def maybe_redact_body(name: str, value) -> str:
+        if redact and name in _REDACT_BODY_FIELDS:
+            return _REDACTED
+        return _render_value(value)
+
+    out: list[str] = [f"{method} {url}"]
+
+    if full:
+        if headers:
+            out.append("")
+            out.append("headers:")
+            out.append(_format_kv_block(
+                [(k, maybe_redact_header(k, v)) for k, v in headers.items()]
+            ))
+        if body:
+            out.append("")
+            out.append("body:")
+            out.append(_format_kv_block(
+                [(k, maybe_redact_body(k, v)) for k, v in body.items()]
+            ))
+        elif parsed.get("raw_body"):
+            out.append("")
+            out.append("raw_body:")
+            out.append(f"  {parsed['raw_body']}")
+        return "\n".join(out)
+
+    # Structured mode.
+    friendly = body.get("fb_api_req_friendly_name")
+    doc_id = body.get("doc_id")
+    if friendly or doc_id:
+        out.append("")
+        if friendly:
+            out.append(f"friendly_name: {friendly}")
+        if doc_id:
+            out.append(f"doc_id: {doc_id}")
+
+    if "variables" in body:
+        out.append("")
+        out.append("variables:")
+        out.append(_render_value(body["variables"]))
+
+    interesting_headers = [
+        (k, maybe_redact_header(k, v))
+        for k, v in headers.items()
+        if k.lower() not in _TELEMETRY_HEADERS
+    ]
+    if interesting_headers:
+        out.append("")
+        out.append("headers:")
+        out.append(_format_kv_block(interesting_headers))
+
+    other_body_items = [
+        (k, maybe_redact_body(k, v))
+        for k, v in body.items()
+        if k not in _BODY_HEADLINE_FIELDS
+        and k != "variables"
+        and k not in _TELEMETRY_BODY_FIELDS
+    ]
+    if other_body_items:
+        out.append("")
+        out.append("body (other fields):")
+        out.append(_format_kv_block(other_body_items))
+
+    return "\n".join(out)
+
 
 if __name__ == "__main__":
     print(get_home_dir_path())

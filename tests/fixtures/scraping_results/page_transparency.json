@@ -1,0 +1,122 @@
+{
+  "query": {
+    "endpoint": "PageTransparency",
+    "mode": "hybrid",
+    "query": {
+      "page_id": "20531316728"
+    },
+    "params": {
+      "post_nav_sleep_seconds": 3.0,
+      "template_capture_timeout": 20.0,
+      "request_timeout_ms": 30000,
+      "operation_timeout_seconds": 120
+    }
+  },
+  "result": "success",
+  "data": [
+    {
+      "id": "20531316728",
+      "is_viewer_admin": false,
+      "page_type_name_for_content": "PAGE",
+      "pages_transparency_info": {
+        "enabled_features": [
+          "ADMIN_LOCATIONS",
+          "PAGE_CREATION_DATE",
+          "PAGE_NAME_CHANGES",
+          "PAGE_ORGANIZATIONS",
+          "STATE_MEDIA_LABELS"
+        ],
+        "is_person_profile": true,
+        "is_profile_action_report": true,
+        "linked_profile_id": "100064860875397",
+        "should_use_page_rename": true,
+        "transparency_title": "Page transparency",
+        "genai_chatbot_disclosure": null,
+        "id": "dHJhbnNwYXJlbmN5OjIwNTMxMzE2NzI4",
+        "admin_locations": {
+          "admin_country_counts": [
+            {
+              "count": 35,
+              "country": {
+                "iso_name": "United States",
+                "id": "109078688522"
+              }
+            },
+            {
+              "count": 3,
+              "country": {
+                "iso_name": "United Kingdom",
+                "id": "112449756806"
+              }
+            },
+            {
+              "count": 1,
+              "country": {
+                "iso_name": "Netherlands",
+                "id": "92510804409"
+              }
+            }
+          ],
+          "num_opt_out": 0,
+          "num_unknown": 0
+        },
+        "has_active_ads": true,
+        "has_run_political_ads": true,
+        "page_id_for_admin": null,
+        "state_media_country_label": null,
+        "history_items": [
+          {
+            "item_type": "NAME_CHANGE",
+            "event_time": 1654275614,
+            "target_name": "Facebook"
+          },
+          {
+            "item_type": "NAME_CHANGE",
+            "event_time": 1582839171,
+            "target_name": "Facebook App"
+          },
+          {
+            "item_type": "NAME_CHANGE",
+            "event_time": 1582656314,
+            "target_name": "Facebook app"
+          },
+          {
+            "item_type": "NAME_CHANGE",
+            "event_time": 1573577631,
+            "target_name": "Facebook"
+          },
+          {
+            "item_type": "NAME_CHANGE",
+            "event_time": 1573575853,
+            "target_name": "Facebook app"
+          },
+          {
+            "item_type": "CREATION",
+            "event_time": 1194475892,
+            "target_name": "Facebook"
+          }
+        ]
+      },
+      "name": "Facebook",
+      "profile_picture": {
+        "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/380700650_10162533193146729_2379134611963304810_n.jpg?stp=dst-jpg_s200x200_tt6&_nc_cat=1&ccb=1-7&_nc_sid=11a88f&_nc_ohc=fIut_8AcZj0Q7kNvwE__Y1L&_nc_oc=Adr_VlOHE5sfW2Zy7OKpeaBVumoCibBbNMhJtxqup6W_idKjK2B2ZMPXjLj08kp6KrU&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=rgVUzESzOUeOTzunehqs8w&_nc_ss=732a8&oh=00_Af5QFEi8dqTEZ74RPm_pbUL6-3mHS1Wp8cJg8fSZTVV0fA&oe=6A0BFC4E"
+      },
+      "profile_plus_for_delegate_page": {
+        "category_text": "Internet company",
+        "id": "100064860875397"
+      },
+      "verification_status": "BLUE_VERIFIED",
+      "confirmed_page_owner_consumer": {
+        "name": null,
+        "information": null,
+        "type": "NONE",
+        "id": null
+      },
+      "confirmed_page_partner_names": [],
+      "page_transparency_settings_uri": "/20531316728/settings/?tab=page_transparency",
+      "should_show_responsible_for_org_content": true
+    }
+  ],
+  "time_started": "2026-05-14 19:32:55.927766+00:00",
+  "time_taken": "0:00:05.788278"
+}

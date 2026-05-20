@@ -34,6 +34,16 @@ class AccountDisabledError(CheckpointError):
     pass
 
 
+class AutomationCheckpointError(CheckpointError):
+    """Facebook redirected to /checkpoint/<id>/ with the 'We suspect automated
+    behavior on your account' challenge. Distinct from generic CheckpointError:
+    Facebook is signaling it sees the account as a bot. Worker locks the
+    account 24h + rotates; account stays `active=True` so it can be re-tried
+    after the lock (recoverable in principle via password change / device
+    verification on the human-facing side)."""
+    pass
+
+
 class TransientLoginError(FailedLoginError):
     """An unexpected error during the login form flow that is *likely* transient
     (playwright element-not-found, page timeout, browser flake). Subclass of

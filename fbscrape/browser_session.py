@@ -14,6 +14,12 @@ from .utils import (
 from .exceptions import (
     FailedLoginError, AccountBannedError, RateLimitError, RendererHangError,
 )
+from .stop_conditions import (
+    StopCondition,
+    StopState,
+    assemble_default_stop_conditions,
+    HYBRID_CURSOR_RESET_WINDOW,
+)
 from . import login as _login
 
 import asyncio
@@ -39,17 +45,20 @@ HYBRID_HEADER_DROP = frozenset({
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
+GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME = "GroupsCometFeedRegularStoriesPaginationQuery"
 PAGE_TRANSPARENCY_FRIENDLY_NAME = "ProfileTransparencyDialogQuery"
 PROFILE_AUTHENTICITY_FRIENDLY_NAME = "ProfileCometDirectoryAuthenticityModalQuery"
+
+# Empirically-validated enum values for the GroupsCometFeed `sortingSetting`
+# variable. Default lives in Query.ENDPOINT_REGISTRY; this tuple just
+# documents what's known to be accepted. Kept as a module-level constant
+# so the CLI help text stays in sync. Other values may also be accepted
+# silently by FB — the param is passed through as-is, no validation.
+GROUP_TIMELINE_SORTING_SETTINGS = ("CHRONOLOGICAL", "RECENT_ACTIVITY", "TOP_POSTS")
 
 # Bump when FB ships a schema update to the persisted query.
 PAGE_TRANSPARENCY_DOC_ID = "35170702705850131"
 PROFILE_AUTHENTICITY_DOC_ID = "26932128459750707"
-
-HYBRID_CURSOR_RESET_WINDOW = 20
-HYBRID_CURSOR_RESET_JUMP_SECONDS = 7 * 86400
-HYBRID_CURSOR_RESET_DUMP_ROOT = "tmp/hybrid/cursor_reset"
-
 
 class BrowserSession:
     """Manages browser session and page navigation."""
@@ -459,6 +468,9 @@ class BrowserSession:
         pagination_sleep_std: float = 0.5,
         template_capture_timeout: float = 20.0,
         max_paginations: int = 10000,
+        max_posts: int = -1,
+        initial_cursor: str = "",
+        seen_post_ids_to_skip: list | None = None,
         post_nav_sleep_seconds: float = 3.0,
         request_timeout_ms: int = 30000,
         max_no_progress_streak: int = 5,
@@ -500,6 +512,7 @@ class BrowserSession:
             "pagination_sleep_mean": pagination_sleep_mean,
             "pagination_sleep_std": pagination_sleep_std,
             "max_paginations": max_paginations,
+            "max_posts": max_posts,
             "max_no_progress_streak": max_no_progress_streak,
             "request_timeout_ms": request_timeout_ms,
             "operation_timeout_seconds": operation_timeout_seconds,
@@ -508,6 +521,20 @@ class BrowserSession:
         self.response_interceptor.flush()
         # All posts come from explicit replays; ignore natural PCTFRQ bodies which carry no date filters.
         self.response_interceptor.extract_posts = False
+
+        # Resume seed (mirrors group_timeline_hybrid). Must run AFTER flush()
+        # (which clears seen_post_ids) and BEFORE the loop.
+        if seen_post_ids_to_skip:
+            self.response_interceptor.seen_post_ids.update(seen_post_ids_to_skip)
+            logger.info(
+                f"[hybrid] @{handle}: seeded {len(seen_post_ids_to_skip)} "
+                f"post_ids into dedup set for resume"
+            )
+        if initial_cursor:
+            logger.info(
+                f"[hybrid] @{handle}: resuming from cursor "
+                f"{self._hybrid_cursor_fp(initial_cursor)}"
+            )
 
         # Phase 1 — navigate
         error = await self._hybrid_navigate(
@@ -520,7 +547,8 @@ class BrowserSession:
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
             )
 
         # Phase 2 — bootstrap scroll
@@ -530,7 +558,8 @@ class BrowserSession:
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
             )
 
         # Phase 3 — capture pagination template
@@ -543,7 +572,8 @@ class BrowserSession:
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
             )
         logger.info(
             f"[hybrid] @{handle}: template captured "
@@ -551,18 +581,20 @@ class BrowserSession:
         )
 
         # Phase 4 — pagination loop
-        result_str = await self._hybrid_pagination_loop(
+        result_str, next_cursor = await self._hybrid_pagination_loop(
             label=handle,
             template=template,
             params=loop_params,
             start_unix=start_unix,
             end_unix=end_unix,
+            initial_cursor=initial_cursor or None,
         )
         return ScrapeOutcome(
             result=result_str,
             data=self.response_interceptor.get_posts(),
             time_started=scrape_start_time,
-            time_taken=datetime.now(timezone.utc) - scrape_start_time
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            last_cursor=next_cursor,
         )
 
     async def search_hybrid(
@@ -577,6 +609,7 @@ class BrowserSession:
         pagination_sleep_std: float = 0.5,
         template_capture_timeout: float = 20.0,
         max_paginations: int = -1,
+        max_posts: int = -1,
         post_nav_sleep_seconds: float = 3.0,
         request_timeout_ms: int = 30000,
         max_no_progress_streak: int = 5,
@@ -611,6 +644,7 @@ class BrowserSession:
             "pagination_sleep_mean": pagination_sleep_mean,
             "pagination_sleep_std": pagination_sleep_std,
             "max_paginations": max_paginations,
+            "max_posts": max_posts,
             "max_no_progress_streak": max_no_progress_streak,
             "request_timeout_ms": request_timeout_ms,
             "operation_timeout_seconds": operation_timeout_seconds,
@@ -664,7 +698,7 @@ class BrowserSession:
         )
 
         # Phase 4 — pagination loop. URL filter is the date authority, so leave start/end_unix unset.
-        result_str = await self._hybrid_pagination_loop(
+        result_str, next_cursor = await self._hybrid_pagination_loop(
             label=query_text,
             template=template,
             params=loop_params,
@@ -673,7 +707,215 @@ class BrowserSession:
             result=result_str,
             data=self.response_interceptor.get_posts(),
             time_started=scrape_start_time,
-            time_taken=datetime.now(timezone.utc) - scrape_start_time
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            last_cursor=next_cursor,
+        )
+
+    async def group_timeline_hybrid(
+        self,
+        handle: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        pagination_count: int = 3,
+        sorting_setting: str = "TOP_POSTS",
+        scroll_burst_every: int = 10,
+        scroll_burst_size_range: tuple[int, int] = (2, 5),
+        pagination_sleep_mean: float = 2.5,
+        pagination_sleep_std: float = 0.5,
+        template_capture_timeout: float = 20.0,
+        max_paginations: int = -1,
+        max_posts: int = -1,
+        initial_cursor: str = "",
+        seen_post_ids_to_skip: list | None = None,
+        post_nav_sleep_seconds: float = 3.0,
+        request_timeout_ms: int = 30000,
+        max_no_progress_streak: int = 5,
+        max_consecutive_out_of_range: int = 20,
+        operation_timeout_seconds: float = 900,
+    ) -> ScrapeOutcome:
+        """Scrape a group's feed by replaying GroupsCometFeedRegularStoriesPaginationQuery.
+
+        Differences from `user_timeline_hybrid`:
+          - Navigates to `/groups/<handle>/` (accepts vanity or numeric id;
+            FB redirects either to the canonical group URL).
+          - The GraphQL variables carry no `beforeTime` / `afterTime` filter —
+            FB has no server-side date filter for group feeds. Termination
+            is purely client-side: oldest in-batch creation_time vs.
+            `start_unix`. `end_date` is therefore advisory (it only bounds
+            the loop's stop check; FB always returns from the current head
+            of feed when cursor is null).
+          - `sortingSetting` is overridden on every replay (default
+            `TOP_POSTS`, matching FB's UI). Empirically, `CHRONOLOGICAL`
+            scrapes correlate with account suspensions on this endpoint;
+            TOP_POSTS is the lowest-fingerprint choice. Termination under
+            TOP_POSTS relies on `ConsecutiveOutOfRange` (default 20) since
+            posts arrive non-monotonically — see `assemble_default_stop_conditions`.
+          - The captured `variables.id` (numeric group id) is inherited from
+            the natural request, so callers may pass either the vanity
+            handle or the numeric id as `handle`.
+
+        Args:
+            handle: Vanity group handle (e.g. "albertaseparatism") or the
+                numeric group id. Used for the `/groups/<handle>/` URL.
+            start_date / end_date: YYYY-MM-DD (inputs are not re-validated here).
+            sorting_setting: Value to send as `variables.sortingSetting`.
+                Known-valid (default `"TOP_POSTS"`):
+                  - `"TOP_POSTS"` — FB UI default; algorithmic ranking.
+                    Termination via `ConsecutiveOutOfRange`. Lowest-fingerprint
+                    and the empirically safer choice for sustained scraping.
+                  - `"CHRONOLOGICAL"` — stream-line tail is descending by
+                    post creation_time. Closest to true creation-time
+                    ordering but empirically associated with bans on this
+                    endpoint — opt-in only. Termination via both
+                    `OldestInBatchBelowStartDate` and `ConsecutiveOutOfRange`.
+                  - `"RECENT_ACTIVITY"` — sorts by most recent comment /
+                    reaction; treated as non-chronological.
+                Other values may be accepted by FB silently.
+            max_consecutive_out_of_range: N posts in a row outside
+                `[start_unix, end_unix]` → bail with `consecutive_out_of_range`.
+                Primary date-tail stop under non-chronological sorts; -1
+                disables.
+            initial_cursor: When non-empty, the loop starts from this
+                cursor instead of `null` (iter 1 is skipped) — used by the
+                `--continue` resume path. Per FB's own docs, cursors are
+                ephemeral; if FB rejects it the existing stop conditions
+                handle the fallout (cursor_reset, no_new_posts_streak,
+                etc.).
+            seen_post_ids_to_skip: Optional iterable of `post_id` strings
+                to seed `ResponseInterceptor.seen_post_ids` with before the
+                loop starts. Prevents previously-collected posts from
+                being re-added when a resume run re-encounters them in
+                the bootstrap edge.
+
+        Returns:
+            ScrapeOutcome.
+        """
+        self.endpoint = "GroupTimeline"
+        logger.info(
+            f"[hybrid] group @{handle}: starting hybrid scrape "
+            f"({start_date} → {end_date}, count={pagination_count}, "
+            f"sort={sorting_setting})"
+        )
+
+        target_url = f"https://www.facebook.com/groups/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start_unix = int(start_datetime.timestamp())
+        # Upper bound for ConsecutiveOutOfRange — capped at now (FB can't
+        # return future posts, but matches UserTimeline's computation).
+        end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
+        now_utc = datetime.now(timezone.utc)
+        end_unix = int(min(end_of_day, now_utc).timestamp())
+
+        loop_params = {
+            "pagination_count": pagination_count,
+            "scroll_burst_every": scroll_burst_every,
+            "scroll_burst_size_range": scroll_burst_size_range,
+            "pagination_sleep_mean": pagination_sleep_mean,
+            "pagination_sleep_std": pagination_sleep_std,
+            "max_paginations": max_paginations,
+            "max_posts": max_posts,
+            "max_no_progress_streak": max_no_progress_streak,
+            "max_consecutive_out_of_range": max_consecutive_out_of_range,
+            "request_timeout_ms": request_timeout_ms,
+            "operation_timeout_seconds": operation_timeout_seconds,
+        }
+
+        self.response_interceptor.flush()
+        # All posts come from explicit replays. Natural bootstrap GCFRSPQ
+        # carries the user's UI sort (likely TOP_POSTS), so letting it
+        # auto-populate self.posts would mix algorithmic ordering into the
+        # output. Mirrors UserTimeline / Search hybrid.
+        self.response_interceptor.extract_posts = False
+
+        # Resume seed: prime the interceptor's dedup set with IDs from a
+        # prior run so bootstrap-edge highlights we already collected don't
+        # come back as new posts. Must happen AFTER flush() (which clears
+        # seen_post_ids) and BEFORE the loop runs.
+        if seen_post_ids_to_skip:
+            self.response_interceptor.seen_post_ids.update(seen_post_ids_to_skip)
+            logger.info(
+                f"[hybrid] group @{handle}: seeded {len(seen_post_ids_to_skip)} "
+                f"post_ids into dedup set for resume"
+            )
+        if initial_cursor:
+            logger.info(
+                f"[hybrid] group @{handle}: resuming from cursor "
+                f"{self._hybrid_cursor_fp(initial_cursor)}"
+            )
+
+        # Phase 1 — navigate
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+
+        # Phase 2 — bootstrap scroll (GCFRSPQ doesn't fire on raw navigation,
+        # same as PCTFRQ — see feedback memory).
+        error = await self._hybrid_bootstrap(operation_timeout_seconds)
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+
+        # Phase 3 — capture pagination template (GCFRSPQ instead of PCTFRQ/SCRQ)
+        error, template = await self._hybrid_capture_template(
+            template_capture_timeout=template_capture_timeout,
+            operation_timeout_seconds=operation_timeout_seconds,
+            friendly_name=GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME,
+            interceptor_attr="latest_gcfrspq_request",
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+        logger.info(
+            f"[hybrid] group @{handle}: template captured "
+            f"(doc_id={template['doc_id']}, group_id={template['profile_id']})"
+        )
+
+        # Phase 4 — pagination loop. `end_unix` flows into the stop framework
+        # (ConsecutiveOutOfRange upper bound) but is NOT injected into the
+        # request body — GroupsCometFeedRegularStoriesPaginationQuery has no
+        # server-side date filter (`inject_before_time=False`). Static
+        # override forces a non-default sort on every replay.
+        result_str, next_cursor = await self._hybrid_pagination_loop(
+            label=handle,
+            template=template,
+            params=loop_params,
+            start_unix=start_unix,
+            end_unix=end_unix,
+            inject_before_time=False,
+            static_variable_overrides={
+                "sortingSetting": sorting_setting,
+            },
+            initial_cursor=initial_cursor or None,
+        )
+        return ScrapeOutcome(
+            result=result_str,
+            data=self.response_interceptor.get_posts(),
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            last_cursor=next_cursor,
         )
 
     async def page_transparency_hybrid(
@@ -993,49 +1235,101 @@ class BrowserSession:
         params: dict,
         start_unix: int | None = None,
         end_unix: int | None = None,
-    ) -> str:
+        static_variable_overrides: dict | None = None,
+        initial_cursor: str | None = None,
+        stop_conditions: list[StopCondition] | None = None,
+        inject_before_time: bool = True,
+    ) -> tuple[str, str | None]:
         """Drive paginations via page.request.post() until a stop condition fires.
 
-        When `end_unix` is set, the replay body carries it as `beforeTime`.
-        When `start_unix` is set, the loop also terminates if a batch's oldest
-        post is older than it.
+        When `end_unix` is set, date-bound stop conditions use it as the
+        upper edge of the window. If `inject_before_time` is also True
+        (default), the replay body carries it as `beforeTime` — leave True
+        for endpoints with server-side date filters (UserTimeline), False
+        for endpoints without one (GroupTimeline) so we don't send an
+        unrecognized variable to FB.
+        When `start_unix` is set, date-bound stop conditions use it as the
+        lower edge of the window.
+        When `static_variable_overrides` is set, those keys are merged into
+        the body's `variables` on every replay (e.g. GroupTimeline injects
+        `sortingSetting=TOP_POSTS` to match FB's UI default).
+        When `initial_cursor` is set (non-empty), the loop starts from that
+        cursor instead of `null` — used by the `--continue` resume path.
+        When `stop_conditions` is None, the canonical list is assembled by
+        `assemble_default_stop_conditions(endpoint, mode, sorting_setting, params)`.
+
+        Termination: walks `stop_conditions` each iter; the first condition
+        to return a result-string terminates the loop. Auth GraphQL errors
+        (raise `FailedLoginError`) and in-body rate-limit errors (return
+        `('rate_limit', next_cursor)` for Worker's account-lock branch) are
+        short-circuited inline BEFORE the framework walk — they map to
+        non-result-string side effects that don't compose with the rest.
+
+        Returns `(result_string, next_cursor)`. `next_cursor` is the cursor
+        the *next* replay would have used had the loop continued — i.e. the
+        latest `end_cursor` observed on the wire. `None` when the loop never
+        completed a successful batch, or when the loop exited via the
+        "end_cursor null = end of feed" path.
         """
         template_form = template["form"]
         template_headers = template["headers"]
-        cursor = template["cursor"]
+        cursor = initial_cursor or template["cursor"]
+        # Tracks the cursor the *next* iter would have sent, so early-return
+        # stop conditions don't lose it. Updated immediately after each
+        # successful end_cursor extraction below.
+        next_cursor: str | None = None
 
         pagination_count = params["pagination_count"]
         scroll_burst_every = params["scroll_burst_every"]
         scroll_burst_size_range = params["scroll_burst_size_range"]
         pagination_sleep_mean = params["pagination_sleep_mean"]
         pagination_sleep_std = params["pagination_sleep_std"]
-        max_paginations = params["max_paginations"]
-        max_no_progress_streak = params["max_no_progress_streak"]
         request_timeout_ms = params["request_timeout_ms"]
         operation_timeout_seconds = params["operation_timeout_seconds"]
+
+        sorting_setting = (static_variable_overrides or {}).get("sortingSetting")
+
+        if stop_conditions is None:
+            # then add the stop condition at the start
+            stop_conditions = []
+        default_stop_conditions = assemble_default_stop_conditions(
+            endpoint=self.endpoint,
+            mode="hybrid",
+            sorting_setting=sorting_setting,
+            params=params,
+        )
+        for d in default_stop_conditions:
+            stop_conditions.append(d)
+
 
         total_paginations = 0
         no_progress_streak = 0
         previous_post_count = len(self.response_interceptor.get_posts())
 
-        # Cursor-reset detector state.
+        # Rolling per-iter window for the diagnostic dump path (cursor_reset,
+        # graphql_error). Loop is the sole writer; conditions read it.
         iter_window: deque = deque(maxlen=HYBRID_CURSOR_RESET_WINDOW)
-        prev_oldest_unix: int | None = None
 
-        # max_paginations == -1 means "no cap".
-        while max_paginations < 0 or total_paginations < max_paginations:
+        while True:
             # No `afterTime` override — FB's UI never sets it, so sending one would be a fingerprint.
             overrides = {
                 "cursor": cursor,
                 "count": pagination_count,
             }
-            if end_unix is not None:
+            if end_unix is not None and inject_before_time:
                 overrides["beforeTime"] = end_unix
+            if static_variable_overrides:
+                # Per-iter overrides (cursor/count/beforeTime) take precedence;
+                # static keys back-fill anything the loop doesn't already set.
+                merged = dict(static_variable_overrides)
+                merged.update(overrides)
+                overrides = merged
             body = self._hybrid_build_body(template_form, overrides)
 
             cursor_sent_fp = self._hybrid_cursor_fp(cursor)
             csr_len = len(self.response_interceptor.latest_csr or "")
             dyn_len = len(self.response_interceptor.latest_dyn or "")
+            cursor_sent_this_iter = cursor
 
             iter_start = datetime.now(timezone.utc)
             response, text, error_str = await self._hybrid_send_replay(
@@ -1046,7 +1340,7 @@ class BrowserSession:
                 operation_timeout_seconds=operation_timeout_seconds,
             )
             if error_str is not None:
-                return error_str
+                return error_str, next_cursor
 
             await self.record_scroll(endpoint=self.endpoint, count=1)
             total_paginations += 1
@@ -1061,67 +1355,59 @@ class BrowserSession:
             if parsed and parsed.get("posts"):
                 self.response_interceptor.add_posts(parsed["posts"])
 
-            # Auth-ish errors → raise so Worker rotates the account; others → bail with a result string.
-            graphql_error = self._hybrid_extract_graphql_error(text)
-            if graphql_error:
-                logger.warning(f"[hybrid] @{label}: GraphQL error: {graphql_error}")
-                if self._hybrid_is_auth_error(graphql_error):
+            # Auth-ish errors → raise so Worker rotates the account.
+            # In-body rate-limits → return 'rate_limit' so Worker locks 24h + rotates.
+            # Other GraphQL errors → handled by GraphQLError stop condition below.
+            graphql_error_detail = self._hybrid_extract_graphql_error_detail(text)
+            if graphql_error_detail:
+                gql_msg = graphql_error_detail.get("message", "")
+                gql_code = graphql_error_detail.get("code")
+                logger.warning(
+                    f"[hybrid] @{label}: GraphQL error: {gql_msg} "
+                    f"(code={gql_code}, severity={graphql_error_detail.get('severity')})"
+                )
+                if self._hybrid_is_auth_error(gql_msg):
                     raise FailedLoginError(
-                        f"Session invalid mid-scrape (graphql error: {graphql_error})"
+                        f"Session invalid mid-scrape (graphql error: {gql_msg})"
                     )
-                return f'graphql_error: {graphql_error}'
+                if self._hybrid_is_rate_limit_error(graphql_error_detail):
+                    # Partial data preserved on the ScrapeOutcome — Worker
+                    # special-cases this result string to lock the account
+                    # for 24h + rotate.
+                    return 'rate_limit', next_cursor
 
             current_post_count = len(self.response_interceptor.get_posts())
             new_posts_in_iter = current_post_count - previous_post_count
             no_progress_streak = 0 if new_posts_in_iter else no_progress_streak + 1
             previous_post_count = current_post_count
 
-            # Stop 1: end_cursor missing → no more posts in range.
             end_cursor = self._hybrid_extract_end_cursor(text)
-            if not end_cursor:
-                elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
-                logger.info(
-                    f"[hybrid] @{label}: end_cursor null after "
-                    f"{total_paginations} paginations (last iter {elapsed_iter:.2f}s) — "
-                    f"end of feed within filter range"
-                )
-                return 'scraped until user-specified starting date was reached'
+            if end_cursor:
+                # End-of-feed (end_cursor null) propagates `None` through
+                # `next_cursor` so the multi-leg resume path treats it as
+                # terminal. Update only when we got a fresh non-null one.
+                next_cursor = end_cursor
 
-            # Stop 2 (UserTimeline only): oldest post in batch crosses start_unix.
-            oldest_in_batch = self._hybrid_extract_oldest_creation_time(text)
-            if (
-                start_unix is not None
-                and oldest_in_batch is not None
-                and oldest_in_batch < start_unix
-            ):
-                logger.info(
-                    f"[hybrid] @{label}: oldest post in batch "
-                    f"({datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()}) "
-                    f"is older than start; done"
-                )
-                return 'scraped until user-specified starting date was reached'
-
-            # Bail rather than spin if FB keeps returning empty pages.
-            if no_progress_streak >= max_no_progress_streak:
-                logger.warning(
-                    f"[hybrid] @{label}: {no_progress_streak} paginations "
-                    f"with no new posts — bailing"
-                )
-                return 'no_new_posts_streak'
-
-            cursor = end_cursor
+            # Collapse the three per-post extractor calls into one pass; the
+            # per-post list is also needed for ConsecutiveOutOfRange.
+            batch_times = list(self._hybrid_iter_wrapping_creation_times(text))
+            oldest_in_batch = min(batch_times) if batch_times else None
+            newest_in_batch = max(batch_times) if batch_times else None
+            second_oldest_in_batch = (
+                sorted(batch_times)[1] if len(batch_times) >= 2 else None
+            )
 
             elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
             oldest_iso = (
                 datetime.fromtimestamp(oldest_in_batch, tz=timezone.utc).isoformat()
                 if oldest_in_batch is not None else "n/a"
             )
-            newest_in_batch = self._hybrid_extract_newest_creation_time(text)
             newest_iso = (
                 datetime.fromtimestamp(newest_in_batch, tz=timezone.utc).isoformat()
                 if newest_in_batch is not None else "n/a"
             )
             posts_in_resp = len(parsed.get("posts") or []) if parsed else 0
+            cursor_recv_fp = self._hybrid_cursor_fp(end_cursor)
             logger.debug(
                 f"[hybrid] @{label} pagination {total_paginations}: "
                 f"{response.status} in {elapsed_iter:.2f}s, "
@@ -1129,22 +1415,24 @@ class BrowserSession:
                 f"in_resp={posts_in_resp}), "
                 f"batch=[{newest_iso} .. {oldest_iso}], "
                 f"cursor_sent={cursor_sent_fp}, "
-                f"cursor_recv={self._hybrid_cursor_fp(end_cursor)}, "
+                f"cursor_recv={cursor_recv_fp}, "
                 f"__csr_len={csr_len}, __dyn_len={dyn_len}, "
                 f"resp_bytes={len(text or '')}"
             )
 
-            # Parser accepted posts but no timestamps were extractable — terminal structural error.
-            if posts_in_resp > 0 and oldest_in_batch is None:
-                logger.error(
-                    f"[hybrid] @{label}: parsed {posts_in_resp} posts but "
-                    f"extracted 0 creation_times at pagination "
-                    f"{total_paginations} — unknown metadata-strategy "
-                    f"typename(s). Aborting (no retry)."
-                )
-                return 'response_shape_error'
-
-            # Cursor-reset diagnostic capture.
+            # Append the current iter to the rolling window BEFORE walking
+            # conditions — both cursor_reset and graphql_error dumps read
+            # the window when they fire.
+            anchor_label = "2nd_oldest" if self.endpoint == "GroupTimeline" else "oldest"
+            detector_anchor = (
+                second_oldest_in_batch or oldest_in_batch
+                if self.endpoint == "GroupTimeline"
+                else oldest_in_batch
+            )
+            anchor_iso = (
+                datetime.fromtimestamp(detector_anchor, tz=timezone.utc).isoformat()
+                if detector_anchor is not None else "n/a"
+            )
             iter_window.append({
                 "pagination_index": total_paginations,
                 "ts": iter_start.isoformat(),
@@ -1158,11 +1446,14 @@ class BrowserSession:
                 "response": {
                     "text": text,
                     "size_bytes": len(text or ""),
-                    "cursor_recv_fp": self._hybrid_cursor_fp(end_cursor),
+                    "cursor_recv_fp": cursor_recv_fp,
                     "oldest_iso": oldest_iso,
                     "newest_iso": newest_iso,
                     "oldest_unix": oldest_in_batch,
                     "newest_unix": newest_in_batch,
+                    "detector_anchor_unix": detector_anchor,
+                    "detector_anchor_iso": anchor_iso,
+                    "detector_anchor_label": anchor_label,
                     "posts_in_resp": posts_in_resp,
                 },
                 "session": {
@@ -1170,29 +1461,49 @@ class BrowserSession:
                     "dyn_len": dyn_len,
                 },
             })
-            if (
-                prev_oldest_unix is not None
-                and oldest_in_batch is not None
-                and (oldest_in_batch - prev_oldest_unix) > HYBRID_CURSOR_RESET_JUMP_SECONDS
-            ):
-                jump_days = (oldest_in_batch - prev_oldest_unix) / 86400.0
-                out_dir = self._hybrid_dump_cursor_reset_window(
-                    label=label,
-                    trigger_index=total_paginations,
-                    prev_oldest_unix=prev_oldest_unix,
-                    cur_oldest_unix=oldest_in_batch,
-                    window=iter_window,
-                )
-                logger.warning(
-                    f"[hybrid] @{label}: cursor-reset detected at "
-                    f"pagination {total_paginations} (oldest jumped "
-                    f"+{jump_days:.1f} days) — dumped window to "
-                    f"{out_dir or '<dump_failed>'}; bailing with partial posts"
-                )
-                # FB silently degraded the stream though cursor still looks valid; scraper resumes with adjusted end_date.
-                return 'cursor_reset'
-            if oldest_in_batch is not None:
-                prev_oldest_unix = oldest_in_batch
+
+            state = StopState(
+                label=label,
+                endpoint=self.endpoint,
+                sorting_setting=sorting_setting,
+                iter_index=total_paginations,
+                cursor_sent=cursor_sent_this_iter,
+                end_cursor=end_cursor,
+                start_unix=start_unix,
+                end_unix=end_unix,
+                batch_creation_times=batch_times,
+                oldest_in_batch=oldest_in_batch,
+                newest_in_batch=newest_in_batch,
+                second_oldest_in_batch=second_oldest_in_batch,
+                posts_in_resp=posts_in_resp,
+                new_posts_in_iter=new_posts_in_iter,
+                all_posts_count=current_post_count,
+                no_progress_streak=no_progress_streak,
+                response_text=text,
+                request_body=body,
+                template_headers=template_headers,
+                response_status=response.status,
+                iter_start_iso=iter_start.isoformat(),
+                elapsed_s=elapsed_iter,
+                cursor_sent_fp=cursor_sent_fp,
+                cursor_recv_fp=cursor_recv_fp,
+                csr_len=csr_len,
+                dyn_len=dyn_len,
+                iter_window=iter_window,
+                graphql_error_detail=graphql_error_detail,
+            )
+
+            for cond in stop_conditions:
+                result_string = cond.evaluate(state)
+                if result_string is not None:
+                    # EndOfFeed semantics: `end_cursor` was null, so
+                    # `next_cursor` is still the prior iter's value (or
+                    # None on iter 1). The caller's multi-leg resume path
+                    # treats `None` as "no resume", which matches the
+                    # original behavior.
+                    return result_string, next_cursor
+
+            cursor = end_cursor
 
             if (total_paginations % scroll_burst_every) == 0:
                 await self._hybrid_organic_scroll_burst(
@@ -1202,11 +1513,6 @@ class BrowserSession:
 
             sleep_s = abs(random.gauss(pagination_sleep_mean, pagination_sleep_std))
             await asyncio.sleep(sleep_s)
-
-        logger.warning(
-            f"[hybrid] @{label}: hit max_paginations cap ({max_paginations})"
-        )
-        return f'hit max_paginations cap ({max_paginations})'
 
     async def check_error_conditions(self) -> str | None:
         """Return a short error code if the current page surfaces an FB error, else None."""
@@ -1651,13 +1957,70 @@ class BrowserSession:
         for d in docs:
             yield from walk(d)
 
+    @staticmethod
+    def _hybrid_iter_chunk_end_cursors(text: str):
+        """Yield `(chunk_path_len, end_cursor)` for every `end_cursor` /
+        `endCursor` in the response body.
+
+        FB's @stream/@defer pagination responses are JSONL streams of patches.
+        Each patch (chunk) declares the response-tree location it plugs in at
+        via a top-level `path` field; the initial non-deferred chunk has no
+        `path` (we treat it as path-length 0). The page-level pagination
+        cursor for the requested connection (the one FB's pagination resolver
+        will accept on the next replay) lives at the shortest path:
+
+          - GroupTimeline:  ['node', 'group_feed']                (len 2)
+          - UserTimeline:   ['node', 'timeline_list_feed_units']  (len 2)
+          - Search:         shallow path under the SERP root      (len ~2-3)
+
+        Inner-attachment sub-streams (Reels mini-feed, instream-video-ad,
+        nested comment threads) have their own `page_info.end_cursor` values
+        living at paths 5+ elements deep. Sending one of those back as
+        `variables.cursor` on the page-level pagination query triggers
+        `field_exception` server-side because the cursor belongs to a
+        different connection entirely.
+        """
+        if not text:
+            return
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            path = doc.get("path")
+            path_len = len(path) if isinstance(path, list) else 0
+
+            def walk(o):
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        if k in ("end_cursor", "endCursor"):
+                            yield v
+                        yield from walk(v)
+                elif isinstance(o, list):
+                    for item in o:
+                        yield from walk(item)
+
+            for cursor in walk(doc):
+                yield path_len, cursor
+
     @classmethod
     def _hybrid_extract_end_cursor(cls, text: str) -> str | None:
-        """Return the first non-empty `end_cursor` / `endCursor`, or None (= end-of-feed)."""
-        for k, v in cls._hybrid_walk_response_for(text, {"end_cursor", "endCursor"}):
-            if v:
-                return v
-        return None
+        """Return the page-level `end_cursor`, or None (= end-of-feed).
+
+        Picks the cursor from the chunk with the shortest `path` — that's the
+        page-level paginated connection's `page_info`, never a nested
+        sub-stream's cursor (Reels attachment, etc.). A falsy cursor at the
+        shortest path is the legitimate end-of-feed signal and returns None.
+        See `_hybrid_iter_chunk_end_cursors` for details.
+        """
+        candidates = list(cls._hybrid_iter_chunk_end_cursors(text))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1] or None
 
     @staticmethod
     def _hybrid_iter_wrapping_creation_times(text: str):
@@ -1704,6 +2067,22 @@ class BrowserSession:
         times = list(cls._hybrid_iter_wrapping_creation_times(text))
         return max(times) if times else None
 
+    @classmethod
+    def _hybrid_extract_second_oldest_creation_time(cls, text: str) -> int | None:
+        """Second-smallest wrapping creation_time in the response, or None
+        when fewer than 2 posts had a parseable timestamp.
+
+        Used by GroupTimeline's cursor-reset detector to ignore the
+        bootstrap-edge "highlight" outlier — FB injects one anchor post
+        per batch that is often chronologically out-of-order vs. the
+        cursor's real position, which would otherwise produce false-
+        positive cursor resets every ~150-200 paginations.
+        """
+        times = sorted(cls._hybrid_iter_wrapping_creation_times(text))
+        if len(times) < 2:
+            return None
+        return times[1]
+
     @staticmethod
     def _hybrid_cursor_fp(cursor: str | None) -> str:
         """Compact log fingerprint for a cursor: `null` or `len=<N> sha=<8hex>`."""
@@ -1711,55 +2090,6 @@ class BrowserSession:
             return "null"
         h = hashlib.sha1(cursor.encode("utf-8")).hexdigest()[:8]
         return f"len={len(cursor)} sha={h}"
-
-    @staticmethod
-    def _hybrid_dump_cursor_reset_window(
-        label: str,
-        trigger_index: int,
-        prev_oldest_unix: int | None,
-        cur_oldest_unix: int | None,
-        window: deque,
-        dump_root: str = HYBRID_CURSOR_RESET_DUMP_ROOT,
-    ) -> str | None:
-        """Persist the rolling iteration window to `<dump_root>/<label>/<UTC_ts>/`.
-
-        Returns the dump directory or None on failure (logged, never raised).
-        """
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        safe_label = label.lstrip("@") or "unknown"
-        out_dir = os.path.join(dump_root, safe_label, ts)
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            with open(os.path.join(out_dir, "window.jsonl"), "w") as f:
-                for rec in window:
-                    f.write(json.dumps(rec) + "\n")
-            summary = {
-                "label": label,
-                "trigger_pagination": trigger_index,
-                "prev_oldest_unix": prev_oldest_unix,
-                "cur_oldest_unix": cur_oldest_unix,
-                "prev_oldest_iso": (
-                    datetime.fromtimestamp(prev_oldest_unix, tz=timezone.utc).isoformat()
-                    if prev_oldest_unix is not None else None
-                ),
-                "cur_oldest_iso": (
-                    datetime.fromtimestamp(cur_oldest_unix, tz=timezone.utc).isoformat()
-                    if cur_oldest_unix is not None else None
-                ),
-                "jump_seconds": (
-                    cur_oldest_unix - prev_oldest_unix
-                    if (prev_oldest_unix is not None and cur_oldest_unix is not None)
-                    else None
-                ),
-                "window_size": len(window),
-                "dumped_at": ts,
-            }
-            with open(os.path.join(out_dir, "summary.json"), "w") as f:
-                json.dump(summary, f, indent=2)
-            return out_dir
-        except Exception as e:
-            logger.warning(f"[hybrid] @{label}: cursor-reset dump failed: {e}")
-            return None
 
     @classmethod
     def _hybrid_extract_graphql_error(cls, text: str) -> str | None:
@@ -1775,6 +2105,30 @@ class BrowserSession:
                     return first[:200]
         return None
 
+    @classmethod
+    def _hybrid_extract_graphql_error_detail(cls, text: str) -> dict | None:
+        """Return the first GraphQL error object as `{message, code, severity}` or None.
+
+        Like `_hybrid_extract_graphql_error` but preserves the structured
+        fields needed to disambiguate auth vs. rate-limit vs. generic errors
+        without parsing the message string twice. `code` is FB's internal
+        numeric error code (e.g. 1675004 for rate-limit) — more stable than
+        the human-readable `message` for programmatic matching.
+        """
+        for _, v in cls._hybrid_walk_response_for(text, {"errors"}):
+            if isinstance(v, list) and v:
+                first = v[0]
+                if isinstance(first, dict):
+                    msg = first.get("message")
+                    return {
+                        "message":  str(msg)[:200] if msg else "",
+                        "code":     first.get("code"),
+                        "severity": first.get("severity"),
+                    }
+                elif isinstance(first, str):
+                    return {"message": first[:200], "code": None, "severity": None}
+        return None
+
     # Substrings that mark a GraphQL error as auth-related (FB returns 200 + errors[] for these).
     _HYBRID_AUTH_ERROR_MARKERS = (
         "lsddataerror",
@@ -1785,6 +2139,15 @@ class BrowserSession:
         "session has expired",
     )
 
+    # FB's numeric error codes that map to account-level rate-limiting.
+    # Confirmed manually: code=1675004, severity=CRITICAL fires on accounts
+    # that hit FB's account-scoped throttle — appears identically whether
+    # the request is from our scraper or a human in a browser. Match by
+    # code first (more stable across FB's message localisation), fall
+    # through to substring match on the message as a safety net.
+    _HYBRID_RATE_LIMIT_CODES = (1675004,)
+    _HYBRID_RATE_LIMIT_MARKERS = ("rate limit exceeded",)
+
     @classmethod
     def _hybrid_is_auth_error(cls, message: str) -> bool:
         """True if a GraphQL error message looks auth-related."""
@@ -1792,6 +2155,23 @@ class BrowserSession:
             return False
         m = message.lower()
         return any(marker in m for marker in cls._HYBRID_AUTH_ERROR_MARKERS)
+
+    @classmethod
+    def _hybrid_is_rate_limit_error(cls, err: dict | None) -> bool:
+        """True if a GraphQL error object signals account-level rate-limiting.
+
+        Matches FB's internal code (1675004) when present (most reliable),
+        else falls back to a case-insensitive substring scan on the message
+        ("Rate limit exceeded"). Either alone is sufficient — FB has been
+        observed to emit both forms.
+        """
+        if not err:
+            return False
+        code = err.get("code")
+        if code is not None and code in cls._HYBRID_RATE_LIMIT_CODES:
+            return True
+        msg = (err.get("message") or "").lower()
+        return any(marker in msg for marker in cls._HYBRID_RATE_LIMIT_MARKERS)
 
     @staticmethod
     def _hybrid_body_looks_like_html(text: str) -> bool:

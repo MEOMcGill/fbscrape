@@ -4,7 +4,7 @@ A Python library for scraping Facebook using Camoufox with account pooling, rota
 
 ## Features
 
-- **Four endpoints** - `UserTimeline`, `Search`, `PageTransparency`, `ProfileAuthenticity`
+- **Five endpoints** - `UserTimeline`, `Search`, `GroupTimeline`, `PageTransparency`, `ProfileAuthenticity`
 - **High-level API** - Simple `FacebookScraper` class handles all complexity
 - **Concurrent scraping** - WorkerPool manages multiple browser sessions
 - **Account management** - SQLite-backed pool with automatic rotation
@@ -108,13 +108,14 @@ construct a `Query` yourself and call `ScrapingResult.from_outcome(query, outcom
 
 ## Endpoints
 
-`fbscrape` supports four endpoints, all registered in `Query.ENDPOINT_REGISTRY`.
+`fbscrape` supports five endpoints, all registered in `Query.ENDPOINT_REGISTRY`.
 Two are paginated post streams; two are single-shot record fetches.
 
 | Endpoint | Required `query` | Mode(s) | Output shape |
 |---|---|---|---|
 | `UserTimeline` | `handle`, `start_date`, `end_date` | `manual`, `hybrid` *(default)* | `data: list[dict]` — one element per post |
 | `Search` | `query_text`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per search-result post |
+| `GroupTimeline` | `handle`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per group post (date filter is client-side; default sort `TOP_POSTS`) |
 | `PageTransparency` | `page_id` (handle optional) | `hybrid` | `data: [transparency_dict]` — single-element list |
 | `ProfileAuthenticity` | `user_id` | `hybrid` | `data: [authenticity_dict]` — single-element list |
 
@@ -241,6 +242,19 @@ fbscrape scrape user-timeline zuck --start-date 2024-01-01 --mode manual
 fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
 fbscrape scrape search --input-file queries.csv
 
+# GroupTimeline — paginated, hybrid only. `handle` accepts vanity OR numeric
+# group id. `--end-date` is advisory (FB has no server-side date filter for
+# group feeds). Default sort is TOP_POSTS (matches FB UI; lowest-fingerprint
+# and empirically safer for sustained scraping than CHRONOLOGICAL); under
+# non-chronological sorts, termination is driven by --max-consecutive-out-of-
+# range (default 20 = bail after N posts in a row outside the date window).
+fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 --end-date 2025-01-01
+fbscrape scrape group-timeline 787909081545196 --start-date 2024-01-01
+fbscrape scrape group-timeline --input-file groups.csv --headless
+# Override sort / stop knobs:
+fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 \
+    --sorting-setting CHRONOLOGICAL --max-consecutive-out-of-range 30
+
 # PageTransparency — single-shot, takes a page_id (handle optional)
 fbscrape scrape page-transparency 899800046546098
 fbscrape scrape page-transparency habsfanhub:899800046546098
@@ -257,12 +271,19 @@ fbscrape flatten data/posts/ --output data/merged.parquet --concat
 
 # Download media (within ~3 days of scrape — fbcdn URLs expire ~4-5 days out)
 fbscrape download-media data/posts/zuck_UserTimeline_hybrid_…json --include-thumbnails
+
+# Inspect a cURL copied from DevTools — prints a structured GraphQL summary
+# (friendly_name, doc_id, decoded `variables` JSON, key headers). Cookie /
+# fb_dtsg / lsd / jazoest are redacted by default; pass --raw to disable
+# redaction, --full to include every header and telemetry body field.
+fbscrape utils parse-curl "curl 'https://www.facebook.com/api/graphql/' -X POST ..."
 ```
 
 `--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
 depend on the subcommand: `handle` + optional `start_date` / `end_date` for
-`user-timeline`; `query_text` + dates for `search`; `page_id` (required) +
-`handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
+`user-timeline` and `group-timeline`; `query_text` + dates for `search`;
+`page_id` (required) + `handle` (optional) for `page-transparency`; `user_id`
+for `profile-authenticity`.
 
 ### Account Management
 

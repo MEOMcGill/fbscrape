@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING
 from playwright.async_api import Locator
 
 from .exceptions import (
-    FailedLoginError, CheckpointError, AccountDisabledError, TransientLoginError,
+    FailedLoginError, CheckpointError, AccountDisabledError,
+    AutomationCheckpointError, TransientLoginError,
 )
 from .logger import logger
 from .response import ResponseInterceptor
@@ -473,12 +474,24 @@ async def _wait_for_log_in_outcome(session: "BrowserSession") -> bool:
 async def _dispatch_login_outcome(session: "BrowserSession", kind: str, url: str) -> bool:
     """Route a classified login outcome to its handler.
 
-    `logged_in` returns True. Failure kinds mark the account inactive and
-    raise the corresponding exception — all info needed by the worker is
-    on the exception (`url` attr) and in the DB (`error_msg`).
+    `logged_in` returns True. Failure kinds raise the corresponding exception
+    — all info needed by the worker is on the exception (`url` attr) and in
+    the DB (`error_msg`).
+
+    Disabled / generic-checkpoint / 2FA mark the account inactive here.
+    `automation_checkpoint` is the exception: account stays active and the
+    worker locks it 24h via `rotate_account(lock_until, error_msg)`.
     """
     if kind == "logged_in":
         return True
+
+    # Refine the generic /checkpoint/ kind into automation_checkpoint when the
+    # page body carries Facebook's bot-suspicion language. URL alone can't
+    # distinguish — /checkpoint/<id>/ is shared with several challenge types.
+    if kind == "checkpoint" and await _is_automation_suspected_checkpoint(session):
+        msg = f"automation suspected ({url})"
+        logger.warning(f"{session.account.display_name}: {msg}")
+        raise AutomationCheckpointError(msg, url=url)
 
     msg_by_kind = {
         "disabled":   f"Account disabled by Facebook ({url})",
@@ -494,6 +507,19 @@ async def _dispatch_login_outcome(session: "BrowserSession", kind: str, url: str
     logger.warning(f"{session.account.display_name}: {msg}")
     await session.pool.set_active(session.account.identifier, False, msg)
     raise exc_by_kind[kind](msg, url=url)
+
+
+async def _is_automation_suspected_checkpoint(session: "BrowserSession") -> bool:
+    """Detect Facebook's 'We suspect automated behavior on your account'
+    checkpoint variant by probing the page body. URL pattern alone is shared
+    with ID-upload / SMS-code / etc. challenges, so only content disambiguates."""
+    try:
+        await session.page.get_by_text(
+            "suspect automated behavior", exact=False
+        ).first.wait_for(state="visible", timeout=2000)
+        return True
+    except Exception:
+        return False
 
 
 # ==================== Page helpers (popups, form detection, typing) ====================

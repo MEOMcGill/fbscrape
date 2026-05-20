@@ -40,14 +40,20 @@ def _g(obj, *keys, default=None):
 def _resolve_story(post: dict) -> dict | None:
     """Walk a raw post dict to its canonical Story node.
 
-    Two shapes appear in PCTFRQ responses:
-      A) initial page load — `node` is a User containing
-         `timeline_list_feed_units.edges[].node` (Story).
-      B) pagination — `node` IS the Story directly.
+    Shapes:
+      A) initial page load — `node` is a container with edges[].node = Story.
+         Two container keys are recognized: `timeline_list_feed_units`
+         (UserTimeline PCTFRQ) and `group_feed` (GroupTimeline GCFRSPQ).
+      B) pagination / fan-out — `node` IS the Story directly.
+
+    `parse_timeline_response` fans Shape A entries into per-Story entries
+    before they reach this function, so the Shape A branch below is mostly
+    defensive — it lets callers pass a raw response line directly.
     """
     node = post.get("node") or {}
-    if "timeline_list_feed_units" in node:
-        return _g(node, "timeline_list_feed_units", "edges", 0, "node")
+    for container_key in ("timeline_list_feed_units", "group_feed"):
+        if container_key in node:
+            return _g(node, container_key, "edges", 0, "node")
     if "post_id" in node:
         return node
     return None
@@ -108,25 +114,67 @@ class FacebookGraphQLParser:
     # routes via this. Adding an endpoint = one new orchestrator + one row here.
     ENDPOINT_FLATTENERS: dict[str, str] = {
         "UserTimeline": "_flatten_pctfrq_post",
+        "GroupTimeline": "_flatten_grouptimeline_post",
         "PageTransparency": "_flatten_pagetransparency_record",
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
     }
+
+    # Edge-container keys that wrap one or more Stories. `parse_timeline_response`
+    # fans out their edges into per-Story `posts` entries so each downstream
+    # consumer (flatten, _hybrid_iter_wrapping_creation_times, add_posts dedup)
+    # sees exactly one Story per entry regardless of how FB streamed the body.
+    _STORY_EDGE_CONTAINERS = ("timeline_list_feed_units", "group_feed")
 
     # ----- runtime parsing (used by ResponseInterceptor) -----
 
     def parse_timeline_response(self, body: bytes, url: str) -> dict | None:
         """Parse a Facebook GraphQL timeline response body into `{posts: [...]}`.
 
+        Each returned entry has shape `{node: Story, ...}` — a single canonical
+        Story per entry. Shape-A response lines (a container node wrapping
+        multiple `edges[].node` Stories) are fanned out into one entry per
+        edge; Shape-B response lines (a Story delivered as `data.node`
+        directly) are preserved with their original `{node, cursor, ...}`
+        keys. Both forms resolve cleanly through `_resolve_story`.
+
         Returns None on any decode/parse failure.
         """
         try:
             response_data = parse_json_or_jsonl(body.decode('utf-8'))
             posts = []
-            for data in response_data:
-                if 'data' in data:
-                    if 'node' in data['data']:
-                        if self.is_post_node(data['data']['node']):
-                            posts.append(data['data'])
+            for data_line in response_data:
+                if not isinstance(data_line, dict) or 'data' not in data_line:
+                    continue
+                payload = data_line['data']
+                if not isinstance(payload, dict):
+                    continue
+                node = payload.get('node')
+                if not isinstance(node, dict):
+                    continue
+                # Shape B: data.node IS the Story directly.
+                if (node.get('__typename') == 'Story'
+                        and node.get('__isFeedUnit') == 'Story'
+                        and isinstance(node.get('post_id'), str)
+                        and node['post_id']):
+                    posts.append(payload)
+                    continue
+                # Shape A: data.node is a container with edges[].node = Story.
+                # Recognised containers: timeline_list_feed_units (UserTimeline),
+                # group_feed (GroupTimeline). Fan out so each Story becomes its
+                # own entry — otherwise the flattener's edges[0] fallback would
+                # silently drop edges 1..N.
+                for container_key in self._STORY_EDGE_CONTAINERS:
+                    container = node.get(container_key)
+                    if not isinstance(container, dict):
+                        continue
+                    for edge in (container.get('edges') or []):
+                        inner = edge.get('node') if isinstance(edge, dict) else None
+                        if (isinstance(inner, dict)
+                                and inner.get('__typename') == 'Story'
+                                and isinstance(inner.get('post_id'), str)
+                                and inner['post_id']):
+                            posts.append({'node': inner})
+                    break  # only one container key applies per response line
 
             return {'posts': posts}
 
@@ -142,11 +190,15 @@ class FacebookGraphQLParser:
         """
         Determine if a node is a Facebook post.
 
-        Two response shapes are recognized:
-          A) initial page load — `data.node` is a User containing
-             `timeline_list_feed_units.edges[].node` with `__typename: Story`.
+        Recognised response shapes:
+          A) initial page load — `data.node` is a container (User/Group)
+             with `edges[].node` Stories. Container keys: `timeline_list_feed_units`
+             (UserTimeline PCTFRQ), `group_feed` (GroupTimeline GCFRSPQ).
           B) pagination — `data.node` IS the Story directly, carrying a
              top-level `post_id` and `__isFeedUnit: "Story"`.
+
+        Kept as a public helper; `parse_timeline_response` no longer routes
+        through it (it inlines the shape checks during fan-out).
 
         Returns:
             bool indicating if node is a post, or None if parsing fails.
@@ -160,10 +212,12 @@ class FacebookGraphQLParser:
                     and isinstance(node.get('post_id'), str)
                     and node['post_id']):
                 return True
-            # Shape A: initial User node carrying the first batch of stories.
-            tlfu = node.get('timeline_list_feed_units')
-            if isinstance(tlfu, dict):
-                for edge in (tlfu.get('edges') or []):
+            # Shape A: any recognised edge-container with at least one Story.
+            for container_key in self._STORY_EDGE_CONTAINERS:
+                container = node.get(container_key)
+                if not isinstance(container, dict):
+                    continue
+                for edge in (container.get('edges') or []):
                     inner = edge.get('node') if isinstance(edge, dict) else None
                     if isinstance(inner, dict) and inner.get('__typename') == 'Story':
                         return True
@@ -216,6 +270,18 @@ class FacebookGraphQLParser:
         out["attachments"]  = self._extract_attachments(story)
         out["shared_post"]  = self._extract_shared_post(story)
         return out
+
+    def _flatten_grouptimeline_post(self, post: dict) -> dict | None:
+        """Orchestrator for GroupsCometFeedRegularStoriesPaginationQuery (GroupTimeline).
+
+        Group-feed Stories share the same Comet shape as UserTimeline posts
+        (metadata, author, attachments, engagement — all identical), so this
+        is a thin alias over `_flatten_pctfrq_post`. Kept as a distinct method
+        so future GroupTimeline-only fields (poster's role in the group,
+        group_id resolution, etc.) can be added here without polluting the
+        UserTimeline flattener.
+        """
+        return self._flatten_pctfrq_post(post)
 
     def _flatten_pagetransparency_record(self, record: dict) -> dict | None:
         """Orchestrator for ProfileTransparencyDialogQuery (PageTransparency).
@@ -768,6 +834,10 @@ class ResponseInterceptor:
         # Same role as latest_pctfrq_request, but for the Search endpoint's
         # hybrid mode. Reset on flush().
         self.latest_scrq_request: dict | None = None
+        # Latest captured GroupsCometFeedRegularStoriesPaginationQuery request,
+        # if any. Same role as latest_pctfrq_request, but for the GroupTimeline
+        # endpoint's hybrid mode. Reset on flush().
+        self.latest_gcfrspq_request: dict | None = None
         # Latest captured natural GraphQL POST (any friendly-name). Populated
         # on every browser-issued GraphQL POST observed. Used by single-shot
         # endpoints (e.g., PageTransparency) that synthesize the request body
@@ -827,6 +897,7 @@ class ResponseInterceptor:
             self._track_request_tokens(response.request)
             await self._track_pctfrq_template(response.request)
             await self._track_scrq_template(response.request)
+            await self._track_gcfrspq_template(response.request)
             await self._track_any_graphql_request(response.request)
 
         # Full network capture is opt-in via FB_NETWORK_CAPTURE_ALL=1. Off by
@@ -987,14 +1058,16 @@ class ResponseInterceptor:
         to the same accumulator that auto-intercepted posts populate.
         Preferred over directly mutating `self.posts`.
 
-        Dedups on `post_id` against `self.seen_post_ids`. Posts without a
-        `post_id` are appended as-is (defensive — the parser should always
-        set one, but if it ever doesn't we'd rather keep the post than
-        silently drop it). Returns the count of posts actually added.
+        Dedups on `post_id` against `self.seen_post_ids`. The parser's
+        `parse_timeline_response` emits one Story per entry with shape
+        `{node: Story, ...}` — the `post_id` lives on `node`, not at the
+        top level, so we check both. Posts without a `post_id` anywhere are
+        appended as-is (defensive — the parser should always set one).
+        Returns the count of posts actually added.
         """
         added = 0
         for post in posts:
-            pid = post.get("post_id")
+            pid = post.get("post_id") or _g(post, "node", "post_id")
             if pid:
                 if pid in self.seen_post_ids:
                     continue
@@ -1113,6 +1186,45 @@ class ResponseInterceptor:
             "headers": headers,
         }
 
+    async def _track_gcfrspq_template(self, request):
+        """If this request is a `GroupsCometFeedRegularStoriesPaginationQuery`,
+        save a small replay-template snapshot (post_data + headers) to
+        `self.latest_gcfrspq_request`. Mirrors `_track_pctfrq_template` for
+        the GroupTimeline endpoint's hybrid mode.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+
+        is_gcfrspq = headers.get("x-fb-friendly-name") == "GroupsCometFeedRegularStoriesPaginationQuery"
+        post_data = None
+        if not is_gcfrspq:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            if post_data:
+                try:
+                    form = parse_qs(post_data, keep_blank_values=True)
+                    name = form.get("fb_api_req_friendly_name") or []
+                    if name and name[-1] == "GroupsCometFeedRegularStoriesPaginationQuery":
+                        is_gcfrspq = True
+                except Exception:
+                    pass
+        if not is_gcfrspq:
+            return
+
+        if post_data is None:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+        self.latest_gcfrspq_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
     async def _track_any_graphql_request(self, request):
         """Save (post_data, headers) for any natural GraphQL POST to
         `self.latest_natural_graphql_request`. Called from intercept_response
@@ -1167,6 +1279,7 @@ class ResponseInterceptor:
         self.latest_dyn = None
         self.latest_pctfrq_request = None
         self.latest_scrq_request = None
+        self.latest_gcfrspq_request = None
         self.latest_natural_graphql_request = None
         # network_capture is opt-in (FB_NETWORK_CAPTURE_ALL=1); reset anyway
         # so a fresh scrape starts with a clean slate when capture is enabled.

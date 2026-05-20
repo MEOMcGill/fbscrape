@@ -32,3 +32,15 @@ fbscrape = "fbscrape.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fbscrape*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "unit: fast, no network, no browser (default)",
+    "integration: headless browser hitting real Facebook; needs an active account in db/accounts.db",
+    "e2e: end-to-end CLI invocations via subprocess; needs an active account",
+]
+# Default invocation runs only unit tests. Use `pytest -m integration`,
+# `pytest -m e2e`, or `pytest -m ''` (empty selector) to opt in.
+addopts = "-m 'not integration and not e2e'"

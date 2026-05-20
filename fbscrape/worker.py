@@ -6,6 +6,7 @@ separation between tasks and automatic resource cleanup.
 """
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from .accounts_pool import AccountsPool
@@ -14,6 +15,7 @@ from .browser_session import BrowserSession
 from .exceptions import (
     AccountBannedError,
     AccountDisabledError,
+    AutomationCheckpointError,
     CheckpointError,
     FailedLoginError,
     NoAccountError,
@@ -43,10 +45,10 @@ class Worker:
         ("UserTimeline", "manual"): "user_timeline_manual",
         ("UserTimeline", "hybrid"): "user_timeline_hybrid",
         ("Search", "hybrid"): "search_hybrid",
+        ("GroupTimeline", "hybrid"): "group_timeline_hybrid",
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
-        # ("GroupTimeline", "manual"): "group_timeline_manual",
     }
 
     def __init__(
@@ -297,6 +299,30 @@ class Worker:
                             lock_until="datetime('now', '+10 minutes')"
                         )
 
+                    # In-body GraphQL rate-limit (FB code 1675004 / "Rate
+                    # limit exceeded"). FB throttles at the account level —
+                    # verified manually that the same error fires for a
+                    # human in a browser using the same account. Lock the
+                    # account 24h + rotate; partial data is preserved on the
+                    # ScrapeOutcome. Mirrors the HTTP-429 RateLimitError path
+                    # but as a result-string branch since the loop returned
+                    # cleanly with partial posts rather than raising.
+                    if outcome.result == 'rate_limit':
+                        ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                        rl_msg = (
+                            f"Rate limited at {ts}: in-body GraphQL error "
+                            f"(FB code 1675004 / 'Rate limit exceeded'); locked 24h"
+                        )
+                        logger.warning(
+                            f"Worker {self.id}: rate_limit (in-body GraphQL) on "
+                            f"{self.current_account.display_name} "
+                            f"(records={len(outcome.data)}); locking account 24h and rotating"
+                        )
+                        await self.rotate_account(
+                            lock_until="datetime('now', '+24 hours')",
+                            error_msg=rl_msg,
+                        )
+
                     # Response-shape error: the hybrid loop saw a response shape
                     # it doesn't know how to read (all posts in a batch had a
                     # metadata-strategy typename outside _METADATA_TIMESTAMP_TYPENAMES).
@@ -326,6 +352,27 @@ class Worker:
                     f"permanently disabled (url={e.url}); rotating without counting as retry"
                 )
                 await self.rotate_account()
+
+            except AutomationCheckpointError as e:
+                # FB flagged the account as suspected automation. Distinct from
+                # generic CheckpointError: re-trying soon is pointless and likely
+                # accelerates account loss, but the account is recoverable in
+                # principle, so we lock 24h (active=True) instead of marking
+                # inactive. Mirrors the RateLimitError handling.
+                # MUST be ordered BEFORE the generic CheckpointError clause
+                # since AutomationCheckpointError is a subclass.
+                ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                am_msg = f"automation suspected at {ts} ({e.url}); locked 24h"
+                logger.warning(
+                    f"Worker {self.id}: automation-suspected checkpoint on "
+                    f"{self.current_account.display_name} (url={e.url}); "
+                    f"locking account 24h and rotating"
+                )
+                await self.rotate_account(
+                    lock_until="datetime('now', '+24 hours')",
+                    error_msg=am_msg,
+                )
+                retry_count += 1
 
             except CheckpointError as e:
                 # Detector already wrote error_msg + marked inactive. Needs manual action
@@ -387,11 +434,17 @@ class Worker:
                 retry_count += 1
 
             except RateLimitError as e:
+                ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                rl_msg = f"Rate limited at {ts}: HTTP 429 ({e}); locked 24h"
                 logger.warning(
-                    f"Worker {self.id}: rate limited on {self.current_account.display_name}: {e}, "
-                    f"locking temporarily and rotating"
+                    f"Worker {self.id}: rate limited (HTTP 429) on "
+                    f"{self.current_account.display_name}: {e}; "
+                    f"locking account 24h and rotating"
                 )
-                await self.rotate_account(lock_until="datetime('now', '+1 hour')")
+                await self.rotate_account(
+                    lock_until="datetime('now', '+24 hours')",
+                    error_msg=rl_msg,
+                )
                 retry_count += 1
 
         # If we exhausted retries, raise to signal failure
@@ -399,11 +452,19 @@ class Worker:
             f"Worker {self.id}: failed to execute task after {max_retries} retries"
         )
 
-    async def rotate_account(self, lock_until: str | None = None):
+    async def rotate_account(
+        self,
+        lock_until: str | None = None,
+        error_msg: str | None = None,
+    ):
         """
         Release current account and acquire a new one.
 
-        Adds a brief cooldown lock to prevent immediately re-acquiring the same account.
+        Adds a brief cooldown lock to prevent immediately re-acquiring the
+        same account. When `error_msg` is provided, it's written to the
+        account's `error_msg` column alongside the lock so post-hoc DB
+        inspection can explain *why* the account was locked (the lock
+        itself expires; the error_msg persists).
 
         Raises:
             NoAccountError: If no account available for rotation
@@ -414,6 +475,7 @@ class Worker:
             await self.pool.lock_until(
                 self.current_account.identifier,
                 "datetime('now', '+2 minutes')" if lock_until is None else lock_until,
+                error_msg=error_msg,
             )
             await self.pool.release_account(self.current_account.identifier)
             logger.info(f"Worker {self.id} released account {self.current_account.display_name} (5s cooldown)")

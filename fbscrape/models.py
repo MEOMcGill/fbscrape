@@ -66,7 +66,7 @@ class Query:
                 "hybrid": {
                     "params": {
                         "pagination_count": 3,
-                        "scroll_burst_every": 10,
+                        "scroll_burst_every": 50,
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
@@ -74,6 +74,19 @@ class Query:
                         # -1 disables the cap entirely; otherwise a positive
                         # int caps how many replays a single session fires.
                         "max_paginations": -1,
+                        # -1 disables the cap; otherwise a positive int caps
+                        # total accumulated posts. Checked at batch
+                        # boundaries, so the actual return count can exceed
+                        # this by up to `pagination_count - 1` posts.
+                        "max_posts": -1,
+                        # Resume support (parallels GroupTimeline; see that
+                        # entry for the rationale). Sentinel defaults so the
+                        # registry's `None = required` convention isn't
+                        # triggered. The high-level scraper injects these
+                        # only on leg 0 of its multi-leg cursor_reset loop;
+                        # subsequent legs start fresh with adjusted end_date.
+                        "initial_cursor": "",
+                        "seen_post_ids_to_skip": [],
                         "post_nav_sleep_seconds": 3.0,
                         "request_timeout_ms": 30000,
                         "max_no_progress_streak": 5,
@@ -94,12 +107,15 @@ class Query:
                     "params": {
                         # FB UI requests 5 search posts per page; mirror it.
                         "pagination_count": 5,
-                        "scroll_burst_every": 30,
+                        "scroll_burst_every": 50,
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
                         "template_capture_timeout": 20.0,
                         "max_paginations": -1,
+                        # -1 disables the cap; positive int caps total
+                        # accumulated posts. Batch-boundary enforced.
+                        "max_posts": -1,
                         "post_nav_sleep_seconds": 3.0,
                         "request_timeout_ms": 30000,
                         "max_no_progress_streak": 5,
@@ -155,8 +171,82 @@ class Query:
                 },
             },
         },
-        # e.g. for future endpoints
-        # "GroupTimeline": {...},
+        "GroupTimeline": {
+            # `handle` accepts either a vanity group handle (e.g. "albertaseparatism")
+            # or the numeric group id — both forms resolve via `/groups/<handle>/`.
+            # Date filtering is purely client-side: the GraphQL query carries no
+            # beforeTime/afterTime variable, so termination relies on the parser-
+            # extracted creation_time vs. start_date (Key Design Decision: hybrid
+            # date-bounded stops). cursor_reset is terminal here (no server-side
+            # date filter to advance for a resume leg).
+            "query_required": ["handle", "start_date", "end_date"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        # FB UI requests 3 group posts per page; mirror it.
+                        "pagination_count": 3,
+                        # Group feed sort, injected into every replay body's
+                        # `variables.sortingSetting`. Empirically-validated values:
+                        #   - "TOP_POSTS" — FB UI default; algorithmic ranking.
+                        #     Older posts can appear at any edge position; the
+                        #     `oldest_in_batch < start_date` stop is unreliable
+                        #     here and is dropped from the default stop set in
+                        #     favor of `ConsecutiveOutOfRange` (counts N posts
+                        #     in a row outside the window). Lowest-fingerprint
+                        #     choice and the empirically-validated safer option
+                        #     for sustained scraping (CHRONOLOGICAL appears
+                        #     correlated with FB suspending the account).
+                        #   - "CHRONOLOGICAL" — stream-line tail is descending
+                        #     by post creation_time. Closest to true creation-
+                        #     time ordering BUT empirically associated with
+                        #     bans — opt-in only. Caveat: the per-batch
+                        #     *bootstrap* edge (always 1 post) is sometimes
+                        #     out of order; the `OldestInBatchBelowStartDate`
+                        #     stop condition is exempt on iter 1 (cursor_sent
+                        #     is None) to absorb this.
+                        #   - "RECENT_ACTIVITY" — sorts by most recent activity
+                        #     (comment / reaction); not strictly post-creation
+                        #     order, so a bumped old post can fire the
+                        #     `oldest_in_batch < start_date` stop early. Treated
+                        #     as non-chronological by `assemble_default_stop_conditions`.
+                        # Override via `--sorting-setting` CLI flag / scraper kwarg.
+                        "sorting_setting": "TOP_POSTS",
+                        "scroll_burst_every": 30,
+                        "scroll_burst_size_range": (2, 5),
+                        "pagination_sleep_mean": 2.5,
+                        "pagination_sleep_std": 0.5,
+                        "template_capture_timeout": 20.0,
+                        "max_paginations": -1,
+                        # -1 disables the cap; positive int caps total
+                        # accumulated posts. Batch-boundary enforced.
+                        "max_posts": -1,
+                        # Resume support. Sentinel defaults so the registry's
+                        # `None` = required convention isn't triggered:
+                        #   - "" → no initial cursor (loop starts from null)
+                        #   - [] → no IDs to skip (interceptor dedup is fresh)
+                        # When set (by the --continue CLI flag or by
+                        # `FacebookScraper.group_timeline(resume_from=...)`),
+                        # the loop starts with this cursor and seeds the
+                        # interceptor's seen_post_ids set so bootstrap-edge
+                        # highlights from prior runs aren't re-counted.
+                        "initial_cursor": "",
+                        "seen_post_ids_to_skip": [],
+                        "post_nav_sleep_seconds": 3.0,
+                        "request_timeout_ms": 30000,
+                        "max_no_progress_streak": 30,
+                        # N posts in a row outside [start_unix, end_unix] →
+                        # bail with `consecutive_out_of_range`. Primary
+                        # date-tail stop on non-chronological sorts (TOP_POSTS,
+                        # RECENT_ACTIVITY) where `oldest_in_batch < start` is
+                        # unreliable. Kept enabled on CHRONOLOGICAL too as
+                        # belt-and-suspenders against the rare bootstrap-edge
+                        # highlight that's old enough to mislead. -1 disables.
+                        "max_consecutive_out_of_range": 20,
+                        "operation_timeout_seconds": 900,
+                    },
+                },
+            },
+        },
     }
 
     # Format for date strings stored in `query` (e.g. query["start_date"]).
@@ -296,11 +386,19 @@ class ScrapeOutcome:
     `data` is `list[dict]` always (one element per scraped record). Single-
     record endpoints like PageTransparency populate a 1-element list; post-
     stream endpoints like UserTimeline / Search populate one element per post.
+
+    `last_cursor` is the cursor that the next replay *would* have used had
+    the loop continued — i.e. the latest `end_cursor` observed on the wire.
+    `None` for single-shot endpoints, and `None` when a paginated loop
+    exited via the "end_cursor null = end of feed" path. Used by the
+    `--continue` resume mechanism. Per FB's own docs, cursors are
+    ephemeral and may be invalidated server-side; treat as best-effort.
     """
     result: str  # 'success', 'failed to load', 'timeout', etc.
     data: list[dict]
     time_started: datetime
     time_taken: timedelta
+    last_cursor: str | None = None
 
 
 @dataclass
@@ -309,12 +407,15 @@ class ScrapingResult:
 
     `data` mirrors `ScrapeOutcome.data` — see that class's docstring for the
     list[dict] convention across single-record and post-stream endpoints.
+    `last_cursor` mirrors `ScrapeOutcome.last_cursor` — see that class's
+    docstring; serialized into saved JSON so `--continue` can pick it up.
     """
     query: Query
     result: str  # 'success', 'failed to load', 'timeout', etc.
     data: list[dict]
     time_started: datetime
     time_taken: timedelta
+    last_cursor: str | None = None
 
     @classmethod
     def from_outcome(cls, query: Query, outcome: ScrapeOutcome) -> "ScrapingResult":
@@ -327,6 +428,7 @@ class ScrapingResult:
             data=outcome.data,
             time_started=outcome.time_started,
             time_taken=outcome.time_taken,
+            last_cursor=outcome.last_cursor,
         )
 
     def to_dict(self) -> dict:
@@ -337,6 +439,7 @@ class ScrapingResult:
             'data': self.data,
             'time_started': str(self.time_started),
             'time_taken': str(self.time_taken),
+            'last_cursor': self.last_cursor,
         }
 
     def to_json(self) -> str:
