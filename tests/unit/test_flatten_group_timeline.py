@@ -15,7 +15,7 @@ from fbscrape.response import FacebookGraphQLParser
 from tests.conftest import load_fixture_or_skip
 
 PARSER = FacebookGraphQLParser()
-FIXTURE_NAME = "group_timeline_hybrid"
+FIXTURE_NAME = "group_timeline"
 
 
 # Expected top-level keys on every flattened GroupTimeline row. Mirrors
@@ -64,9 +64,9 @@ def flat_rows(records):
 
 
 def test_every_record_flattens(records, flat_rows):
-    """Most records should flatten — a high failure rate signals shape drift."""
+    """All records should flatten."""
     pct = len(flat_rows) / len(records)
-    assert pct >= 0.95, (
+    assert len(flat_rows) == len(records), (
         f"only {len(flat_rows)}/{len(records)} ({pct:.0%}) records flattened — "
         f"check for unrecognized story shapes"
     )

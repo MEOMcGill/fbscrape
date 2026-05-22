@@ -152,28 +152,11 @@ class BrowserSession:
                 logger.info(f"Browser session initialized for {self.account.display_name} (auto_login=False)")
                 return
 
-            if self.account.cookies:
-                logger.debug(f"Account has {len(self.account.cookies)} cookies, injecting...")
-                try:
-                    await self._context.add_cookies(self.account.cookies)
-                    logger.info(f"Injected {len(self.account.cookies)} cookies for {self.account.display_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to inject cookies for {self.account.display_name}: {e}")
-
-                if await _login.check_logged_in(self, timeout=5.0):
-                    await _login._on_login_success(self)
-                    logger.info(f"Browser session initialized for {self.account.display_name} (already logged in)")
-                    return
-
-                await _login.resolve_not_logged_in(self)
-                logger.info(f"Browser session initialized for {self.account.display_name}")
-            else:
-                logger.debug("No cookies available, going straight to form login")
-                if not await _login.login_automatic(self):
-                    raise FailedLoginError(
-                        f"Failed to login for {self.account.display_name} (no login form)"
-                    )
-                logger.info(f"Browser session initialized for {self.account.display_name} (form login)")
+            # Production login orchestrator: cookies → automatic → manual
+            # (non-headless only). Raises typed exceptions on terminal failure;
+            # the worker catches them to drive account rotation.
+            await _login.login(self)
+            logger.info(f"Browser session initialized for {self.account.display_name}")
         except FailedLoginError as e:
             logger.error(f"Failed to login for {self.account.display_name}: {e}")
             try:
@@ -233,8 +216,8 @@ class BrowserSession:
     async def user_timeline_manual(
         self,
         handle: str,
-        start_date: str,
-        end_date: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
         scroll_window_height_coefficient: float = 3.0,
         post_nav_sleep_seconds: float = 5.0,
         inter_scroll_sleep_range: tuple[float, float] = (2.0, 4.5),
@@ -248,7 +231,10 @@ class BrowserSession:
 
         Args:
             handle: Facebook username/handle.
-            start_date / end_date: YYYY-MM-DD (inputs are not re-validated here).
+            start_date / end_date: YYYY-MM-DD or None (open lower / upper
+                bound). When start_date is None, the "oldest post < start"
+                stop is disabled — the scrape relies on no_new_posts_streak
+                and the GraphQL-silence watchdog for termination.
 
         Returns:
             ScrapeOutcome.
@@ -261,8 +247,12 @@ class BrowserSession:
 
         scrape_start_time = datetime.now(timezone.utc)
 
-        start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
-        end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+        start_datetime = (
+            datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+        )
+        end_datetime = (
+            datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
+        )
 
         total_scrolls = 0
         no_new_posts_count = 0
@@ -377,7 +367,7 @@ class BrowserSession:
                     previous_post_count = current_post_count
                     logger.debug(f"@{handle} iter {total_scrolls}: progress! new count={current_post_count}")
 
-                if current_post_count > 0:
+                if current_post_count > 0 and start_datetime is not None:
                     oldest_timestamp = self._find_oldest_post_timestamp(posts)
 
                     if oldest_timestamp:
@@ -459,8 +449,8 @@ class BrowserSession:
     async def user_timeline_hybrid(
         self,
         handle: str,
-        start_date: str,
-        end_date: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
         pagination_count: int = 3,
         scroll_burst_every: int = 10,
         scroll_burst_size_range: tuple[int, int] = (2, 5),
@@ -480,7 +470,12 @@ class BrowserSession:
 
         Args:
             handle: Facebook username/handle.
-            start_date / end_date: YYYY-MM-DD (inputs are not re-validated here).
+            start_date / end_date: YYYY-MM-DD or None. When end_date is None,
+                no `beforeTime` is injected into replay bodies (the CLI layer
+                normally auto-fills today to mirror FB's UI; passing None
+                directly is an opt-out). When start_date is None, the
+                date-bounded stops (`OldestInBatchBelowStartDate`,
+                `ConsecutiveOutOfRange`) no-op via their existing guards.
 
         Returns:
             ScrapeOutcome.
@@ -494,16 +489,20 @@ class BrowserSession:
         target_url = f"https://www.facebook.com/{handle}/"
         scrape_start_time = datetime.now(timezone.utc)
 
-        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        # afterTime: start-of-day UTC, inclusive. None when start_date omitted.
+        start_unix: int | None = None
+        if start_date:
+            start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            start_unix = int(start_datetime.timestamp())
 
-        # afterTime: start-of-day UTC, inclusive.
-        start_unix = int(start_datetime.timestamp())
-
-        # beforeTime: end-of-day UTC capped at "now" (mirrors FB's UI when end_date is today).
-        end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
-        now_utc = datetime.now(timezone.utc)
-        end_unix = int(min(end_of_day, now_utc).timestamp())
+        # beforeTime: end-of-day UTC capped at "now". None when end_date omitted
+        # (loop will skip `beforeTime` injection — see `inject_before_time`).
+        end_unix: int | None = None
+        if end_date:
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
+            now_utc = datetime.now(timezone.utc)
+            end_unix = int(min(end_of_day, now_utc).timestamp())
 
         loop_params = {
             "pagination_count": pagination_count,
@@ -800,14 +799,20 @@ class BrowserSession:
         target_url = f"https://www.facebook.com/groups/{handle}/"
         scrape_start_time = datetime.now(timezone.utc)
 
-        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        start_unix = int(start_datetime.timestamp())
-        # Upper bound for ConsecutiveOutOfRange — capped at now (FB can't
-        # return future posts, but matches UserTimeline's computation).
-        end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
-        now_utc = datetime.now(timezone.utc)
-        end_unix = int(min(end_of_day, now_utc).timestamp())
+        # Date bounds are purely client-side here (GCFRSPQ has no server-side
+        # date filter). Either / both may be None — stop conditions are
+        # None-safe via their existing guards, and the loop will not inject
+        # `beforeTime` either way (`inject_before_time=False` below).
+        start_unix: int | None = None
+        if start_date:
+            start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            start_unix = int(start_datetime.timestamp())
+        end_unix: int | None = None
+        if end_date:
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
+            now_utc = datetime.now(timezone.utc)
+            end_unix = int(min(end_of_day, now_utc).timestamp())
 
         loop_params = {
             "pagination_count": pagination_count,
@@ -1527,6 +1532,7 @@ class BrowserSession:
             .or_(self.page.get_by_text("Sorry, this page isn't available"))
             .or_(self.page.get_by_text("No Posts Yet"))
             .or_(self.page.get_by_text("This account is private"))
+            .or_(self.page.get_by_text("Only members can see who's in the group and what they post"))
         )
         if await error_indicators.count() == 0:
             return None
@@ -1559,6 +1565,9 @@ class BrowserSession:
 
         if await self.page.get_by_text("This content isn't available right now").count() > 0:
             return 'content not available'
+
+        if await self.page.get_by_text("Only members can see who's in the group and what they post").count() > 0:
+            return 'group is private'
 
         return None
 

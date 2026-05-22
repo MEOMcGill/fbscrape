@@ -231,26 +231,37 @@ fbscrape --help
 ### Scraping
 
 ```bash
-# UserTimeline — paginated, date-bounded (default mode is hybrid)
+# UserTimeline — paginated; --start-date / --end-date are both OPTIONAL.
+# When omitted: start has no lower bound; end defaults to today (UTC) to
+# mirror FB's UI fingerprint (which always sends `beforeTime`). Default
+# mode is hybrid.
 fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
 fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --headless --max-sessions 2
+
+# Open-ended UserTimeline scrape — pull the most recent N posts with no date filter.
+fbscrape scrape user-timeline zuck --max-posts 500
 
 # Force the scroll-driven path (deprecated; UserTimeline only)
 fbscrape scrape user-timeline zuck --start-date 2024-01-01 --mode manual
 
-# Search — paginated, date-bounded, hybrid only
+# Search — paginated, date-bounded, hybrid only (no-date URL form is TODO).
 fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
 fbscrape scrape search --input-file queries.csv
 
 # GroupTimeline — paginated, hybrid only. `handle` accepts vanity OR numeric
-# group id. `--end-date` is advisory (FB has no server-side date filter for
-# group feeds). Default sort is TOP_POSTS (matches FB UI; lowest-fingerprint
-# and empirically safer for sustained scraping than CHRONOLOGICAL); under
-# non-chronological sorts, termination is driven by --max-consecutive-out-of-
-# range (default 20 = bail after N posts in a row outside the date window).
+# group id. `--start-date` and `--end-date` are BOTH OPTIONAL (FB's UI sends
+# no date filter on group feeds — when omitted there is no client-side
+# bound either). Default sort is TOP_POSTS (matches FB UI; lowest-
+# fingerprint and empirically safer for sustained scraping than
+# CHRONOLOGICAL); under non-chronological sorts, termination is driven by
+# --max-consecutive-out-of-range (default 20 = bail after N posts in a row
+# outside the date window — no-op when no dates are provided), or
+# --max-posts.
 fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 --end-date 2025-01-01
 fbscrape scrape group-timeline 787909081545196 --start-date 2024-01-01
 fbscrape scrape group-timeline --input-file groups.csv --headless
+# Open-ended group scrape — pull the most recent N posts.
+fbscrape scrape group-timeline albertaseparatism --max-posts 500
 # Override sort / stop knobs:
 fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 \
     --sorting-setting CHRONOLOGICAL --max-consecutive-out-of-range 30
@@ -264,13 +275,16 @@ fbscrape scrape page-transparency --input-file pages.csv --headless
 fbscrape scrape profile-authenticity 100044331674441
 fbscrape scrape profile-authenticity --input-file users.csv --headless
 
-# Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz)
-fbscrape flatten data/posts/zuck_UserTimeline_hybrid_2024-01-01_2025-01-01.json --format all
-fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
+# Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz).
+# Saved scrape files are named `<handle>_<endpoint>_<mode>.json{,.gz}` —
+# no date segment. The actual scrape parameters live in the file's
+# `query.query` field.
+fbscrape flatten data/posts/zuck_UserTimeline_hybrid.json --format all
+fbscrape flatten data/posts/ --format parquet
 fbscrape flatten data/posts/ --output data/merged.parquet --concat
 
 # Download media (within ~3 days of scrape — fbcdn URLs expire ~4-5 days out)
-fbscrape download-media data/posts/zuck_UserTimeline_hybrid_…json --include-thumbnails
+fbscrape download-media data/posts/zuck_UserTimeline_hybrid.json --include-thumbnails
 
 # Inspect a cURL copied from DevTools — prints a structured GraphQL summary
 # (friendly_name, doc_id, decoded `variables` JSON, key headers). Cookie /

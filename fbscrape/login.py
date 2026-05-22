@@ -10,10 +10,21 @@ the manual breakpoint-driven flow for human-in-the-loop logins.
 API surface (functions take a BrowserSession because the session owns the
 playwright page/context, the AccountsPool, and the response interceptor):
 
-    login_automatic(session)  -> form-fill flow used by Worker on scrape start
-    login_manual(session)     -> open facebook.com, breakpoint() for human
-    check_logged_in(session)  -> GraphQL-viewer-based login detection
-    resolve_not_logged_in(session)  -> obstacle handlers + form-login fallback
+    login(session)            -> production orchestrator: cookies → automatic
+                                 → manual (non-headless only). Raises typed
+                                 exceptions on terminal failure.
+    login_with_cookies(session) -> cookie-injection + viewer probe.
+    login_automatic(session)  -> form-fill flow (with Continue-interstitial fast
+                                 path); used by `login()` when cookies fail.
+    login_manual(session)     -> open facebook.com, breakpoint() for human.
+    check_logged_in(session)  -> GraphQL-viewer-based login detection.
+
+Helper contract: each `login_*` function returns True on confirmed success,
+False on "this method is N/A or didn't authenticate" (caller should try the
+next method), and raises a typed exception (CheckpointError, AccountDisabledError,
+AutomationCheckpointError, TransientLoginError, FailedLoginError) on actual
+account-state problems. These typed exceptions are caught upstream by
+`Worker.execute_task`, which decides account rotation policy.
 
 Internal helpers (popup dismissal, human-like typing, login-form detection,
 post-form URL classification) live as module-level coroutines and take the
@@ -49,6 +60,28 @@ LOGIN_FORM_MAX_ATTEMPTS = 2
 
 # ==================== Public API ====================
 
+async def login(session: "BrowserSession") -> None:
+    """Production login orchestrator: cookies → automatic → manual (non-headless only).
+
+    Returns None on success. Raises a typed exception on terminal failure;
+    typed exceptions from the sub-functions (CheckpointError family,
+    TransientLoginError, etc.) propagate straight to the worker.
+
+    Helpers return False to signal "this method is N/A or didn't authenticate"
+    — that's the trigger to fall through to the next method on the SAME account.
+    """
+    if await login_with_cookies(session):
+        return
+    if await login_automatic(session):
+        return
+    if not session.headless:
+        if await login_manual(session):
+            return
+    raise FailedLoginError(
+        f"All login methods failed for {session.account.display_name}"
+    )
+
+
 async def login_automatic(session: "BrowserSession") -> bool:
     """
     Execute Facebook form-fill login flow if needed.
@@ -77,6 +110,25 @@ async def login_automatic(session: "BrowserSession") -> bool:
 
     # Decline cookies popup
     await _clear_pre_login_popups(session)
+
+    # Continue-interstitial fast path: FB sometimes shows a "Continue → enter
+    # password → Log in" re-auth screen when there's partial session state
+    # (typically from cookies that almost authenticated). Clicking through it
+    # is faster than a full form-fill. Only fires if the Continue button is
+    # actually visible — defensive 3 s visibility check inside the helper.
+    # Must run BEFORE clear_cookies, since the interstitial relies on the
+    # partial session cookies being present.
+    if await _handle_continue_interstitial(session):
+        if await check_logged_in(session, timeout=10.0):
+            await _on_login_success(session)
+            logger.info(f"Login successful via Continue interstitial for {session.account.display_name}")
+            return True
+        logger.debug("Continue interstitial ran but login still not confirmed; falling through to form-fill")
+
+    # Wipe any lingering cookies so FB serves the regular login form (bad
+    # cookies can otherwise hide the form by making FB think we're partially
+    # logged in). No-op when there are no cookies.
+    await session._context.clear_cookies()
 
     # Check if login form is visible
     if not await _is_login_form_visible(session):
@@ -181,20 +233,29 @@ async def login_automatic(session: "BrowserSession") -> bool:
 
 
 async def login_with_cookies(session: "BrowserSession") -> bool:
-    """
-    Inject the account's persisted cookies and verify with the GraphQL viewer
-    probe. Does NOT fall back to form login on failure — caller decides what
-    to do next.
+    """Inject the account's persisted cookies and verify via URL classification
+    + GraphQL viewer probe.
 
-    Used by `fbscrape login --mode cookies` for "are my cookies still valid?"
-    checks. Production scraping uses the auto path in BrowserSession.initialize()
-    which DOES fall back through `resolve_not_logged_in()` → form login.
+    Pipeline:
+        1. If no cookies stored → return False.
+        2. Inject cookies; on add_cookies exception → return False.
+        3. Explicit goto(facebook.com) — add_cookies doesn't navigate.
+        4. URL classification via `_wait_for_log_in_outcome`. Raises a typed
+           exception on `/checkpoint/...` / `/two_step_verification/` URLs;
+           returns True for "home"-shaped URLs (could-be-logged-in); returns
+           False if URL never settled into anything recognized.
+        5. If URL is home-shaped, confirm via `check_logged_in` (viewer-bearing
+           GraphQL probe — authoritative for "really logged in").
 
     Returns:
-        True  if cookies got us logged in (also runs the post-success
-              bookkeeping — refreshes cookies in DB, marks active, etc.).
-        False if the account has no stored cookies, cookie injection failed,
-              or the viewer probe didn't see a logged-in session.
+        True if cookies authenticated us (URL is home + viewer fired); also runs
+        `_on_login_success` (refreshes cookies in DB, marks active, etc.).
+        False if no cookies / add_cookies failed / URL didn't settle / URL was
+        home but viewer never fired (caller should fall through to form login).
+
+    Raises:
+        AccountDisabledError / CheckpointError / AutomationCheckpointError if
+        FB redirected the navigation to a known failure URL.
     """
     if not session.account.cookies:
         logger.warning(f"No cookies stored for {session.account.display_name}")
@@ -209,27 +270,44 @@ async def login_with_cookies(session: "BrowserSession") -> bool:
         logger.warning(f"Failed to inject cookies for {session.account.display_name}: {e}")
         return False
 
-    if await check_logged_in(session, timeout=10.0):
-        await _on_login_success(session)
-        return True
+    # add_cookies doesn't navigate — we need to actually visit FB before any
+    # URL classification or viewer probe makes sense.
+    await session.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
 
-    logger.warning(
-        f"Cookies for {session.account.display_name} did not yield a logged-in session"
-    )
-    return False
+    # URL classification first — raises typed exception on checkpoint URLs.
+    # Returns True for "home"-shaped URLs (necessary-but-not-sufficient for
+    # being logged in); False if URL didn't settle into any known pattern.
+    if not await _wait_for_log_in_outcome(session):
+        logger.warning(
+            f"Cookies for {session.account.display_name}: URL never settled into known pattern"
+        )
+        return False
 
+    # URL is home-shaped. Confirm via viewer-bearing GraphQL probe.
+    if not await check_logged_in(session, timeout=10.0):
+        logger.warning(
+            f"Cookies for {session.account.display_name}: home URL but viewer never fired"
+        )
+        return False
+
+    await _on_login_success(session)
+    return True
 
 async def login_manual(session: "BrowserSession") -> bool:
-    """
-    Open facebook.com, drop into a pdb breakpoint so the human can complete
+    """Open facebook.com, drop into a pdb breakpoint so the human can complete
     login by hand (typically through the noVNC viewport when running in the
     container), then return.
 
+    The human's word is taken at face value — no URL classification or viewer
+    check after `c`. That's the point of manual: the operator drove it.
+
     Returns:
-        True  if the user typed `c` (continue) at the prompt — caller should
-              persist cookies via `session.save_cookies()`.
-        False if the user typed `q` (quit) or interrupted with Ctrl-C — caller
-              should NOT touch persisted cookies.
+        True  if the user typed `c` (continue) at the prompt. Caller is
+              responsible for `save_cookies()`.
+
+    Raises:
+        FailedLoginError if the user typed `q` (quit) or interrupted with
+        Ctrl-C / Ctrl-D — no cookies should be persisted in that case.
     """
     page = session.page
     logger.info(f"login_manual() for {session.account.display_name}")
@@ -249,9 +327,11 @@ async def login_manual(session: "BrowserSession") -> bool:
 
     try:
         breakpoint()
-    except (bdb.BdbQuit, KeyboardInterrupt):
+    except (bdb.BdbQuit, KeyboardInterrupt) as e:
         logger.info("login_manual: aborted by user")
-        return False
+        raise FailedLoginError(
+            f"Manual login aborted for {session.account.display_name}"
+        ) from e
     return True
 
 
@@ -288,6 +368,9 @@ async def check_logged_in(session: "BrowserSession", timeout: float = 10.0) -> b
                     f"({temp_interceptor.get_graphql_request_count()} GraphQL responses seen)"
                 )
                 return True
+
+            await asyncio.sleep(interval)
+            await session.page.reload(wait_until="domcontentloaded") # relaod - sometimes
             await asyncio.sleep(interval)
             elapsed += interval
 
@@ -298,43 +381,6 @@ async def check_logged_in(session: "BrowserSession", timeout: float = 10.0) -> b
         return False
     finally:
         temp_interceptor.stop_interception()
-
-
-async def resolve_not_logged_in(session: "BrowserSession") -> None:
-    """Handle all known 'not-yet-logged-in' states after cookie injection.
-
-    Tries each registered obstacle handler in order. Each handler self-detects
-    its case and, if matched, performs the recovery action. After any match we
-    re-verify with `check_logged_in` (GraphQL-based, DOM-independent). If no
-    handler succeeds in getting us logged in, we fall back to the last resort:
-    wipe cookies and run the full `login_automatic()` form flow.
-
-    To add a new obstacle, define a coroutine `_handle_<case>(session) -> bool`
-    that returns True iff it matched, and register it in `obstacle_handlers`.
-
-    Raises:
-        FailedLoginError: if no handler and no fallback resulted in a login.
-    """
-    obstacle_handlers = [
-        _handle_continue_interstitial,
-        # future: _handle_2fa_challenge,
-        # future: _handle_checkpoint,
-    ]
-
-    for handler in obstacle_handlers:
-        if not await handler(session):
-            continue
-        logger.info(f"Login obstacle matched by {handler.__name__}")
-        if await check_logged_in(session, timeout=10.0):
-            await _on_login_success(session)
-            return
-        logger.warning(f"{handler.__name__} ran but login still not confirmed")
-
-    # Last resort: wipe cookies and run the full login form flow.
-    logger.warning(f"No obstacle handler succeeded — falling back to full login for {session.account.display_name}")
-    await session._context.clear_cookies()
-    if not await login_automatic(session):
-        raise FailedLoginError(f"Failed to login for {session.account.display_name}")
 
 
 # ==================== Post-success bookkeeping ====================
@@ -434,14 +480,18 @@ async def _wait_for_log_in_outcome(session: "BrowserSession") -> bool:
     we persist `error_msg` + mark the account inactive *before* raising,
     so higher layers don't need a second DB write.
     """
+    # "home" is a necessary-but-not-sufficient outcome — FB serves these URLs to
+    # both logged-in users (real home feed) AND logged-out users (login form
+    # rendered on /). Callers MUST follow up with a viewer-bearing GraphQL probe
+    # (`check_logged_in`) before declaring success.
     outcomes: list[tuple[str, str]] = [
         (r"/checkpoint/disabled/",   "disabled"),
         (r"/checkpoint/",            "checkpoint"),
         (r"/two_step_verification/", "two_factor"),
         (r"/two_factor/",            "two_factor"),
-        (r"/?home",                  "logged_in"),  # /home, /home.php
-        (r"/?$",                     "logged_in"),  # bare root (host or host/)
-        (r"/?\?",                    "logged_in"),  # query-only (host?... / host/?...)
+        (r"/?home",                  "home"),  # /home, /home.php
+        (r"/?$",                     "home"),  # bare root (host or host/)
+        (r"/?\?",                    "home"),  # query-only (host?... / host/?...)
     ]
     host_re = r"https://(?:www|m|web|mbasic)\.facebook\.com"
     wait_re = re.compile(
@@ -474,7 +524,8 @@ async def _wait_for_log_in_outcome(session: "BrowserSession") -> bool:
 async def _dispatch_login_outcome(session: "BrowserSession", kind: str, url: str) -> bool:
     """Route a classified login outcome to its handler.
 
-    `logged_in` returns True. Failure kinds raise the corresponding exception
+    `home` returns True (URL is FB homepage — caller still owes a viewer-bearing
+    GraphQL confirmation). Failure kinds raise the corresponding exception
     — all info needed by the worker is on the exception (`url` attr) and in
     the DB (`error_msg`).
 
@@ -482,7 +533,9 @@ async def _dispatch_login_outcome(session: "BrowserSession", kind: str, url: str
     `automation_checkpoint` is the exception: account stays active and the
     worker locks it 24h via `rotate_account(lock_until, error_msg)`.
     """
-    if kind == "logged_in":
+    if kind == "home":
+        # URL is FB homepage — could be logged in OR logged out (login form).
+        # Caller must follow up with a viewer-bearing GraphQL probe.
         return True
 
     # Refine the generic /checkpoint/ kind into automation_checkpoint when the

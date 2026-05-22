@@ -49,7 +49,13 @@ class Query:
     #   }
     ENDPOINT_REGISTRY: ClassVar[dict] = {
         "UserTimeline": {
-            "query_required": ["handle", "start_date", "end_date"],
+            # `start_date` and `end_date` are *optional* (not in query_required).
+            # When `end_date` is omitted, the CLI auto-fills today (FB's UI
+            # always sends `beforeTime`, and we mirror that fingerprint at the
+            # CLI layer). When `start_date` is omitted, no lower bound — the
+            # client-side stop conditions (`OldestInBatchBelowStartDate`,
+            # `ConsecutiveOutOfRange`) no-op via their existing `is None` guards.
+            "query_required": ["handle"],
             "modes": {
                 "manual": {
                     "params": {
@@ -179,7 +185,13 @@ class Query:
             # extracted creation_time vs. start_date (Key Design Decision: hybrid
             # date-bounded stops). cursor_reset is terminal here (no server-side
             # date filter to advance for a resume leg).
-            "query_required": ["handle", "start_date", "end_date"],
+            #
+            # `start_date` and `end_date` are *optional* (not in query_required).
+            # FB's group-feed UI sends no date filter at all (no `beforeTime` /
+            # `afterTime` variable in GCFRSPQ), so both defaults mirror that
+            # fingerprint: stay None when omitted. Client-side stop conditions
+            # are None-safe via their existing guards.
+            "query_required": ["handle"],
             "modes": {
                 "hybrid": {
                     "params": {
@@ -211,7 +223,7 @@ class Query:
                         #     as non-chronological by `assemble_default_stop_conditions`.
                         # Override via `--sorting-setting` CLI flag / scraper kwarg.
                         "sorting_setting": "TOP_POSTS",
-                        "scroll_burst_every": 30,
+                        "scroll_burst_every": 50,
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,

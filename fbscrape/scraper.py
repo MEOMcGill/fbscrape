@@ -6,14 +6,60 @@ browser sessions and account rotation automatically.
 """
 
 import asyncio
-import json
+import gzip
 from datetime import datetime, timezone, timedelta
+
+import ijson
 
 from .accounts_pool import AccountsPool
 from .logger import logger
 from .models import Query, ScrapingResult
 from .response import FacebookGraphQLParser
 from .worker_pool import WorkerPool
+
+
+def _stream_resume_state(path: str) -> tuple[str, list[str]]:
+    """Pull `(last_cursor, post_ids)` from a saved ScrapingResult without
+    materializing the whole posts array in memory.
+
+    The saved files grow to hundreds of MB compressed (multi-GB JSON);
+    a stdlib `json.load` blocks the event loop for tens of seconds to
+    minutes per file, which serializes the resume reads of every
+    target in a `--continue` batch before any browser opens. ijson's
+    yajl2_c backend streams the parse, so we touch only the top-level
+    `last_cursor` scalar and each post's `post_id` (preferring the
+    same `node.post_id` → top-level `post_id` precedence as the prior
+    load-everything path).
+
+    Accepts both `.json` and `.json.gz` (gzip-sniffed via magic bytes,
+    matching `cli._open_scrape_input`). Also accepts the legacy
+    `posts` key for files written before the `data` rename.
+    """
+    with open(path, 'rb') as fh:
+        is_gzip = fh.read(2) == b'\x1f\x8b'
+    opener = gzip.open if is_gzip else open
+
+    last_cursor = ""
+    post_ids: list[str] = []
+    node_pid: str | None = None
+    top_pid: str | None = None
+    with opener(path, 'rb') as fh:
+        for prefix, event, value in ijson.parse(fh):
+            if prefix == 'last_cursor' and event == 'string':
+                last_cursor = value or ""
+            elif prefix in ('data.item.post_id', 'posts.item.post_id') \
+                    and event == 'string':
+                top_pid = value
+            elif prefix in ('data.item.node.post_id',
+                            'posts.item.node.post_id') and event == 'string':
+                node_pid = value
+            elif prefix in ('data.item', 'posts.item') and event == 'end_map':
+                pid = node_pid or top_pid
+                if pid:
+                    post_ids.append(pid)
+                node_pid = None
+                top_pid = None
+    return last_cursor, post_ids
 
 # Cap on how many times a single high-level user_timeline call will resume
 # after a `cursor_reset` leg. Each resume submits a fresh task with end_date
@@ -102,8 +148,8 @@ class FacebookScraper:
     async def user_timeline(
         self,
         handle: str,
-        start_date: str,
-        end_date: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
         mode: str = "hybrid",
         max_posts: int = -1,
         resume_from: str | None = None,
@@ -117,8 +163,15 @@ class FacebookScraper:
 
         Args:
             handle: Facebook username/handle (e.g., "zuck")
-            start_date: Start date for scraping (YYYY-MM-DD format)
-            end_date: End date for scraping (YYYY-MM-DD format)
+            start_date: Start date for scraping (YYYY-MM-DD) or None.
+                When None, no client-side lower bound — relies on
+                `EndOfFeed` / `NoNewPostsStreak` / `MaxPostsReached` for
+                termination. The CLI does NOT auto-fill this.
+            end_date: End date for scraping (YYYY-MM-DD) or None.
+                When None, no `beforeTime` is injected into replay bodies
+                (the CLI layer normally auto-fills today to mirror FB's UI
+                fingerprint). Multi-leg cursor_reset resume is disabled
+                when end_date is None — there's no upper bound to advance.
             mode: "manual" (scroll-driven) or "hybrid" (page.request POST-driven,
                   no scroll-induced DOM growth — default).
             max_posts: Hard cap on the number of accumulated posts. `-1`
@@ -176,18 +229,11 @@ class FacebookScraper:
                     f"resume_from is only supported with mode='hybrid'; "
                     f"manual mode has no cursor concept (got mode={mode!r})"
                 )
-            from .cli import _open_scrape_input  # local: avoids cycle at module load
-            with _open_scrape_input(resume_from) as f:
-                saved = json.load(f)
-            initial_cursor = saved.get("last_cursor") or ""
-            saved_records = saved.get("data") or saved.get("posts") or []
-            saved_post_ids = [
-                pid
-                for rec in saved_records
-                for pid in [(rec.get("node") or {}).get("post_id")
-                            or rec.get("post_id")]
-                if pid
-            ]
+            # Streamed via ijson on a thread so concurrent --continue
+            # targets don't serialize on the event loop.
+            initial_cursor, saved_post_ids = await asyncio.to_thread(
+                _stream_resume_state, resume_from,
+            )
             logger.info(
                 f"UserTimeline resume from {resume_from}: "
                 f"cursor={'<set>' if initial_cursor else '<null>'}, "
@@ -274,6 +320,20 @@ class FacebookScraper:
 
             if leg.result != "cursor_reset":
                 final_result = leg.result
+                break
+
+            # Multi-leg resume only when end_date was originally set — the
+            # resume mechanism works by advancing end_date backward to the
+            # oldest collected post. With no upper bound, there's nothing
+            # to advance; cursor_reset becomes terminal with partial data
+            # preserved (mirrors GroupTimeline's policy).
+            if current_end_date is None:
+                final_result = leg.result  # "cursor_reset"
+                logger.warning(
+                    f"UserTimeline for handle={handle}: cursor_reset on leg "
+                    f"{leg_idx}; end_date is None so no multi-leg resume — "
+                    f"terminating with partial data"
+                )
                 break
 
             # Compute next leg's end_date from the oldest accumulated post's
@@ -429,10 +489,14 @@ class FacebookScraper:
         Args:
             handle: Vanity group handle (e.g. "albertaseparatism") or the
                 numeric group id — both forms resolve via `/groups/<handle>/`.
-            start_date: Start date (YYYY-MM-DD), inclusive.
-            end_date:   End date (YYYY-MM-DD), inclusive — advisory, since
-                FB has no server-side filter; it only bounds the client-side
-                stop check.
+            start_date: Start date (YYYY-MM-DD) or None. When None, no
+                client-side lower bound — relies on `EndOfFeed` /
+                `NoNewPostsStreak` / `MaxPostsReached` / `MaxPaginations`
+                for termination.
+            end_date:   End date (YYYY-MM-DD) or None — advisory either way,
+                since FB has no server-side filter for group feeds. When set,
+                it only bounds the client-side stop check (e.g.
+                `ConsecutiveOutOfRange`).
             mode: Currently only "hybrid" is supported.
             max_posts: Hard cap on the number of accumulated posts. `-1`
                   (default) disables the cap. Enforced at batch boundaries
@@ -472,18 +536,11 @@ class FacebookScraper:
         # ScrapingResult and thread them through as Query params. Accepts
         # both .json and .json.gz transparently.
         if resume_from:
-            from .cli import _open_scrape_input  # local import: avoids cycle at module load
-            with _open_scrape_input(resume_from) as f:
-                saved = json.load(f)
-            saved_cursor = saved.get("last_cursor") or ""
-            saved_records = saved.get("data") or saved.get("posts") or []
-            saved_post_ids = [
-                pid
-                for rec in saved_records
-                for pid in [(rec.get("node") or {}).get("post_id")
-                            or rec.get("post_id")]
-                if pid
-            ]
+            # Streamed via ijson on a thread so concurrent --continue
+            # targets don't serialize on the event loop.
+            saved_cursor, saved_post_ids = await asyncio.to_thread(
+                _stream_resume_state, resume_from,
+            )
             cleaned_params["initial_cursor"] = saved_cursor
             cleaned_params["seen_post_ids_to_skip"] = saved_post_ids
             logger.info(

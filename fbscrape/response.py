@@ -229,18 +229,30 @@ class FacebookGraphQLParser:
 
     # ----- public flatten API -----
 
-    def flatten(self, record: dict, endpoint: str) -> dict | None:
-        """Flatten one raw record dict into a row dict.
+    def flatten(
+        self,
+        record: dict | list[dict],
+        endpoint: str,
+    ) -> dict | list[dict | None] | None:
+        """Flatten one record — or a list of records — into row dict(s).
 
         Args:
-            record: One element of `ScrapingResult.data`. For post-stream
-                endpoints (UserTimeline, Search) this is a `data.<root>` dict
-                wrapping a Story; for single-record endpoints (PageTransparency)
-                this is the record dict directly.
+            record: Either one element of `ScrapingResult.data`, or the full
+                list. For post-stream endpoints (UserTimeline, Search,
+                GroupTimeline) each element is a `data.<root>` dict wrapping a
+                Story; for single-record endpoints (PageTransparency,
+                ProfileAuthenticity) it's the record dict directly.
             endpoint: Endpoint name from the originating Query (e.g. "UserTimeline").
 
-        Returns the row dict, or None if the record can't be resolved.
-        Routes to `ENDPOINT_FLATTENERS[endpoint]`.
+        Returns:
+            - `dict | None` when `record` is a dict — the row dict, or None if
+              the record can't be resolved.
+            - `list[dict | None]` when `record` is a list — one entry per input,
+              with None preserved for records that can't be resolved (callers
+              that want only successes should filter Nones themselves).
+
+        Raises `ValueError` if `endpoint` is unregistered or `record` is
+        neither a dict nor a list. Routes to `ENDPOINT_FLATTENERS[endpoint]`.
         """
         method = self.ENDPOINT_FLATTENERS.get(endpoint)
         if not method:
@@ -248,7 +260,17 @@ class FacebookGraphQLParser:
                 f"No flattener registered for endpoint: {endpoint!r}. "
                 f"Registered: {list(self.ENDPOINT_FLATTENERS)}"
             )
-        return getattr(self, method)(record)
+
+        if isinstance(record, dict):
+            return getattr(self, method)(record)
+        elif isinstance(record, list):
+            return [
+                getattr(self, method)(r) for r in record
+            ]
+        else:
+            raise ValueError(
+                f"Unrecognized record type: {type(record)} please pass either a dict or a list[dict]."
+            )
 
     # ----- endpoint orchestrators -----
 

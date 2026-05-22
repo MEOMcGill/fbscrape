@@ -147,6 +147,37 @@ def test_to_dict_and_to_json_roundtrip():
     assert parsed["query"] == d["query"]
 
 
+@pytest.mark.parametrize(
+    "endpoint, mode, query",
+    [
+        # UserTimeline: dates are optional — neither required field nor None-rejecting.
+        ("UserTimeline", "hybrid",  {"handle": "zuck"}),
+        ("UserTimeline", "hybrid",  {"handle": "zuck", "start_date": "2024-01-01"}),
+        ("UserTimeline", "hybrid",  {"handle": "zuck", "end_date": "2025-01-01"}),
+        ("UserTimeline", "manual",  {"handle": "zuck"}),
+        # GroupTimeline: same policy.
+        ("GroupTimeline", "hybrid", {"handle": "albertaseparatism"}),
+        ("GroupTimeline", "hybrid", {"handle": "1182661777030900", "end_date": "2025-01-01"}),
+    ],
+)
+def test_optional_dates_accepted(endpoint, mode, query):
+    """UserTimeline + GroupTimeline accept missing start_date / end_date."""
+    q = Query(endpoint=endpoint, mode=mode, query=dict(query), params={})
+    # Stored as-given; absent keys stay absent (not coerced to None values).
+    for k, v in query.items():
+        assert q.query[k] == v
+
+
+def test_search_still_requires_dates():
+    """Search keeps both date fields required — no-date URL form not yet supported."""
+    with pytest.raises(ValueError, match="missing required fields"):
+        Query(
+            endpoint="Search", mode="hybrid",
+            query={"query_text": "x"},  # no dates
+            params={},
+        )
+
+
 def test_endpoint_registry_top_level_keys_pinned():
     """Lock the set of supported endpoints — adding one is a user-visible
     change, so the test should explicitly fail and force an update here."""

@@ -650,6 +650,7 @@ def login(ctx, identifier, mode, cookies, headless):
     """
     from .browser_session import BrowserSession
     from .login import login_automatic, login_manual, login_with_cookies
+    from .exceptions import FailedLoginError
 
     async def _login():
         pool = AccountsPool(ctx.obj['db'])
@@ -663,22 +664,12 @@ def login(ctx, identifier, mode, cookies, headless):
         async with BrowserSession(
             account, pool, headless=headless, auto_login=False
         ) as session:
-            cookies_injected = False
-            if cookies:
-                if not session.account.cookies:
-                    click.echo(f"--cookies: no stored cookies for {identifier}; ignoring flag.")
-                else:
-                    await session._context.add_cookies(session.account.cookies)
-                    click.echo(
-                        f"--cookies: injected {len(session.account.cookies)} stored cookies "
-                        f"into browser context."
-                    )
-                    cookies_injected = True
-
             if mode == 'manual':
-                ok = await login_manual(session)
-                if not ok:
-                    click.echo("Aborted; no cookies saved.")
+                # login_manual raises FailedLoginError on `q`/Ctrl-C abort.
+                try:
+                    await login_manual(session)
+                except FailedLoginError as e:
+                    click.echo(f"Aborted; no cookies saved. ({e})")
                     return
                 # Manual flow doesn't run _on_login_success, so save explicitly.
                 await session.save_cookies()
@@ -686,26 +677,32 @@ def login(ctx, identifier, mode, cookies, headless):
                 return
 
             # mode == 'automatic'
-            # If cookies were pre-injected, try the cookie-only path first.
-            # login_with_cookies re-adds them (idempotent) then probes via
-            # the GraphQL viewer endpoint; on success it persists fresh
+            # If --cookies, try the cookie path first. login_with_cookies
+            # re-injects them, probes the URL classifier (raises on checkpoint),
+            # then confirms via GraphQL viewer. On success it persists fresh
             # cookies and marks the account active.
-            if cookies_injected:
-                if await login_with_cookies(session):
-                    click.echo(f"Login OK via cookies for {identifier} (refreshed in DB).")
-                    return
-                click.echo("Cookies didn't validate — falling back to form-fill.")
-                await session._context.clear_cookies()
+            try:
+                if cookies:
+                    if not session.account.cookies:
+                        click.echo(f"--cookies: no stored cookies for {identifier}; ignoring flag.")
+                    elif await login_with_cookies(session):
+                        click.echo(f"Login OK via cookies for {identifier} (refreshed in DB).")
+                        return
+                    else:
+                        click.echo("Cookies didn't validate — falling back to form-fill.")
 
-            # login_automatic returns False on "no login form visible",
-            # raises typed exceptions on checkpoint / disabled / transient.
-            # On success it runs _on_login_success which already saves cookies.
-            ok = await login_automatic(session)
-            if not ok:
-                raise click.ClickException(
-                    f"Automatic login failed for {identifier}: no login form visible"
-                )
-            click.echo(f"Login OK for {identifier} (cookies persisted).")
+                # login_automatic returns False on "no login form visible",
+                # raises typed exceptions on checkpoint / disabled / transient.
+                # On success it runs _on_login_success which already saves cookies.
+                if not await login_automatic(session):
+                    raise click.ClickException(
+                        f"Automatic login failed for {identifier}: no login form visible"
+                    )
+                click.echo(f"Login OK for {identifier} (cookies persisted).")
+            except FailedLoginError as e:
+                # Covers CheckpointError, AccountDisabledError, AutomationCheckpointError,
+                # TransientLoginError, and generic FailedLoginError — all subclasses.
+                raise click.ClickException(f"Login failed for {identifier}: {e}")
 
     run_async(_login())
 
@@ -834,6 +831,8 @@ def _load_scrape_targets(
 
 def _resolve_targets(
     keys, input_file, start_date, end_date, key_field: str = 'handle',
+    require_start: bool = True, require_end: bool = True,
+    default_end_to_today: bool = True,
 ) -> list[dict]:
     """Resolve identifiers + dates from CLI flags and/or --input-file into a
     flat list of {<key_field>, start_date, end_date} dicts.
@@ -841,13 +840,19 @@ def _resolve_targets(
     `keys` is the tuple of positional CLI args (handles for UserTimeline,
     query texts for Search). `key_field` names the per-row identifier field.
 
+    Per-endpoint policy via the boolean flags:
+      - `require_start` — when False, missing start_date is allowed (None).
+      - `require_end` — when False, missing end_date is allowed (None).
+      - `default_end_to_today` — when True, a missing end_date is filled
+        with today's UTC date (mirrors FB UI fingerprint for UserTimeline).
+        Independent of `require_end`; both can be False to allow truly
+        open upper bounds (GroupTimeline) or only one False to require
+        a server-side default (Search keeps `True, True, True`).
+
     Enforces:
     - exactly one of (positional `keys`, --input-file) is supplied
     - if the file supplies a start_date for any row, --start-date must NOT be set
     - same exclusivity for end_date
-    - every resolved row ends up with a start_date (CLI flag fills rows that
-      don't carry one); end_date defaults to today UTC if neither file nor flag
-      supplies it
     """
     if keys and input_file:
         raise click.UsageError(
@@ -877,18 +882,45 @@ def _resolve_targets(
     resolved = []
     for t in targets:
         sd = t.get('start_date') or start_date
-        if sd is None:
+        if sd is None and require_start:
             raise click.UsageError(
                 f"start_date missing for {key_field} {t[key_field]!r} "
                 f"(no row value, no --start-date flag)"
             )
-        ed = t.get('end_date') or end_date or today
+        ed = t.get('end_date') or end_date
+        if ed is None and default_end_to_today:
+            ed = today
+        if ed is None and require_end:
+            raise click.UsageError(
+                f"end_date missing for {key_field} {t[key_field]!r} "
+                f"(no row value, no --end-date flag)"
+            )
         resolved.append({
             key_field: t[key_field],
             'start_date': sd,
             'end_date': ed,
         })
     return resolved
+
+
+def _build_stem(handle: str, endpoint: str, mode: str) -> str:
+    """File-name stem for saved scrape results.
+
+    Dates are intentionally NOT included — the saved JSON's `query.query`
+    field carries the actual scrape parameters, and the stem is the key
+    that `--continue` / `--skip-existing` match on. One stem per (handle,
+    endpoint, mode) means a rolling archive across multiple runs.
+    """
+    return f"{handle.replace('.', '_')}_{endpoint}_{mode}"
+
+
+def _existing_output_for_stem(output_dir: str, stem: str) -> str | None:
+    """Return path to a prior `.json{,.gz}` for this stem, or None."""
+    for ext in ('.json.gz', '.json'):
+        p = os.path.join(output_dir, f"{stem}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
 
 
 @cli.group()
@@ -905,13 +937,16 @@ def scrape():
                    'positional handles. If the file supplies start_date / '
                    'end_date columns, the matching CLI flag must NOT be set.')
 @click.option('--start-date', default=None,
-              help='Start date YYYY-MM-DD (how far back to scrape). Required '
-                   'unless supplied per-row via --input-file.')
+              help='Start date YYYY-MM-DD (how far back to scrape). Optional — '
+                   'when omitted there is no client-side lower bound and the '
+                   'scrape relies on end-of-feed / no-new-posts / max-posts '
+                   'termination.')
 @click.option('--end-date', default=None,
               help='End date YYYY-MM-DD (most recent date to scrape from). '
-                   'Default: today (UTC). Mutually exclusive with an end_date '
-                   'column in --input-file.')
-@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
+                   'Default: today (UTC) — mirrors FB UI fingerprint, which '
+                   'always sends `beforeTime`. Mutually exclusive with an '
+                   'end_date column in --input-file.')
+@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/)')
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=5000, type=int, help='Scrolls (or hybrid paginations) before rotating account')
 @click.option('--stall-timeout-seconds', default=None, type=int, help='[manual] bail out if no GraphQL response for N seconds (default 300, ignored for --mode hybrid)')
@@ -1014,37 +1049,29 @@ def scrape_user_timeline(
             "no cursor concept). Re-run with --mode hybrid (the default)."
         )
 
-    targets = _resolve_targets(handles, input_file, start_date, end_date)
+    # UserTimeline: start_date is optional (client-side stop only); end_date
+    # auto-fills today to mirror FB UI fingerprint (which always sends
+    # `beforeTime`).
+    targets = _resolve_targets(
+        handles, input_file, start_date, end_date,
+        require_start=False, require_end=False, default_end_to_today=True,
+    )
 
     if output_dir is None:
-        starts = [t['start_date'] for t in targets]
-        ends = [t['end_date'] for t in targets]
-        output_dir = os.path.join(
-            get_home_dir_path(), "data", "posts",
-            f"{min(starts)}_{max(ends)}",
-        )
+        output_dir = os.path.join(get_home_dir_path(), "data", "posts")
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
     if skip_existing:
-        # Mirror the filename format used by the save loop below. Note: a file
-        # existing means a prior run reached `data.save(...)` — it does NOT
-        # guarantee the scrape succeeded (errors are saved too). Delete files
-        # for failed handles if you want them retried.
+        # File existing means a prior run reached `data.save(...)` — it does
+        # NOT guarantee the scrape succeeded (errors are saved too). Delete
+        # files for failed handles if you want them retried.
         before = len(targets)
         targets = [
             t for t in targets
-            if not os.path.exists(os.path.join(
-                output_dir,
-                f"{t['handle'].replace('.', '_')}"
-                f"_UserTimeline_{mode}"
-                f"_{t['start_date']}_{t['end_date']}.json",)
-            ) and not os.path.exists(os.path.join(
-                output_dir,
-                f"{t['handle'].replace('.', '_')}"
-                f"_UserTimeline_{mode}"
-                f"_{t['start_date']}_{t['end_date']}.json.gz")
-            )
+            if _existing_output_for_stem(
+                output_dir, _build_stem(t['handle'], 'UserTimeline', mode)
+            ) is None
         ]
         skipped = before - len(targets)
         if skipped:
@@ -1085,16 +1112,9 @@ def scrape_user_timeline(
 
     def _existing_output_path(target: dict) -> str | None:
         """Return path to a prior `.json` / `.json.gz` for this target, or None."""
-        stem = (
-            f"{target['handle'].replace('.', '_')}"
-            f"_UserTimeline_{mode}"
-            f"_{target['start_date']}_{target['end_date']}"
+        return _existing_output_for_stem(
+            output_dir, _build_stem(target['handle'], 'UserTimeline', mode)
         )
-        for ext in ('.json.gz', '.json'):
-            p = os.path.join(output_dir, f"{stem}{ext}")
-            if os.path.exists(p):
-                return p
-        return None
 
     async def _scrape():
         pool = AccountsPool(ctx.obj['db'])
@@ -1106,6 +1126,7 @@ def scrape_user_timeline(
             mobile=mobile,
             raise_when_no_account=not wait_for_account,
         ) as scraper:
+            finalize_tasks: list[asyncio.Task] = []
             async for result in gather(
                 scraper.user_timeline(
                     handle=t['handle'],
@@ -1117,53 +1138,16 @@ def scrape_user_timeline(
                 )
                 for t in targets
             ):
-                data: ScrapingResult = result
-                handle = data.query.query.get('handle')
-                stem = (
-                    f"{handle.replace('.', '_')}"
-                    f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}"
-                )
-                # Merge prior data when --continue resumed this target.
-                if continue_:
-                    prior = None
-                    for ext in ('.json.gz', '.json'):
-                        p = os.path.join(output_dir, f"{stem}{ext}")
-                        if os.path.exists(p):
-                            with _open_scrape_input(p) as f:
-                                prior = json.load(f)
-                            break
-                    if prior is not None:
-                        prior_data = prior.get('data') or prior.get('posts') or []
-                        if prior_data:
-                            data.data = prior_data + data.data
-                            logger.info(
-                                f"@{handle}: merged {len(prior_data)} prior + "
-                                f"{len(data.data) - len(prior_data)} new posts "
-                                f"(total {len(data.data)})"
-                            )
-                # Auto-unstick: if this --continue resume bailed on
-                # no_new_posts_streak, the saved cursor is anchored at a
-                # position where FB serves only already-collected posts.
-                # Swap last_cursor to a deeper anchor (rank #3 oldest cursored
-                # post) so the next --continue can break the dedup loop.
-                # Same fix as `fbscrape unstick-cursor`, applied automatically.
-                if continue_ and data.result == 'no_new_posts_streak':
-                    chosen = _find_unstick_cursor(
-                        data.data, endpoint=data.query.endpoint, rank=3,
+                # Merge + save off the event loop: lets the next yielded
+                # result enter this loop body immediately instead of
+                # stalling behind a multi-minute json.load + gzip-write.
+                finalize_tasks.append(asyncio.create_task(
+                    asyncio.to_thread(
+                        _finalize_continue_result, result, output_dir, continue_,
                     )
-                    if chosen:
-                        new_cursor, diag = chosen
-                        chosen_iso = datetime.fromtimestamp(
-                            diag["chosen_created_at"], tz=timezone.utc,
-                        ).isoformat()
-                        logger.info(
-                            f"@{handle}: no_new_posts_streak on --continue resume — "
-                            f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
-                            f"data[{diag['chosen_idx']}] @ {chosen_iso}"
-                        )
-                        data.last_cursor = new_cursor
-                data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
+                ))
+            if finalize_tasks:
+                await asyncio.gather(*finalize_tasks)
 
     run_async(_scrape())
 
@@ -1178,13 +1162,15 @@ def scrape_user_timeline(
                    'handles. If the file supplies start_date / end_date '
                    'columns, the matching CLI flag must NOT be set.')
 @click.option('--start-date', default=None,
-              help='Start date YYYY-MM-DD (how far back to scrape). Required '
-                   'unless supplied per-row via --input-file.')
+              help='Start date YYYY-MM-DD (how far back to scrape). Optional — '
+                   'when omitted there is no client-side lower bound.')
 @click.option('--end-date', default=None,
               help='End date YYYY-MM-DD (advisory: FB has no server-side date '
-                   'filter for group feeds; this only bounds the client-side '
-                   'stop check). Default: today (UTC).')
-@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/{start}_{end})')
+                   'filter for group feeds, so this only bounds client-side '
+                   'stops like ConsecutiveOutOfRange). Optional — when '
+                   'omitted there is no client-side upper bound, matching '
+                   'FB\'s UI (which sends no date filter on group feeds).')
+@click.option('--output-dir', default=None, help='Directory to save results (default: data/posts/)')
 @click.option('--max-sessions', default=2, type=int, help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=5000, type=int, help='Paginations before rotating account')
 @click.option('--headless/--no-headless', default=True,
@@ -1295,15 +1281,16 @@ def scrape_group_timeline(
         )
 
     mode = 'hybrid'  # Only mode supported for GroupTimeline.
-    targets = _resolve_targets(handles, input_file, start_date, end_date)
+    # GroupTimeline: both dates fully optional (FB's UI sends no date filter
+    # on group feeds, so the cleanest fingerprint match is to send nothing
+    # unless the user explicitly bounds the scrape).
+    targets = _resolve_targets(
+        handles, input_file, start_date, end_date,
+        require_start=False, require_end=False, default_end_to_today=False,
+    )
 
     if output_dir is None:
-        starts = [t['start_date'] for t in targets]
-        ends = [t['end_date'] for t in targets]
-        output_dir = os.path.join(
-            get_home_dir_path(), "data", "posts",
-            f"{min(starts)}_{max(ends)}",
-        )
+        output_dir = os.path.join(get_home_dir_path(), "data", "posts")
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
@@ -1311,17 +1298,9 @@ def scrape_group_timeline(
         before = len(targets)
         targets = [
             t for t in targets
-            if not os.path.exists(os.path.join(
-                output_dir,
-                f"{t['handle'].replace('.', '_')}"
-                f"_GroupTimeline_{mode}"
-                f"_{t['start_date']}_{t['end_date']}.json",)
-            ) and not os.path.exists(os.path.join(
-                output_dir,
-                f"{t['handle'].replace('.', '_')}"
-                f"_GroupTimeline_{mode}"
-                f"_{t['start_date']}_{t['end_date']}.json.gz")
-            )
+            if _existing_output_for_stem(
+                output_dir, _build_stem(t['handle'], 'GroupTimeline', mode)
+            ) is None
         ]
         skipped = before - len(targets)
         if skipped:
@@ -1356,16 +1335,9 @@ def scrape_group_timeline(
 
     def _existing_output_path(target: dict) -> str | None:
         """Return path to a prior `.json` / `.json.gz` for this target, or None."""
-        stem = (
-            f"{target['handle'].replace('.', '_')}"
-            f"_GroupTimeline_{mode}"
-            f"_{target['start_date']}_{target['end_date']}"
+        return _existing_output_for_stem(
+            output_dir, _build_stem(target['handle'], 'GroupTimeline', mode)
         )
-        for ext in ('.json.gz', '.json'):
-            p = os.path.join(output_dir, f"{stem}{ext}")
-            if os.path.exists(p):
-                return p
-        return None
 
     async def _scrape():
         pool = AccountsPool(ctx.obj['db'])
@@ -1377,6 +1349,7 @@ def scrape_group_timeline(
             mobile=mobile,
             raise_when_no_account=not wait_for_account,
         ) as scraper:
+            finalize_tasks: list[asyncio.Task] = []
             async for result in gather(
                 scraper.group_timeline(
                     handle=t['handle'],
@@ -1387,55 +1360,71 @@ def scrape_group_timeline(
                 )
                 for t in targets
             ):
-                data: ScrapingResult = result
-                handle = data.query.query.get('handle')
-                stem = (
-                    f"{handle.replace('.', '_')}"
-                    f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}"
-                )
-                # Merge prior data when --continue resumed this target. Re-
-                # discover the file by stem (it hasn't been overwritten yet —
-                # the new scrape's save() runs below).
-                if continue_:
-                    prior = None
-                    for ext in ('.json.gz', '.json'):
-                        p = os.path.join(output_dir, f"{stem}{ext}")
-                        if os.path.exists(p):
-                            with _open_scrape_input(p) as f:
-                                prior = json.load(f)
-                            break
-                    if prior is not None:
-                        prior_data = prior.get('data') or prior.get('posts') or []
-                        if prior_data:
-                            data.data = prior_data + data.data
-                            logger.info(
-                                f"@{handle}: merged {len(prior_data)} prior + "
-                                f"{len(data.data) - len(prior_data)} new posts "
-                                f"(total {len(data.data)})"
-                            )
-                # Auto-unstick: see scrape user-timeline for the rationale.
-                # When --continue bails on no_new_posts_streak, swap to a
-                # deeper anchor (rank #3 oldest cursored post) so the next
-                # --continue can break the dedup loop.
-                if continue_ and data.result == 'no_new_posts_streak':
-                    chosen = _find_unstick_cursor(
-                        data.data, endpoint=data.query.endpoint, rank=3,
+                # Merge + save off the event loop: see `scrape user-timeline`.
+                finalize_tasks.append(asyncio.create_task(
+                    asyncio.to_thread(
+                        _finalize_continue_result, result, output_dir, continue_,
                     )
-                    if chosen:
-                        new_cursor, diag = chosen
-                        chosen_iso = datetime.fromtimestamp(
-                            diag["chosen_created_at"], tz=timezone.utc,
-                        ).isoformat()
-                        logger.info(
-                            f"@{handle}: no_new_posts_streak on --continue resume — "
-                            f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
-                            f"data[{diag['chosen_idx']}] @ {chosen_iso}"
-                        )
-                        data.last_cursor = new_cursor
-                data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
+                ))
+            if finalize_tasks:
+                await asyncio.gather(*finalize_tasks)
 
     run_async(_scrape())
+
+
+def _finalize_continue_result(
+    data: 'ScrapingResult',
+    output_dir: str,
+    continue_: bool,
+) -> None:
+    """Merge prior data, auto-unstick cursor, save the merged result.
+
+    Synchronous so it can be dispatched via `asyncio.to_thread` —
+    running it inline in the async for-loop blocks every other worker's
+    completion behind a single ~10k-post `json.load` + gzip-write,
+    turning a batch of 6 concurrent target completions into ~hours of
+    serialized post-processing. With to_thread the merges run on the
+    default thread pool and the scrape coroutines keep yielding.
+
+    No-op contract: if `continue_` is False, this is just a save; the
+    auto-unstick branch only fires on `no_new_posts_streak`.
+    """
+    from .logger import logger
+    handle = data.query.query.get('handle')
+    stem = _build_stem(handle, data.query.endpoint, data.query.mode)
+    if continue_:
+        prior = None
+        for ext in ('.json.gz', '.json'):
+            p = os.path.join(output_dir, f"{stem}{ext}")
+            if os.path.exists(p):
+                with _open_scrape_input(p) as f:
+                    prior = json.load(f)
+                break
+        if prior is not None:
+            prior_data = prior.get('data') or prior.get('posts') or []
+            if prior_data:
+                data.data = prior_data + data.data
+                logger.info(
+                    f"@{handle}: merged {len(prior_data)} prior + "
+                    f"{len(data.data) - len(prior_data)} new posts "
+                    f"(total {len(data.data)})"
+                )
+    if continue_ and data.result == 'no_new_posts_streak':
+        chosen = _find_unstick_cursor(
+            data.data, endpoint=data.query.endpoint, rank=3,
+        )
+        if chosen:
+            new_cursor, diag = chosen
+            chosen_iso = datetime.fromtimestamp(
+                diag["chosen_created_at"], tz=timezone.utc,
+            ).isoformat()
+            logger.info(
+                f"@{handle}: no_new_posts_streak on --continue resume — "
+                f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
+                f"data[{diag['chosen_idx']}] @ {chosen_iso}"
+            )
+            data.last_cursor = new_cursor
+    data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
 
 
 def _sanitize_query_for_filename(s: str) -> str:

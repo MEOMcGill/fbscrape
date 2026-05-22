@@ -1,6 +1,6 @@
 # Adding a new endpoint
 
-`fbscrape` is built around an endpoint × mode registry (`Query.ENDPOINT_REGISTRY`). Adding a new scrape target (e.g. `GroupTimeline`, `PageInsights`, `EventGuests`) is a wiring exercise across ~7 files. This guide is opinionated: **hybrid-first**. The scroll-driven `manual` mode exists for `UserTimeline` only and is effectively deprecated — do not add a `manual` mode to new endpoints.
+`fbscrape` is built around an endpoint × mode registry (`Query.ENDPOINT_REGISTRY`). Adding a new scrape target (e.g. `GroupTimeline`, `PageInsights`, `EventGuests`) is a wiring exercise across the runtime (7 touch points), the stop-condition framework (1 touch point if termination differs from existing endpoints), and the test suite (4 mandatory artifacts). This guide is opinionated: **hybrid-first**. The scroll-driven `manual` mode exists for `UserTimeline` only and is effectively deprecated — do not add a `manual` mode to new endpoints.
 
 The most recently added endpoint is **`GroupTimeline`** (`GroupsCometFeedRegularStoriesPaginationQuery`). It's the cleanest reference for date-bounded paginated endpoints where FB enforces no server-side date filter — when in doubt, grep for `GroupTimeline` or `group_timeline` and copy its shape. For an URL-filter-driven paginated reference, see `Search`; for a single-shot reference, see `PageTransparency`.
 
@@ -17,7 +17,7 @@ This is the checklist to paste into a chat with Claude when you want a new endpo
 
 ### 2. Inputs the caller will supply
 
-- **Required `query` fields** — what does the user need to provide to start a scrape? (`handle`, `query_text`, `group_id`, `event_id`, `start_date`, `end_date`, ...)
+- **Required `query` fields** — what does the user need to provide to start a scrape? (`handle`, `query_text`, `group_id`, `event_id`, ...). `start_date` / `end_date` should usually be **optional** (not in `query_required`) — see Key Design Decision 20 in CLAUDE.md. The CLI layer carries a per-endpoint policy (`require_start`, `require_end`, `default_end_to_today`) to drive what counts as "no dates" + whether a default fill applies. Match what FB's UI sends on the wire: if FB sends `beforeTime` always (UserTimeline), `default_end_to_today=True`; if FB sends no date filter (GroupTimeline), `default_end_to_today=False`.
 - **Optional / mode params** — anything tunable (per-page count, sleep ranges, max paginations). If you don't know yet, leave blank — Claude will copy the `Search` defaults and prune.
 
 ### 3. Navigation URL
@@ -50,8 +50,8 @@ You should end with 4 files. Attach all of them.
 
 When does a scrape stop? Common patterns:
 
-- **Date-bounded** — stop when oldest post in batch < `start_date` (this is what `UserTimeline` hybrid does).
-- **Exhaustion-only** — stop when `has_next_page` is false / `end_cursor` is null.
+- **Date-bounded** — stop when oldest post in batch < `start_date` (UserTimeline + GroupTimeline+CHRONOLOGICAL). Skipped when `start_date is None` via the existing None guard in `OldestInBatchBelowStartDate.evaluate`.
+- **Exhaustion-only** — stop when `has_next_page` is false / `end_cursor` is null. Always enabled; the natural terminator for date-free scrapes.
 - **Max-results cap** — stop after N posts.
 - **FB-imposed degradation** — if you've observed the response shape collapse mid-scrape (like the cursor-reset symptom in `UserTimeline`, see Key Design Decision 16 in CLAUDE.md), note it.
 
@@ -87,24 +87,60 @@ Attached:
 
 ## Part 2 — what Claude wires up (reference)
 
-Seven touch points, in order. `Search` is the gold-standard example for each.
+Twelve touch points across three groups: **runtime** (1–7), **stop conditions** (8, conditional), and **tests** (9–12, mandatory). `Search` / `GroupTimeline` are the gold-standard examples for the runtime touch points; the existing single-shot endpoints (`PageTransparency`, `ProfileAuthenticity`) are the references for non-paginated runtime shapes.
 
-1. **`Query.ENDPOINT_REGISTRY`** (`fbscrape/models.py`) — add a top-level entry with `query_required` and `modes: {"hybrid": {"params": {...}}}`. Copy the `Search` `params` block and adjust.
+### Runtime (7 touch points)
+
+1. **`Query.ENDPOINT_REGISTRY`** (`fbscrape/models.py`) — add a top-level entry with `query_required` and `modes: {"hybrid": {"params": {...}}}`. Copy the `Search` `params` block and adjust. Note: per Key Design Decision 20, `start_date` / `end_date` should usually **not** be in `query_required` — keep them in `params` only if FB's UI sends them on the wire.
 2. **`BrowserSession.<endpoint_snake>_hybrid`** (`fbscrape/browser_session.py`) — the per-mode scrape method. Mirrors `search_hybrid` (around `browser_session.py:711`): navigate → bootstrap scroll → capture template via the new interceptor field (#5) → pagination loop → return `ScrapeOutcome`. The pagination loop helper `_hybrid_pagination_loop` is reusable when the response is Story-tree compatible.
 3. **`Worker.ENDPOINT_MODE_METHODS`** (`fbscrape/worker.py`) — one row: `("GroupTimeline", "hybrid"): "group_timeline_hybrid"`.
-4. **`FacebookScraper.<endpoint_snake>()`** (`fbscrape/scraper.py`) — high-level wrapper. Builds the canonical `Query`, submits via `WorkerPool.submit_task`, returns `ScrapingResult`. Mirrors `FacebookScraper.search` (around `scraper.py:264`).
-5. **`ResponseInterceptor`** (`fbscrape/response.py`) — new `latest_<endpoint>_request` capture path so the hybrid template can be harvested from a natural request. Mirrors the `is_scrq` block (around `response.py:880-905`). The hybrid scrape method (#2) polls this field.
-6. **`FacebookGraphQLParser`** (`fbscrape/response.py`) — `_flatten_<endpoint>_post` orchestrator + entry in `ENDPOINT_FLATTENERS`. Most FB surfaces share the Comet Story shape, so the orchestrator is usually a thin composition of the existing `_extract_*` methods. Skip this only if you don't need flattening for this endpoint (Search currently skips it — known gap).
-7. **`cli.py`** — `@scrape.command(name='<endpoint-kebab>')` subcommand. Mirrors `scrape_search` (around `cli.py:1007`). Click options should mirror the hybrid params from the registry; `Query.ENDPOINT_REGISTRY[<endpoint>]["modes"]["hybrid"]["params"]` is the source of truth for defaults.
+4. **`FacebookScraper.<endpoint_snake>()`** (`fbscrape/scraper.py`) — high-level wrapper. Builds the canonical `Query`, submits via `WorkerPool.submit_task`, returns `ScrapingResult`. Mirrors `FacebookScraper.search` (around `scraper.py:264`). If the endpoint has no server-side date filter, **omit the multi-leg cursor_reset resume loop** — cursor_reset is terminal for those endpoints (preserve partial data, return).
+5. **`ResponseInterceptor`** (`fbscrape/response.py`) — new `latest_<endpoint>_request` capture path so the hybrid template can be harvested from a natural request. Mirrors the `is_scrq` block (around `response.py:880-905`). The hybrid scrape method (#2) polls this field. Single-shot endpoints (PageTransparency, ProfileAuthenticity) skip this and reuse `latest_natural_graphql_request` instead.
+6. **`FacebookGraphQLParser`** (`fbscrape/response.py`) — `_flatten_<endpoint>_post` orchestrator + entry in `ENDPOINT_FLATTENERS`. Most FB surfaces share the Comet Story shape, so the orchestrator is usually a thin composition of the existing `_extract_*` methods. Skip this only if you don't need flattening for this endpoint (Search currently skips it — known gap). If your endpoint uses a new edge-container key (e.g. `timeline_list_feed_units`, `group_feed`), also add it to `FacebookGraphQLParser._STORY_EDGE_CONTAINERS` so `parse_timeline_response` fans Shape A correctly.
+7. **`cli.py`** — `@scrape.command(name='<endpoint-kebab>')` subcommand. Mirrors `scrape_search` (around `cli.py:1007`). Three sub-tasks:
+   - **Click options.** Mirror the hybrid params from the registry; `Query.ENDPOINT_REGISTRY[<endpoint>]["modes"]["hybrid"]["params"]` is the source of truth for defaults.
+   - **Per-endpoint CLI policy.** The `_resolve_targets()` call (around `cli.py:835`) takes three flags that encode "what does FB's UI send on the wire" — set them per Key Design Decision 20:
+     - `require_start` — `True` only if FB's UI mandates a start_date on this surface (currently only Search).
+     - `require_end` — same, for end_date.
+     - `default_end_to_today` — `True` when FB always sends `beforeTime` (UserTimeline, Search); `False` when FB sends no date filter (GroupTimeline). A wrong default here makes the scraper's fingerprint deviate from a real user's traffic.
+   - **`--continue` / auto-unstick.** If the endpoint paginates, decide whether to wire `_find_unstick_cursor` and `_finalize_continue_result` (UserTimeline + GroupTimeline both do). Single-shot endpoints skip this.
+
+### Stop conditions (1 touch point, conditional)
+
+8. **`stop_conditions.assemble_default_stop_conditions`** (`fbscrape/stop_conditions.py`) — only edit if your endpoint has termination semantics that don't fit the existing branches. The function currently switches on `(endpoint, sorting_setting)` to assemble the canonical condition set:
+   - **Chronological responses** (UserTimeline, Search, GroupTimeline+CHRONOLOGICAL) get `OldestInBatchBelowStartDate` + `CursorReset`.
+   - **Non-chronological responses** (GroupTimeline+TOP_POSTS / +RECENT_ACTIVITY) drop those and rely on `ConsecutiveOutOfRange` instead.
+   - `ConsecutiveOutOfRange` is opt-in via `params["max_consecutive_out_of_range"] > 0`.
+
+   If your endpoint introduces a **new sort value** (e.g. a third sorting_setting for GroupTimeline) or **non-monotonic response ordering by default**, extend the `is_chronological` branch logic. If `CursorReset`'s anchor-selection needs an endpoint-specific tweak (GroupTimeline uses `second_oldest_in_batch` to dodge bootstrap-edge highlights — see Key Design Decision 16), update `CursorReset.evaluate` similarly. Most new endpoints can leave this file alone.
+
+### Tests (4 mandatory artifacts)
+
+These are **required**, not optional — the test suite codifies the public contract and catches FB shape drift. See [`tests/README.md`](../tests/README.md) for the three-tier structure.
+
+9. **Fixture capture** (`tests/_capture_fixtures.py`) — add a new entry to `TARGETS` and `CAPTURERS`. Pick a stable public target (a long-lived public profile / group / page). Then run:
+   ```bash
+   python tests/_capture_fixtures.py --only <new_endpoint>
+   ```
+   Verifies #1–#7 wire up at all and produces the JSON the unit test loads.
+10. **Unit flatten test** (`tests/unit/test_flatten_<new_endpoint>.py`) — model on the existing single-shot ones (`test_flatten_page_transparency.py`, `test_flatten_profile_authenticity.py`) for non-paginated endpoints, or on `test_flatten_group_timeline.py` for paginated ones. Load the captured fixture, flatten via `FacebookGraphQLParser.flatten(record, endpoint)`, assert key fields are populated and the row schema matches expectations.
+11. **Integration test** (`tests/integration/test_<new_endpoint>.py`) — mirrors the matching integration test. Headless scrape against real FB with a tight window; asserts `result.result in success_set`, `len(data) > 0`, and that every record flattens. Auto-skips when no active account is available.
+12. **Registry tripwire bump** — update `EXPECTED_KEYS` in `tests/unit/test_query_registry.py` (the test `test_endpoint_registry_top_level_keys_pinned`). This is intentionally a tripwire so registry additions can't slip in without a deliberate ack.
 
 ---
 
 ## Part 3 — verification
 
-1. **Programmatic.** In a short script: `async with FacebookScraper(...) as scraper: result = await scraper.<endpoint>(...)`. Check `len(result.posts) > 0`, `result.query.endpoint == "<Label>"`, posts have a non-null `creation_time`.
-2. **CLI.** `fbscrape scrape <endpoint-kebab> ...` against the same target. Same expectations.
-3. **Flattener.** If #6 was wired: `fbscrape flatten <output.json>` — confirm the row schema looks reasonable and there are no fields silently dropped.
-4. **Long-haul.** Run a scrape long enough to trigger several paginations. Watch for FB-imposed degradation (cursor reset, `errors[]`, HTML response bodies). If you see something odd, capture it and add a stop condition.
+1. **Run the test suite.** All four test artifacts from Part 2 §9–12 must pass:
+   ```bash
+   pytest tests/unit/test_flatten_<new_endpoint>.py tests/unit/test_query_registry.py
+   pytest -m integration tests/integration/test_<new_endpoint>.py
+   ```
+   The unit tier runs on every bare `pytest`, so it's the first to catch regressions when FB shifts shape.
+2. **Programmatic smoke.** In a short script: `async with FacebookScraper(...) as scraper: result = await scraper.<endpoint>(...)`. Check `len(result.data) > 0`, `result.query.endpoint == "<Label>"`, posts have a non-null `creation_time`.
+3. **CLI smoke.** `fbscrape scrape <endpoint-kebab> ...` against the same target. Same expectations.
+4. **Flattener.** If #6 was wired: `fbscrape flatten <output.json>` — confirm the row schema looks reasonable and there are no fields silently dropped.
+5. **Long-haul.** For paginated endpoints, run a scrape long enough to trigger several paginations. Watch for FB-imposed degradation (cursor reset, `errors[]`, HTML response bodies). If you see something odd, capture it and either extend an existing `StopCondition` or add a new one in `stop_conditions.py` + wire it through `assemble_default_stop_conditions` (Part 2 §8).
 
 ---
 
