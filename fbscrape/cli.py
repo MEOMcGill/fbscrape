@@ -712,7 +712,24 @@ def login(ctx, identifier, mode, cookies, headless):
 # Recognized per-row keys in --input-file; everything else is dropped.
 # `key_field` is the name of the required identifier field for the endpoint
 # (handle for UserTimeline, query_text for Search). Date keys are constant.
-_INPUT_FILE_EXTENSIONS = ('.csv', '.parquet', '.json', '.jsonl', '.ndjson', '.yaml', '.yml')
+# Longest-first so `.parquet.zstd` peels before `.parquet`.
+_INPUT_FILE_EXTENSIONS = (
+    '.parquet.zstd', '.csv', '.parquet', '.json', '.jsonl', '.ndjson',
+    '.yaml', '.yml',
+)
+
+
+def _input_file_ext(path: str) -> str | None:
+    """Return the recognized input-file extension for `path`, or None.
+
+    Matches against `_INPUT_FILE_EXTENSIONS` longest-first so compound
+    suffixes like `.parquet.zstd` win over `.zstd`.
+    """
+    lower = path.lower()
+    for ext in _INPUT_FILE_EXTENSIONS:
+        if lower.endswith(ext):
+            return ext
+    return None
 
 
 def _load_scrape_targets(
@@ -737,10 +754,10 @@ def _load_scrape_targets(
     """
     import json as _json
 
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in _INPUT_FILE_EXTENSIONS:
+    ext = _input_file_ext(path)
+    if ext is None:
         raise click.UsageError(
-            f"Unsupported --input-file extension {ext!r}. "
+            f"Unsupported --input-file extension for {path!r}. "
             f"Supported: {', '.join(_INPUT_FILE_EXTENSIONS)}"
         )
 
@@ -748,9 +765,9 @@ def _load_scrape_targets(
         import csv
         with open(path, newline='') as f:
             raw_rows = list(csv.DictReader(f))
-    elif ext == '.parquet':
-        import pandas as pd
-        raw_rows = pd.read_parquet(path).to_dict(orient='records')
+    elif ext in ('.parquet', '.parquet.zstd'):
+        import polars as pl
+        raw_rows = pl.read_parquet(path).to_dicts()
     elif ext in ('.yaml', '.yml'):
         import yaml
         with open(path) as f:

@@ -83,6 +83,12 @@ class BrowserSession:
 
         self.endpoint: str = ""
 
+        # Per-session scroll counter. Worker reads this after each task and
+        # adds it to its own per-account-ownership total to decide rotation
+        # (the DB scroll columns are cumulative-lifetime and aren't suitable
+        # as a rotation signal — see Worker.execute_task).
+        self.scrolls_recorded: int = 0
+
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -1573,6 +1579,7 @@ class BrowserSession:
 
     async def record_scroll(self, endpoint: str, count: int = 1):
         """Record `count` scrolls against the current account."""
+        self.scrolls_recorded += count
         await self.pool.update_scroll_count(self.account.identifier, endpoint, count)
 
     async def get_scroll_count(self, endpoint: str | None = None) -> int:

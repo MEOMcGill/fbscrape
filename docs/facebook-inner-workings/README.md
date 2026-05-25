@@ -240,3 +240,77 @@ on a search page changes both *what* matches you see and *how* you'd judge
 "have I seen everything yet." Same logic applies to FB feeds — the sort is
 fundamentally a different question being asked of FB's index, not just a
 reordering of the same answer set.
+
+---
+
+## 6. User-vs-Page is not a post-level distinction
+
+Two of `fbscrape`'s endpoints look at "the same kind of thing" from very
+different angles:
+
+- `ProfileAuthenticity(user_id)` — info on a User profile (join date, category,
+  meta-verified, transparency-link presence).
+- `PageTransparency(page_id)` — info on the linked Page (creation date, name
+  history, admin countries, paid-ad activity).
+
+For any account that's "a person with a public-facing role" — politicians,
+local businesses, news outlets, creators, low-quality content farms — both
+exist. FB models this as **a User entity with a separate Page entity attached**.
+The Page is where the ads/transparency live; the User is what posts on the
+timeline and gets followed. They have **different numeric ids**.
+
+The non-obvious bit: **FB doesn't surface this distinction at the post layer**.
+A `UserTimeline` post from a Page-backed account looks structurally identical
+to one from a pure personal profile:
+
+```
+actors[0].__typename       = "User"      # always
+actors[0].__isActor        = "User"
+actors[0].__isEntity       = "User"
+feedback.owning_profile.__typename = "User"
+actors[0].id               = <user_id>   # never the page_id
+```
+
+Empirically, 142 of 161 distinct authors in the canadian-fb-slop dataset
+have a populated `delegate_page_id` (so they're Page-backed); zero of their
+posts report `author_type == "Page"`. The post payload is from FB's
+*timeline/feed* graph, which is owner-keyed on User entities — the linked
+Page is reachable only by a separate query.
+
+Three practical consequences:
+
+**Don't filter `author_type == "Page"` to find Page-backed accounts.** It
+will return zero rows even on a dataset that's almost entirely Page-backed.
+The signal isn't there.
+
+**`PageTransparency(page_id=author_id)` won't work for these accounts.**
+FB resolves `page(id: <user_id>)` to no node and returns `data.page = null`.
+You need the actual Page id, which lives on the User's ProfileAuthenticity
+record as `delegate_page_id`.
+
+**The right pipeline is two-stage and unconditional.** Even though 88% of
+the canadian dataset is Page-backed, you can't tell which 88% from posts
+alone — you have to call `ProfileAuthenticity` on every distinct `author_id`,
+then check `delegate_page_id`:
+
+```
+post.author_id   ──►   ProfileAuthenticity   ──►   delegate_page_id?
+                              │                         │
+                              │                         ├── populated
+                              │                         │       │
+                              │                         │       ▼
+                              │                         │   PageTransparency
+                              │                         │   (page_id=delegate_page_id)
+                              │                         │
+                              │                         └── null → stop
+                              ▼
+                       (always written:
+                        join_date, category,
+                        meta_verified, …)
+```
+
+`author_id` is in the same namespace as `ProfileAuthenticity.user_id` for
+modern accounts (15-digit ids starting with `100…` or `61…`). The one edge
+case is pre-2010 accounts (Zuck = `"4"`), whose post-level `author_id` and
+modern `ProfileAuthenticity.user_id` live in different namespaces — those
+won't cross-reference from a post alone.

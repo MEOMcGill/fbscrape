@@ -276,10 +276,17 @@ class Worker:
                     # once, in scraper.user_timeline.
                     outcome = await method(**task.query, **task.params)
 
-                    # Update Worker's scroll count from session
-                    endpoint_scrolls = await session.get_scroll_count(task.endpoint)
-                    self.scroll_count += endpoint_scrolls
-                    logger.debug(f"Worker {self.id}: task complete, endpoint_scrolls={endpoint_scrolls}, total scroll_count={self.scroll_count}")
+                    # Accumulate scrolls performed by THIS session (a fresh
+                    # BrowserSession is created per task, so `scrolls_recorded`
+                    # is naturally a per-task delta). `self.scroll_count` tracks
+                    # the running total across every session this worker spun
+                    # up while owning the current account; rotation zeroes it.
+                    # DB scroll columns keep updating via `record_scroll` for
+                    # account selection / prioritization, but are NOT consulted
+                    # here — they're cumulative-lifetime and would over-count.
+                    session_scrolls = session.scrolls_recorded
+                    self.scroll_count += session_scrolls
+                    logger.debug(f"Worker {self.id}: task complete, session_scrolls={session_scrolls}, total scroll_count={self.scroll_count}")
 
                     result = ScrapingResult.from_outcome(task, outcome)
 

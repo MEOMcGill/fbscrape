@@ -173,6 +173,52 @@ The `delegate_page_id` field on the authenticity response is the bridge —
 it carries the Page id for profiles that have a Page side, and is `null` for
 pure personal profiles (no transparency record exists for those).
 
+#### Starting from a post scrape
+
+If you already have `UserTimeline` output (or `Search` / `GroupTimeline`) and
+want transparency info for every account that posted, the post-level
+`author_id` IS the input to `ProfileAuthenticity` (same id namespace).
+**There is no post-level signal that tells you whether an account has a
+linked Page** — FB ships `actors[0].__typename = "User"` on every post
+regardless. So you have to call `ProfileAuthenticity` on every distinct
+`author_id` and branch on `delegate_page_id`:
+
+```python
+import polars as pl
+from fbscrape import FacebookScraper, gather
+from fbscrape.response import FacebookGraphQLParser
+
+posts = pl.read_parquet("posts_flattened.parquet.zstd")
+user_ids = posts["author_id"].unique().to_list()
+parser = FacebookGraphQLParser()
+
+async with FacebookScraper(db="accounts.db", max_browser_sessions=3) as scraper:
+    page_jobs: list[tuple[str, str]] = []  # (user_id, delegate_page_id)
+    async for r in gather(scraper.profile_authenticity(uid) for uid in user_ids):
+        if not r.data:
+            continue
+        row = parser.flatten(r.data[0], endpoint="ProfileAuthenticity")
+        if row and row.get("delegate_page_id"):
+            page_jobs.append((row["user_id"], row["delegate_page_id"]))
+
+    async for r in gather(
+        scraper.page_transparency(page_id=pid, handle=uid) for uid, pid in page_jobs
+    ):
+        ...
+```
+
+The `handle=uid` on the `page_transparency` call is purely cosmetic — it
+controls the warm-up navigation URL (`/<uid>/`) so the request looks like a
+real user clicking from a profile. The GraphQL body sent to FB carries
+`delegate_page_id` as `variables.pageID` regardless.
+
+One edge case: pre-2010 accounts (Zuck = `"4"`, etc.) have a legacy short id
+as `author_id` on their own posts, but their modern `ProfileAuthenticity.user_id`
+is a different 15-digit number. The two ids refer to the same person but
+aren't cross-referenceable from a post alone. Filter to modern ids
+(`len(author_id) >= 10 and author_id.startswith(("100", "61"))`) if you need
+to be strict.
+
 ## Architecture
 
 ```

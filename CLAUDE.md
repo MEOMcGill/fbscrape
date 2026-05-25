@@ -104,6 +104,32 @@ Same shape as `PageTransparency` — single-shot, no pagination, no scroll, no d
 - Single `page.request.post()` to `/api/graphql/`. HTTP-status classification reuses `_hybrid_send_replay`.
 - Returns `ScrapeOutcome(result='success', data=[authenticity_dict])` — the dict is `data.user` from the GraphQL response. Top-level fields include `id`, `name`, `delegate_page_id`, and a nested `profile_directory_authenticity_modal` with `header_fields[]` (profile join date, profile-updated-since, category, transparency link), `meta_verified_section`, and `about_fields[]`. The flattener dispatches `header_fields[]` by `profile_field_type` (`PROFILE_JOIN_DATE` → `profile_join_date`, `PROFILE_UPDATED_SINCE` → `profile_updated_since`, `CATEGORY` → `category`, `TRANSPARENCY` → `transparency_present` bool).
 
+### Post → ProfileAuthenticity → PageTransparency chain
+
+The three endpoints `UserTimeline`, `ProfileAuthenticity`, and `PageTransparency` form a natural pipeline when you start from posts and want Page-side transparency info, but the input/output identifiers DON'T line up the way the type system suggests:
+
+- **`UserTimeline` post's `author_id` IS the `user_id`** that `ProfileAuthenticity` takes. The post-flattener writes the same numeric id under both names (`actors[0].id` / `feedback.owning_profile.id`). The only edge case is legacy short-id accounts (Zuck = `4`); for those the post-level `author_id` and the modern `ProfileAuthenticity.user_id` live in different namespaces and don't cross-reference. Modern 15-digit ids (`100…`, `61…`) are safe.
+- **`author_id` is NOT a valid `PageTransparency.page_id`.** PageTransparency expects the *linked Page's* id, which differs from the User id for any personal-profile-with-linked-Page account. Passing the user_id to PageTransparency returns `data.page = null` → `result="parse_error"`. The Page id only comes from `ProfileAuthenticity.delegate_page_id` (or a separately-sourced Page id, e.g. from a FB UI URL).
+- **`actors[0].__typename` is always `User` on UserTimeline posts** — even when the account has a linked Page. Empirically: 142/161 distinct authors in the canadian-fb-slop dataset have a populated `delegate_page_id` (so they're Page-backed), yet 100% of their posts report `author_type == "User"`. FB doesn't expose the linked-Page distinction at the post layer. There is no post-level signal to short-circuit the ProfileAuthenticity step — you have to call it on every author_id and let `delegate_page_id` decide whether PageTransparency is applicable.
+
+So the pipeline is:
+
+```
+post.author_id  ──►  ProfileAuthenticity(user_id=author_id)
+                                │
+                                ▼
+                         delegate_page_id?
+                          ╱            ╲
+                  populated            null
+                       │                  │
+                       ▼                  ▼
+       PageTransparency(             stop — plain User,
+       page_id=delegate_page_id,     no linked Page
+       handle=author_id)
+```
+
+The `handle=author_id` on the PageTransparency call is purely for the navigation URL warm-up; the GraphQL body sent to FB carries `delegate_page_id` as `variables.pageID`. See [`README.md`](README.md) — "Two-stage pipeline: user_id → page_id → transparency" — for the executable example.
+
 ### Endpoint × mode registry (`Query.ENDPOINT_REGISTRY`)
 
 Single source of truth for what scrape requests are valid:
@@ -153,6 +179,8 @@ In-body GraphQL rate-limits (HTTP 200 + `errors:[{code:1675004, message:"Rate li
 Other in-body GraphQL errors (HTTP 200 + `errors[]` that aren't auth or rate-limit — e.g. `"A server error field_exception occured"`) bail with the result string `'graphql_error: <msg>'` and partial data preserved. The loop also dumps the rolling iter window + the errored iter to `tmp/hybrid/graphql_error/<handle>/<UTC_ts>/` (mirrors the `cursor_reset` dump structure: `window.jsonl` with prior iterations and `summary.json` with the structured `{message, code, severity}` and trigger pagination index) so the full request/response can be inspected post-incident. `Worker.execute_task` does NOT rotate or burn a retry slot on `graphql_error` — the condition signals an FB-side or shape issue, not an account problem.
 
 Account rotation has a 5-minute cooldown lock to prevent immediately re-acquiring the same account.
+
+Independently of exception-driven rotation, `Worker` also rotates pre-task when its current account has accumulated ≥ `scroll_threshold` scrolls (default 500). The counter (`Worker.scroll_count`) is endpoint-agnostic and scoped to a single account-ownership: it sums `BrowserSession.scrolls_recorded` from every fresh session this worker spun up under the current account, and zeroes on `initialize` / `close` / `rotate_account`. DB scroll columns (`scroll_count_per_endpoint_total`, `scroll_count_overall_24h`) keep updating via `record_scroll` but are NOT consulted for the rotation decision — they're cumulative-lifetime and would over-count across worker instances; their concrete consumer is `AccountsPool._order_by = "scroll_count_overall_24h ASC"` for account-selection prioritization. See Key Design Decision 23.
 
 ### `ResponseInterceptor` state (`response.py`)
 
@@ -239,6 +267,8 @@ Set `FB_NETWORK_CAPTURE_ALL=1` to record every browser response (XHR + JS + CSS 
     - **Post-scrape (merge + save).** `cli._finalize_continue_result` consolidates the prior load + `prior + new` concatenation + auto-unstick + compressed save into one synchronous helper, dispatched via `asyncio.to_thread` + `asyncio.create_task` per yielded result. After the gather loop, `await asyncio.gather(*finalize_tasks)` joins them all before the scraper context exits. Without the dispatch, a single ~10k-post merge blocked the next yielded result behind a 6-7 minute `json.load` + `gzip.open('wt')` write, turning concurrent target completions into hours of serialized post-processing. The merge itself still uses stdlib `json.load` (it needs every prior record to rewrite the file), so per-file time is unchanged — the win is across-target overlap. Caveat: stdlib `json.load` holds the GIL during decode, so cross-thread parallelism is bounded by GIL contention on the parse phase; gzip decompression (zlib, C) and ijson (yajl2_c, C) both release the GIL, so a future "stream prior records via ijson" optimization could lift that ceiling.
 
     The on-disk format is unchanged.
+
+23. **Scroll-based rotation reads a per-session counter, not the DB.** `Worker` rotates when its current account has accumulated ≥ `scroll_threshold` scrolls. The counter is per-account-ownership (zeroed on rotation / initialize / close), endpoint-agnostic, and fed by `BrowserSession.scrolls_recorded` — a per-session integer bumped in `record_scroll` alongside the existing DB write. Worker reads `session.scrolls_recorded` after each task (a natural per-task delta since BrowserSession is fresh per task) and adds it to `self.scroll_count`. The DB columns are NOT a rotation signal: `scroll_count_per_endpoint_total` is cumulative-lifetime and `scroll_count_overall_24h` doesn't actually roll on 24h, so reading either as a running total over-counts across worker instances and across runs. Pre-fix the worker did `self.scroll_count += await session.get_scroll_count(task.endpoint)` where the right-hand side was the DB lifetime total — every task on the same endpoint counted every prior task's scrolls again, growing quadratically. DB scroll tracking is preserved as-is for its real consumer: `AccountsPool._order_by = "scroll_count_overall_24h ASC"` prioritizes low-scroll accounts when selecting from the pool.
 
 For account state, lifecycle, and exception → DB-write semantics: [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 
@@ -445,3 +475,4 @@ fbscrape utils parse-curl "curl ..." --raw
 - **Hybrid: GraphQL `errors[]` with partial data — marker set.** We drain posts before bailing, but the `_HYBRID_AUTH_ERROR_MARKERS` list is incomplete; expand as new auth-ish error strings are observed.
 - **Hybrid: `freeze_tokens` experiment.** FB's bundled JS strongly suggests `__csr` / `__dyn` are HasteBitMap telemetry, not auth tokens — `RelayFBNetwork` will conditionally `delete v.__csr`. If empirically validated, drop the live-splicing path and the organic-scroll bursts whose only purpose is token refresh. Add a `freeze_tokens: bool` param to `user_timeline_hybrid` that captures the tokens once from the bootstrap template and never updates them; run a 200+ pagination scrape; if it succeeds we have evidence to simplify.
 - Add an endpoint to get the information of on a post
+- Better INFO logging so it looks cleaner

@@ -88,6 +88,23 @@ _METADATA_TIMESTAMP_TYPENAMES = (
 _METADATA_AUDIENCE_TYPENAMES  = ("CometFeedStoryAudienceStrategy",)
 _METADATA_MUSIC_TYPENAMES     = ("CometStoryMusicPostLevelAttributionStrategy",)
 
+# `comet_ufi_summary_and_actions_renderer.feedback` ships in two variants:
+#
+#   A) "Full" — totals live directly on the feedback dict:
+#        feedback.reaction_count.count
+#        feedback.share_count.count
+#        feedback.comments_count_summary_renderer.feedback.comment_rendering_instance.comments.total_count
+#
+#   B) "Thinned" — top-level totals are absent; the same numbers are nested
+#      inside `adaptive_ufi_action_renderers[i].feedback.<thing>`, dispatched
+#      by `__typename` (same pattern as metadata[] strategies). Empirically ~60%
+#      of UserTimeline responses in the wild ship this shape.
+#
+# Same FB rename-tolerance pattern as _METADATA_*_TYPENAMES: tuples, first match wins.
+_REACTION_RENDERER_TYPENAMES = ("UFIStoryReactActionRenderer",)
+_COMMENT_RENDERER_TYPENAMES  = ("UFICommentActionRenderer",)
+_SHARE_RENDERER_TYPENAMES    = ("XFBUFIAdaptiveShareActionRenderer",)
+
 
 def _pick_progressive_video(media: dict | None) -> str | None:
     """Return the highest-priority progressive mp4 URL from a media dict, if any."""
@@ -604,8 +621,26 @@ class FacebookGraphQLParser:
                    "feedback_target_with_context",
                    "comet_ufi_summary_and_actions_renderer", "feedback") or {})
 
+    def _action_renderer_feedback(self, sf: dict, typenames: tuple[str, ...]) -> dict:
+        """Per-renderer `feedback` subdict from `adaptive_ufi_action_renderers[]`,
+        dispatched by `__typename`. First match wins (sibling renames tolerated
+        via the candidate tuple, same pattern as `_metadata_by_typenames`).
+
+        Variant B of the summary feedback shape (~60% of UserTimeline responses)
+        omits the top-level totals and only ships them through these renderers.
+        Returns `{}` if no renderer matches — caller decides what that means.
+        """
+        for tn in typenames:
+            for r in sf.get("adaptive_ufi_action_renderers") or []:
+                if isinstance(r, dict) and r.get("__typename") == tn:
+                    return r.get("feedback") or {}
+        return {}
+
     def _extract_engagement(self, story: dict) -> dict:
         sf = self._summary_feedback(story)
+
+        # Per-reaction breakdown — both variants ship `top_reactions.edges[]`
+        # at the top of `sf`, so this path works regardless of variant.
         rxn_counts = {k: 0 for k in ("like", "love", "haha", "wow", "sad", "angry", "care")}
         for e in _g(sf, "top_reactions", "edges", default=[]) or []:
             name = _g(e, "node", "localized_name")
@@ -613,6 +648,30 @@ class FacebookGraphQLParser:
                 key = name.lower()
                 if key in rxn_counts:
                     rxn_counts[key] = e.get("reaction_count") or 0
+
+        # Totals: try top-level (Variant A), fall back to the matching adaptive
+        # renderer's feedback (Variant B). Last-resort for reactions: sum the
+        # per-type edges — FB has exactly 7 reaction types so the sum is exhaustive.
+        react_fb   = sf if "reaction_count"                  in sf else self._action_renderer_feedback(sf, _REACTION_RENDERER_TYPENAMES)
+        share_fb   = sf if "share_count"                     in sf else self._action_renderer_feedback(sf, _SHARE_RENDERER_TYPENAMES)
+        # Comments: in Variant A the total lives under either
+        # `comments_count_summary_renderer.feedback.comment_rendering_instance`
+        # or directly at `comment_rendering_instance` (FB ships both). In Variant
+        # B only the renderer-nested version exists. We try the most specific
+        # path first, then both shallower fallbacks.
+        comment_fb = sf if ("comments_count_summary_renderer" in sf or "comment_rendering_instance" in sf) \
+                        else self._action_renderer_feedback(sf, _COMMENT_RENDERER_TYPENAMES)
+
+        total_reactions = _g(react_fb, "reaction_count", "count")
+        if total_reactions is None and any(rxn_counts.values()):
+            total_reactions = sum(rxn_counts.values())
+
+        total_comments = (
+            _g(comment_fb, "comments_count_summary_renderer", "feedback",
+               "comment_rendering_instance", "comments", "total_count")
+            or _g(comment_fb, "comment_rendering_instance", "comments", "total_count")
+        )
+
         # Video duration: first attachment carrying a non-zero length wins.
         duration = None
         for a in story.get("attachments") or []:
@@ -620,12 +679,12 @@ class FacebookGraphQLParser:
             if d:
                 duration = d
                 break
+
         return {
-            "reactions":          _g(sf, "reaction_count", "count"),
+            "reactions":          total_reactions,
             **rxn_counts,
-            "shares":             _g(sf, "share_count", "count"),
-            "comments":           _g(sf, "comments_count_summary_renderer", "feedback",
-                                     "comment_rendering_instance", "comments", "total_count"),
+            "shares":             _g(share_fb, "share_count", "count"),
+            "comments":           total_comments,
             "video_views":        _g(sf, "video_view_count"),
             "video_duration_sec": duration,
         }

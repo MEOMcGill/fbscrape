@@ -9,6 +9,18 @@ fresh real scrapes the unit tests load.
 Targets are deliberately hard-coded so re-running yields drop-in replacements
 for the same fixture file. All captures run headless. The script is named with
 a leading underscore so pytest doesn't try to collect it as a test module.
+
+NOT auto-captured by this script:
+
+- `user_timeline_hybrid_variant_b.json` — hand-curated 6-record bundle pulled
+  from raw saves to cover the "Variant B" summary-feedback shape (totals
+  inside `adaptive_ufi_action_renderers[]` rather than at the top of the
+  feedback dict). The `zuck` fixture is 100% Variant A and missed a real
+  bug where ~60% of production responses ship Variant B. Records were picked
+  for structural diversity (reel / video / album / photo / hashtags / 5
+  distinct authors). If FB changes the Variant B shape and you need a fresh
+  set, replace by pulling new records from any raw scrape and re-confirming
+  via `tests/unit/test_flatten_user_timeline.py::test_variant_b_records_are_actually_variant_b`.
 """
 
 from __future__ import annotations
