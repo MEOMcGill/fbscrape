@@ -3,9 +3,8 @@ aiosqlite==0.22.1
 browserforge==1.2.4
 camoufox==0.4.11
 click==8.3.3
+ijson==3.5.0
 loguru==0.7.3
-numpy==2.4.4
-pandas==3.0.2
 playwright==1.58.0
 polars==1.20.0
 pyarrow==18.1.0
