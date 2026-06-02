@@ -18,4 +18,4 @@ services:
       - SCREEN_RES=1920x1080x24
     stdin_open: true
     tty: true
-    shm_size: 12gb
+    shm_size: 18gb

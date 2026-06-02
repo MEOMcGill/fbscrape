@@ -39,7 +39,14 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
-from playwright.async_api import Locator
+from playwright.async_api import (
+    Locator,
+    TimeoutError as PlaywrightTimeoutError,
+)
+try:  # not re-exported from the public API on older playwright versions
+    from playwright.async_api import TargetClosedError
+except ImportError:
+    from playwright._impl._errors import TargetClosedError
 
 from .exceptions import (
     FailedLoginError, CheckpointError, AccountDisabledError,
@@ -69,17 +76,35 @@ async def login(session: "BrowserSession") -> None:
 
     Helpers return False to signal "this method is N/A or didn't authenticate"
     — that's the trigger to fall through to the next method on the SAME account.
+
+    Transient-nav chokepoint: the login helpers issue several bare
+    `page.goto` / `page.reload` calls (e.g. `login_with_cookies`,
+    `check_logged_in`) that aren't individually guarded. A renderer/network
+    flake there raises a raw playwright `TimeoutError` / `TargetClosedError`,
+    which is NOT one of the worker's typed-retry exceptions — so it would
+    escape untyped through `gather()` and tear down the ENTIRE batch (one
+    bad navigation killing every other handle). We reclassify those two
+    specific errors as `TransientLoginError` so the worker rotates to a fresh
+    account + browser and retries (account stays `active=True`). The catch is
+    deliberately narrow: checkpoint / ban / disabled signals raise their own
+    typed exceptions and pass straight through, never swallowed here.
     """
-    if await login_with_cookies(session):
-        return
-    if await login_automatic(session):
-        return
-    if not session.headless:
-        if await login_manual(session):
+    try:
+        if await login_with_cookies(session):
             return
-    raise FailedLoginError(
-        f"All login methods failed for {session.account.display_name}"
-    )
+        if await login_automatic(session):
+            return
+        if not session.headless:
+            if await login_manual(session):
+                return
+        raise FailedLoginError(
+            f"All login methods failed for {session.account.display_name}"
+        )
+    except (PlaywrightTimeoutError, TargetClosedError) as e:
+        raise TransientLoginError(
+            f"Login navigation flaked (transient) for "
+            f"{session.account.display_name}: {e}"
+        ) from e
 
 
 async def login_automatic(session: "BrowserSession") -> bool:

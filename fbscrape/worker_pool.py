@@ -6,11 +6,12 @@ return results via Futures.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 from .accounts_pool import AccountsPool
 from .exceptions import NoAccountError
 from .logger import logger
-from .models import Query
+from .models import Query, ScrapingResult
 from .worker import Worker
 
 IDLE_RELEASE_TIMEOUT_SECONDS = 60  # 1 minute; idle workers release accounts after this
@@ -170,6 +171,7 @@ class WorkerPool:
 
                 logger.info(f"WorkerPool: {worker.id} processing {query.endpoint} - {query.query}")
                 idle_seconds = 0
+                task_started = datetime.now(timezone.utc)
                 try:
                     result = await worker.execute_task(query)
                     future.set_result(result)
@@ -182,8 +184,19 @@ class WorkerPool:
                     await self.task_queue.put((query, future))
                     break
                 except Exception as e:
-                    logger.error(f"WorkerPool: {worker.id} failed {query.endpoint}: {e}")
-                    future.set_exception(e)
+                    # Resolve as a failed result (don't raise) so one bad task can't propagate through gather() and kill the whole batch.
+                    logger.error(
+                        f"WorkerPool: {worker.id} failed {query.endpoint} "
+                        f"{query.query} — recording as failed task: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    future.set_result(ScrapingResult(
+                        query=query,
+                        result=f"task_failed: {type(e).__name__}",
+                        data=[],
+                        time_started=task_started,
+                        time_taken=datetime.now(timezone.utc) - task_started,
+                    ))
                 finally:
                     self.task_queue.task_done()
         finally:
