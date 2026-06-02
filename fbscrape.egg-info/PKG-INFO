@@ -7,13 +7,17 @@ Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: playwright>=1.40.0
 Requires-Dist: camoufox>=0.4.0
+Requires-Dist: browserforge>=1.2.0
 Requires-Dist: aiosqlite>=0.19.0
+Requires-Dist: aiohttp>=3.9.0
+Requires-Dist: requests>=2.31.0
 Requires-Dist: click>=8.0.0
+Requires-Dist: loguru>=0.7.0
 Requires-Dist: tabulate>=0.9.0
-Requires-Dist: pika>=1.3.0
 Requires-Dist: pyarrow>=14.0.0
 Requires-Dist: polars>=1.0.0
 Requires-Dist: pyyaml>=6.0
+Requires-Dist: ijson>=3.2
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
@@ -136,7 +140,7 @@ Two are paginated post streams; two are single-shot record fetches.
 |---|---|---|---|
 | `UserTimeline` | `handle`, `start_date`, `end_date` | `manual`, `hybrid` *(default)* | `data: list[dict]` — one element per post |
 | `Search` | `query_text`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per search-result post |
-| `GroupTimeline` | `handle`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per group post (date filter is client-side; sort forced to `NEW_POSTS`) |
+| `GroupTimeline` | `handle`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per group post (date filter is client-side; default sort `TOP_POSTS`) |
 | `PageTransparency` | `page_id` (handle optional) | `hybrid` | `data: [transparency_dict]` — single-element list |
 | `ProfileAuthenticity` | `user_id` | `hybrid` | `data: [authenticity_dict]` — single-element list |
 
@@ -193,6 +197,74 @@ if __name__ == "__main__":
 The `delegate_page_id` field on the authenticity response is the bridge —
 it carries the Page id for profiles that have a Page side, and is `null` for
 pure personal profiles (no transparency record exists for those).
+
+#### Starting from a post scrape
+
+If you already have `UserTimeline` output (or `Search` / `GroupTimeline`) and
+want transparency info for every account that posted, the post-level
+`author_id` IS the input to `ProfileAuthenticity` (same id namespace).
+**There is no post-level signal that tells you whether an account has a
+linked Page** — FB ships `actors[0].__typename = "User"` on every post
+regardless. So you have to call `ProfileAuthenticity` on every distinct
+`author_id` and branch on `delegate_page_id`:
+
+```python
+import polars as pl
+from fbscrape import FacebookScraper, gather
+from fbscrape.response import FacebookGraphQLParser
+
+posts = pl.read_parquet("posts_flattened.parquet.zstd")
+user_ids = posts["author_id"].unique().to_list()
+parser = FacebookGraphQLParser()
+
+async with FacebookScraper(db="accounts.db", max_browser_sessions=3) as scraper:
+    page_jobs: list[tuple[str, str]] = []  # (user_id, delegate_page_id)
+    async for r in gather(scraper.profile_authenticity(uid) for uid in user_ids):
+        if not r.data:
+            continue
+        row = parser.flatten(r.data[0], endpoint="ProfileAuthenticity")
+        if row and row.get("delegate_page_id"):
+            page_jobs.append((row["user_id"], row["delegate_page_id"]))
+
+    async for r in gather(
+        scraper.page_transparency(page_id=pid, handle=uid) for uid, pid in page_jobs
+    ):
+        ...
+```
+
+The `handle=uid` on the `page_transparency` call is purely cosmetic — it
+controls the warm-up navigation URL (`/<uid>/`) so the request looks like a
+real user clicking from a profile. The GraphQL body sent to FB carries
+`delegate_page_id` as `variables.pageID` regardless.
+
+### Comments on a post
+
+Top-level comments only (v1). Each comment carries `replies_total_count` so
+you can decide which comments to drill into via a future reply-fetching
+endpoint:
+
+```python
+from fbscrape import FacebookScraper
+
+async with FacebookScraper(db="accounts.db", max_browser_sessions=2) as scraper:
+    result = await scraper.comments_list(
+        handle="brianlilley",
+        post_id="pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l",
+        max_results=200,  # -1 (default) = exhaust
+    )
+    print(f"{len(result.data)} comments scraped, result={result.result!r}")
+    result.save(f"data/comments/brianlilley_top_comments.json", compress=True)
+```
+
+`post_id` accepts either the numeric form (e.g. `"1608937113934197"`) OR the
+pfbid form — both resolve via FB's permalink redirect.
+
+One edge case: pre-2010 accounts (Zuck = `"4"`, etc.) have a legacy short id
+as `author_id` on their own posts, but their modern `ProfileAuthenticity.user_id`
+is a different 15-digit number. The two ids refer to the same person but
+aren't cross-referenceable from a post alone. Filter to modern ids
+(`len(author_id) >= 10 and author_id.startswith(("100", "61"))`) if you need
+to be strict.
 
 ## Architecture
 
@@ -252,23 +324,50 @@ fbscrape --help
 ### Scraping
 
 ```bash
-# UserTimeline — paginated, date-bounded (default mode is hybrid)
+# UserTimeline — paginated; --start-date / --end-date are both OPTIONAL.
+# When omitted: start has no lower bound; end defaults to today (UTC) to
+# mirror FB's UI fingerprint (which always sends `beforeTime`). Default
+# mode is hybrid.
 fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01
 fbscrape scrape user-timeline zuck meta --start-date 2024-01-01 --headless --max-sessions 2
+
+# Open-ended UserTimeline scrape — pull the most recent N posts with no date filter.
+fbscrape scrape user-timeline zuck --max-posts 500
 
 # Force the scroll-driven path (deprecated; UserTimeline only)
 fbscrape scrape user-timeline zuck --start-date 2024-01-01 --mode manual
 
-# Search — paginated, date-bounded, hybrid only
+# Search — paginated, date-bounded, hybrid only (no-date URL form is TODO).
 fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
 fbscrape scrape search --input-file queries.csv
 
 # GroupTimeline — paginated, hybrid only. `handle` accepts vanity OR numeric
-# group id. `--end-date` is advisory (FB has no server-side date filter for
-# group feeds); termination relies on client-side creation_time vs. start_date.
+# group id. `--start-date` and `--end-date` are BOTH OPTIONAL (FB's UI sends
+# no date filter on group feeds — when omitted there is no client-side
+# bound either). Default sort is TOP_POSTS (matches FB UI; lowest-
+# fingerprint and empirically safer for sustained scraping than
+# CHRONOLOGICAL); under non-chronological sorts, termination is driven by
+# --max-consecutive-out-of-range (default 20 = bail after N posts in a row
+# outside the date window — no-op when no dates are provided), or
+# --max-posts.
 fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 --end-date 2025-01-01
 fbscrape scrape group-timeline 787909081545196 --start-date 2024-01-01
 fbscrape scrape group-timeline --input-file groups.csv --headless
+# Open-ended group scrape — pull the most recent N posts.
+fbscrape scrape group-timeline albertaseparatism --max-posts 500
+# Override sort / stop knobs:
+fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 \
+    --sorting-setting CHRONOLOGICAL --max-consecutive-out-of-range 30
+
+# CommentsList — top-level comments on a post. Identifier is `<handle>:<post_id>`;
+# post_id accepts numeric form OR the pfbid form (both work in FB's permalink URL).
+# Exhaustion-only by default; pass --max-results to cap. No date filter (comments
+# are returned non-chronologically by FB's "Most Relevant" ranking). Replies
+# (depth>0) are NOT collected here — each comment carries `replies_total_count`
+# so callers can decide which comments warrant a separate reply-fetching pass.
+fbscrape scrape comments-list brianlilley:pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l
+fbscrape scrape comments-list zuck:10115311901107991 --max-results 200 --headless
+fbscrape scrape comments-list --input-file posts.csv
 
 # PageTransparency — single-shot, takes a page_id (handle optional)
 fbscrape scrape page-transparency 899800046546098
@@ -279,20 +378,29 @@ fbscrape scrape page-transparency --input-file pages.csv --headless
 fbscrape scrape profile-authenticity 100044331674441
 fbscrape scrape profile-authenticity --input-file users.csv --headless
 
-# Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz)
-fbscrape flatten data/posts/zuck_UserTimeline_hybrid_2024-01-01_2025-01-01.json --format all
-fbscrape flatten data/posts/2025-06-01_2026-02-17/ --format parquet
+# Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz).
+# Saved scrape files are named `<handle>_<endpoint>_<mode>.json{,.gz}` —
+# no date segment. The actual scrape parameters live in the file's
+# `query.query` field.
+fbscrape flatten data/posts/zuck_UserTimeline_hybrid.json --format all
+fbscrape flatten data/posts/ --format parquet
 fbscrape flatten data/posts/ --output data/merged.parquet --concat
 
 # Download media (within ~3 days of scrape — fbcdn URLs expire ~4-5 days out)
-fbscrape download-media data/posts/zuck_UserTimeline_hybrid_…json --include-thumbnails
+fbscrape download-media data/posts/zuck_UserTimeline_hybrid.json --include-thumbnails
+
+# Inspect a cURL copied from DevTools — prints a structured GraphQL summary
+# (friendly_name, doc_id, decoded `variables` JSON, key headers). Cookie /
+# fb_dtsg / lsd / jazoest are redacted by default; pass --raw to disable
+# redaction, --full to include every header and telemetry body field.
+fbscrape utils parse-curl "curl 'https://www.facebook.com/api/graphql/' -X POST ..."
 ```
 
 `--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
 depend on the subcommand: `handle` + optional `start_date` / `end_date` for
 `user-timeline` and `group-timeline`; `query_text` + dates for `search`;
-`page_id` (required) + `handle` (optional) for `page-transparency`; `user_id`
-for `profile-authenticity`.
+`handle` + `post_id` (both required) for `comments-list`; `page_id` (required) +
+`handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
 
 ### Account Management
 

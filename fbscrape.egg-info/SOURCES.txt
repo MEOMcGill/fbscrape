@@ -14,6 +14,7 @@ fbscrape/login.py
 fbscrape/models.py
 fbscrape/response.py
 fbscrape/scraper.py
+fbscrape/stop_conditions.py
 fbscrape/utils.py
 fbscrape/worker.py
 fbscrape/worker_pool.py
