@@ -301,11 +301,12 @@ def list_accounts(ctx, active, inactive, verbose):
             return
 
         if verbose:
-            headers = ['Identifier', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks', 'Error', 'Proxy']
+            headers = ['Identifier', 'Password', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks', 'Error', 'Proxy']
             rows = []
             for a in accounts:
                 rows.append([
                     a.identifier,
+                    a.password or '-',
                     a.username or '-',
                     'Y' if a.active else 'N',
                     'Y' if a.in_use else 'N',
@@ -316,11 +317,12 @@ def list_accounts(ctx, active, inactive, verbose):
                     a.proxy_server or '-',
                 ])
         else:
-            headers = ['Identifier', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks']
+            headers = ['Identifier', 'Password', 'Username', 'Active', 'In Use', 'Last Used', 'Scrolls (24h)', 'Locks']
             rows = []
             for a in accounts:
                 rows.append([
                     a.identifier,
+                    a.password or '-',
                     a.username or '-',
                     'Y' if a.active else 'N',
                     'Y' if a.in_use else 'N',
@@ -665,6 +667,17 @@ def login(ctx, identifier, mode, cookies, headless):
             account, pool, headless=headless, auto_login=False
         ) as session:
             if mode == 'manual':
+                if cookies:
+                    if not session.account.cookies:
+                        click.echo(f"--cookies: no stored cookies for {identifier}; ignoring flag.")
+                    else:
+                        try:
+                            await session._context.add_cookies(session.account.cookies)
+                            click.echo(
+                                f"Injected {len(session.account.cookies)} cookies for {identifier}."
+                            )
+                        except Exception as e:
+                            click.echo(f"--cookies: injection failed ({e}); continuing without.")
                 # login_manual raises FailedLoginError on `q`/Ctrl-C abort.
                 try:
                     await login_manual(session)
@@ -929,6 +942,33 @@ def _build_stem(handle: str, endpoint: str, mode: str) -> str:
     endpoint, mode) means a rolling archive across multiple runs.
     """
     return f"{handle.replace('.', '_')}_{endpoint}_{mode}"
+
+
+def _commentslist_post_id_label(post_id: str, max_len: int = 24) -> str:
+    """Filename-safe label for a post_id, capped so pfbid forms don't blow
+    out the filename. Numeric ids (≤ ~17 digits) pass through verbatim;
+    pfbid-style strings get truncated. Resume relies on the full post_id
+    in the saved JSON's `query.query`, not on this label."""
+    s = post_id.replace('.', '_').replace('/', '_')
+    return s if len(s) <= max_len else s[:max_len]
+
+
+def _build_stem_for_query(query) -> str:
+    """Per-endpoint stem builder. Most endpoints key on `handle`; CommentsList
+    additionally encodes a truncated post_id label so one (handle, post_id)
+    pair has a unique on-disk stem.
+    """
+    endpoint = query.endpoint
+    mode = query.mode
+    if endpoint == "CommentsList":
+        handle = query.query["handle"]
+        post_id = query.query["post_id"]
+        return (
+            f"{handle.replace('.', '_')}_"
+            f"{_commentslist_post_id_label(post_id)}_"
+            f"{endpoint}_{mode}"
+        )
+    return _build_stem(query.query["handle"], endpoint, mode)
 
 
 def _existing_output_for_stem(output_dir: str, stem: str) -> str | None:
@@ -1408,7 +1448,7 @@ def _finalize_continue_result(
     """
     from .logger import logger
     handle = data.query.query.get('handle')
-    stem = _build_stem(handle, data.query.endpoint, data.query.mode)
+    stem = _build_stem_for_query(data.query)
     if continue_:
         prior = None
         for ext in ('.json.gz', '.json'):
@@ -1744,6 +1784,205 @@ def scrape_search(
                     f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json"
                 )
                 data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
+@scrape.command(name='comments-list')
+@click.argument('pairs', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read (handle, post_id) rows from a CSV, Parquet, YAML, '
+                   'or JSON/JSONL file. Both columns are required. '
+                   'Mutually exclusive with positional args.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/comments/)')
+@click.option('--max-sessions', default=2, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless/--no-headless', default=True,
+              help='Run browsers headless (default). Pass --no-headless to see '
+                   'the browser window — useful for debugging login flows.')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--comments-after-count', type=int, default=None,
+              help='variables.commentsAfterCount on each replay. -1 (default) '
+                   'mirrors FB UI (server picks ~10 per page).')
+@click.option('--feed-location', type=str, default=None,
+              help='variables.feedLocation (default "POST_PERMALINK_DIALOG").')
+@click.option('--scroll-burst-every', type=int, default=None,
+              help='organic scroll burst every N paginations (default 50)')
+@click.option('--scroll-burst-min', type=int, default=None,
+              help='minimum scrolls per organic burst (default 2)')
+@click.option('--scroll-burst-max', type=int, default=None,
+              help='maximum scrolls per organic burst (default 5)')
+@click.option('--max-paginations', type=int, default=None,
+              help='safety cap on paginations per session (default -1 = no cap)')
+@click.option('--max-results', type=int, default=None,
+              help='cap on total accumulated comments (default -1 = no cap). '
+                   'Checked at batch boundaries; actual count can exceed by '
+                   'up to ~one page.')
+@click.option('--pagination-sleep-mean', type=float, default=None,
+              help='mean inter-pagination sleep seconds (default 2.5)')
+@click.option('--pagination-sleep-std', type=float, default=None,
+              help='std dev of inter-pagination sleep (default 0.5)')
+@click.option('--template-capture-timeout', type=float, default=None,
+              help='max seconds to wait for first '
+                   'CommentsListComponentsPaginationQuery (default 20)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the post permalink (default 3)')
+@click.option('--request-timeout-ms', type=int, default=None,
+              help='per-request timeout for page.request.post in milliseconds '
+                   '(default 30000)')
+@click.option('--max-no-progress-streak', type=int, default=None,
+              help='bail after N consecutive paginations with no new comments '
+                   '(default 5)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 900)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up instead '
+                   'of raising NoAccountError when the pool is empty/locked.')
+@click.option('--skip-existing', is_flag=True,
+              help='Skip targets whose output JSON file already exists.')
+@click.option('--continue', 'continue_', is_flag=True,
+              help='Resume each target from its prior saved file (matches on '
+                   '<handle>_<post_id>_CommentsList_hybrid stem). '
+                   'Mutually exclusive with --skip-existing.')
+@click.pass_context
+def scrape_comments_list(
+    ctx, pairs, input_file, output_dir, max_sessions, scroll_threshold,
+    headless, mobile, log_level, comments_after_count, feed_location,
+    scroll_burst_every, scroll_burst_min, scroll_burst_max, max_paginations,
+    max_results, pagination_sleep_mean, pagination_sleep_std,
+    template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
+    max_no_progress_streak, operation_timeout_seconds, wait_for_account,
+    skip_existing, continue_,
+):
+    """Scrape top-level comments on a post (hybrid mode only).
+
+    \b
+    Each target needs both a handle (drives the navigation URL) and a
+    post_id (numeric form OR pfbid form — both work in
+    /<handle>/posts/<post_id>/). The base64 `feedback:<id>` GraphQL
+    variable is captured from the natural request template.
+
+    \b
+    Examples:
+      fbscrape scrape comments-list brianlilley:pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l
+      fbscrape scrape comments-list zuck:10115311901107991 --headless
+      fbscrape scrape comments-list --input-file posts.csv
+
+    \b
+    Notes:
+      - Exhaustion-only by default — set --max-results to cap.
+      - Comments are returned non-chronologically by FB's "Most Relevant"
+        ranking; no date filtering applies.
+      - Replies (depth>0) are NOT collected here — each comment carries
+        `replies_total_count` for callers that want to drill into a
+        separate reply-fetching endpoint.
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    if skip_existing and continue_:
+        raise click.UsageError(
+            "--skip-existing and --continue are mutually exclusive: one drops "
+            "targets that already have output, the other resumes them. Pick one."
+        )
+
+    mode = 'hybrid'
+    # Reuse the generic 'handle:post_id' resolver — same shape as
+    # PageTransparency's `handle:page_id` form.
+    targets = _resolve_handle_pair_targets(pairs, input_file, paired_key='post_id')
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "comments")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    def _stem_for_target(target: dict) -> str:
+        return (
+            f"{target['handle'].replace('.', '_')}_"
+            f"{_commentslist_post_id_label(target['post_id'])}_"
+            f"CommentsList_{mode}"
+        )
+
+    if skip_existing:
+        before = len(targets)
+        targets = [
+            t for t in targets
+            if _existing_output_for_stem(output_dir, _stem_for_target(t)) is None
+        ]
+        skipped = before - len(targets)
+        if skipped:
+            logger.info(
+                f"--skip-existing: {skipped}/{before} targets already have "
+                f"output files in {output_dir}"
+            )
+        if not targets:
+            logger.info("Nothing to scrape.")
+            return
+
+    mode_params = {
+        "comments_after_count": comments_after_count,
+        "feed_location": feed_location,
+        "scroll_burst_every": scroll_burst_every,
+        "max_paginations": max_paginations,
+        "pagination_sleep_mean": pagination_sleep_mean,
+        "pagination_sleep_std": pagination_sleep_std,
+        "template_capture_timeout": template_capture_timeout,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "request_timeout_ms": request_timeout_ms,
+        "max_no_progress_streak": max_no_progress_streak,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    if scroll_burst_min is not None or scroll_burst_max is not None:
+        from .models import Query
+        default_min, default_max = (
+            Query.ENDPOINT_REGISTRY["CommentsList"]["modes"]["hybrid"]
+            ["params"]["scroll_burst_size_range"]
+        )
+        mode_params["scroll_burst_size_range"] = (
+            scroll_burst_min if scroll_burst_min is not None else default_min,
+            scroll_burst_max if scroll_burst_max is not None else default_max,
+        )
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    def _existing_output_path(target: dict) -> str | None:
+        return _existing_output_for_stem(output_dir, _stem_for_target(target))
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            finalize_tasks: list[asyncio.Task] = []
+            async for result in gather(
+                scraper.comments_list(
+                    handle=t['handle'],
+                    post_id=t['post_id'],
+                    max_results=max_results if max_results is not None else -1,
+                    resume_from=_existing_output_path(t) if continue_ else None,
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                finalize_tasks.append(asyncio.create_task(
+                    asyncio.to_thread(
+                        _finalize_continue_result, result, output_dir, continue_,
+                    )
+                ))
+            if finalize_tasks:
+                await asyncio.gather(*finalize_tasks)
 
     run_async(_scrape())
 

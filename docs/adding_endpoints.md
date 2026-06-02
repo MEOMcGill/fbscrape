@@ -2,7 +2,7 @@
 
 `fbscrape` is built around an endpoint × mode registry (`Query.ENDPOINT_REGISTRY`). Adding a new scrape target (e.g. `GroupTimeline`, `PageInsights`, `EventGuests`) is a wiring exercise across the runtime (7 touch points), the stop-condition framework (1 touch point if termination differs from existing endpoints), and the test suite (4 mandatory artifacts). This guide is opinionated: **hybrid-first**. The scroll-driven `manual` mode exists for `UserTimeline` only and is effectively deprecated — do not add a `manual` mode to new endpoints.
 
-The most recently added endpoint is **`GroupTimeline`** (`GroupsCometFeedRegularStoriesPaginationQuery`). It's the cleanest reference for date-bounded paginated endpoints where FB enforces no server-side date filter — when in doubt, grep for `GroupTimeline` or `group_timeline` and copy its shape. For an URL-filter-driven paginated reference, see `Search`; for a single-shot reference, see `PageTransparency`.
+The most recently added endpoint is **`CommentsList`** (`CommentsListComponentsPaginationQuery`). It's the cleanest reference for an *exhaustion-only* paginated endpoint whose response isn't Story-shaped — when adding a new endpoint that doesn't fit the Story-stream model, grep for `CommentsList` or `comments_list` and copy its shape (dedicated `_hybrid_comments_pagination_loop` + dedicated `parse_comments_response` parser + minimal stop set). For date-bounded paginated endpoints where FB enforces no server-side date filter, see `GroupTimeline` (Story-shaped). For an URL-filter-driven paginated reference, see `Search`; for a single-shot reference, see `PageTransparency`.
 
 ---
 

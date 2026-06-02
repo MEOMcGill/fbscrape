@@ -46,6 +46,7 @@ class Worker:
         ("UserTimeline", "hybrid"): "user_timeline_hybrid",
         ("Search", "hybrid"): "search_hybrid",
         ("GroupTimeline", "hybrid"): "group_timeline_hybrid",
+        ("CommentsList", "hybrid"): "comments_list_hybrid",
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future

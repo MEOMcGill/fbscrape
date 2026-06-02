@@ -46,6 +46,7 @@ HYBRID_HEADER_DROP = frozenset({
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
 GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME = "GroupsCometFeedRegularStoriesPaginationQuery"
+COMMENTS_LIST_HYBRID_TARGET_FRIENDLY_NAME = "CommentsListComponentsPaginationQuery"
 PAGE_TRANSPARENCY_FRIENDLY_NAME = "ProfileTransparencyDialogQuery"
 PROFILE_AUTHENTICITY_FRIENDLY_NAME = "ProfileCometDirectoryAuthenticityModalQuery"
 
@@ -928,6 +929,391 @@ class BrowserSession:
             time_taken=datetime.now(timezone.utc) - scrape_start_time,
             last_cursor=next_cursor,
         )
+
+    async def comments_list_hybrid(
+        self,
+        handle: str,
+        post_id: str,
+        comments_after_count: int = -1,
+        feed_location: str = "POST_PERMALINK_DIALOG",
+        scroll_burst_every: int = 50,
+        scroll_burst_size_range: tuple[int, int] = (2, 5),
+        pagination_sleep_mean: float = 2.5,
+        pagination_sleep_std: float = 0.5,
+        template_capture_timeout: float = 20.0,
+        max_paginations: int = -1,
+        max_results: int = -1,
+        initial_cursor: str = "",
+        seen_comment_ids_to_skip: list | None = None,
+        post_nav_sleep_seconds: float = 3.0,
+        request_timeout_ms: int = 30000,
+        max_no_progress_streak: int = 5,
+        operation_timeout_seconds: float = 900,
+    ) -> ScrapeOutcome:
+        """Scrape top-level comments on a post by replaying
+        CommentsListComponentsPaginationQuery.
+
+        Differences from `user_timeline_hybrid` / `group_timeline_hybrid`:
+          - Navigates to `/<handle>/posts/<post_id>/` (post_id accepts the
+            numeric form OR the pfbid form — both work in FB's permalink URL).
+          - GraphQL response is single-chunk JSON (not JSONL / @defer), so the
+            pagination loop uses a comment-specific parser
+            (`parse_comments_response`) instead of `parse_timeline_response`.
+          - Pagination variable is `commentsAfterCursor` (not `cursor`); page
+            size variable is `commentsAfterCount`; FB has no server-side date
+            filter and comments are non-chronological, so the loop runs no
+            date-bound stop conditions.
+          - The captured `variables.id` (base64 `feedback:<numeric_post_id>`)
+            is inherited from the natural request; callers don't supply it.
+
+        Args:
+            handle: Vanity handle (or numeric id) of the post's author / page;
+                used in the navigation URL.
+            post_id: Numeric post id OR pfbid form — passed verbatim into the
+                URL path.
+            comments_after_count: `variables.commentsAfterCount`. `-1` mirrors
+                FB's UI (server picks ~10 per page). Positive int caps the
+                per-page count.
+            feed_location: `variables.feedLocation`. Default
+                `"POST_PERMALINK_DIALOG"` matches the surface our nav URL hits.
+            max_results: -1 disables; cap on total accumulated comments.
+                Batch-boundary, may overshoot by up to ~one page.
+            initial_cursor: When non-empty, the loop starts from this
+                cursor instead of `null` — used by the `--continue` resume
+                path. Cursors are ephemeral per FB's own docs.
+            seen_comment_ids_to_skip: Optional iterable of comment_id strings
+                to seed `ResponseInterceptor.seen_post_ids` with (the same
+                set is reused for comment dedup across resume runs).
+
+        Returns:
+            ScrapeOutcome with `data` = list of Comment-shaped records (one
+            entry per top-level comment).
+        """
+        self.endpoint = "CommentsList"
+        logger.info(
+            f"[hybrid] post {handle}/{post_id}: starting comments scrape "
+            f"(feed_location={feed_location})"
+        )
+
+        target_url = f"https://www.facebook.com/{handle}/posts/{post_id}/"
+        scrape_start_time = datetime.now(timezone.utc)
+
+        loop_params = {
+            "comments_after_count": comments_after_count,
+            "feed_location": feed_location,
+            "scroll_burst_every": scroll_burst_every,
+            "scroll_burst_size_range": scroll_burst_size_range,
+            "pagination_sleep_mean": pagination_sleep_mean,
+            "pagination_sleep_std": pagination_sleep_std,
+            "max_paginations": max_paginations,
+            # The MaxPostsReached stop condition counts `all_posts_count`;
+            # we re-use it as the comment-count cap by aliasing the param.
+            "max_posts": max_results,
+            "max_no_progress_streak": max_no_progress_streak,
+            "request_timeout_ms": request_timeout_ms,
+            "operation_timeout_seconds": operation_timeout_seconds,
+        }
+
+        self.response_interceptor.flush()
+        # Comments aren't returned by `parse_timeline_response` (the
+        # interceptor's auto-extract hook), so leaving `extract_posts` on
+        # would have no effect either way — we collect manually inside the
+        # loop. Turn it off for clarity / symmetry with other hybrid paths.
+        self.response_interceptor.extract_posts = False
+
+        # Resume seed: comments dedup uses the same `seen_post_ids` set
+        # (it's name-only — the set is really "seen record ids" for whatever
+        # endpoint the session is currently scraping).
+        if seen_comment_ids_to_skip:
+            self.response_interceptor.seen_post_ids.update(seen_comment_ids_to_skip)
+            logger.info(
+                f"[hybrid] post {handle}/{post_id}: seeded "
+                f"{len(seen_comment_ids_to_skip)} comment_ids into dedup set "
+                f"for resume"
+            )
+        if initial_cursor:
+            logger.info(
+                f"[hybrid] post {handle}/{post_id}: resuming from cursor "
+                f"{self._hybrid_cursor_fp(initial_cursor)}"
+            )
+
+        # Phase 1 — navigate
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+
+        # Phase 2 — bootstrap scroll. CommentsListComponentsPaginationQuery
+        # is the "load more comments" query; an initial page-level scroll
+        # gets the comments panel rendered + the first paginated request
+        # firing. Same mechanism as PCTFRQ / GCFRSPQ.
+        error = await self._hybrid_bootstrap(operation_timeout_seconds)
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+
+        # Phase 3 — capture template
+        error, template = await self._hybrid_capture_template(
+            template_capture_timeout=template_capture_timeout,
+            operation_timeout_seconds=operation_timeout_seconds,
+            friendly_name=COMMENTS_LIST_HYBRID_TARGET_FRIENDLY_NAME,
+            interceptor_attr="latest_clcpq_request",
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+                last_cursor=initial_cursor or None,
+            )
+        logger.info(
+            f"[hybrid] post {handle}/{post_id}: template captured "
+            f"(doc_id={template['doc_id']}, feedback_id={template['profile_id']})"
+        )
+
+        # Phase 4 — comment pagination loop. No date filter, no JSONL
+        # parsing, no Story shape. Comment parser handles dedup +
+        # accumulation directly.
+        result_str, next_cursor = await self._hybrid_comments_pagination_loop(
+            label=f"{handle}/{post_id}",
+            template=template,
+            params=loop_params,
+            initial_cursor=initial_cursor or None,
+        )
+        return ScrapeOutcome(
+            result=result_str,
+            data=self.response_interceptor.get_posts(),
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            last_cursor=next_cursor,
+        )
+
+    async def _hybrid_comments_pagination_loop(
+        self,
+        label: str,
+        template: dict,
+        params: dict,
+        initial_cursor: str | None = None,
+        stop_conditions: list[StopCondition] | None = None,
+    ) -> tuple[str, str | None]:
+        """Drive comment paginations via page.request.post() until a stop fires.
+
+        Mirrors the structure of `_hybrid_pagination_loop` but tailored for
+        CommentsListComponentsPaginationQuery:
+          - Replays use `commentsAfterCursor` / `commentsAfterCount` (not
+            `cursor` / `count`).
+          - The response is single-chunk JSON; `end_cursor` lives at
+            `data.node.comment_rendering_instance_for_feed_location.comments.page_info.end_cursor`.
+          - Comments are parsed via `parse_comments_response` and appended
+            via the interceptor's `add_posts` (which dedups by `id`).
+          - No date semantics; date-bound stop conditions are not assembled.
+
+        Returns `(result_string, next_cursor)`.
+        """
+        template_form = template["form"]
+        template_headers = template["headers"]
+        cursor = initial_cursor or template["cursor"]
+        next_cursor: str | None = None
+
+        comments_after_count = params["comments_after_count"]
+        feed_location = params["feed_location"]
+        scroll_burst_every = params["scroll_burst_every"]
+        scroll_burst_size_range = params["scroll_burst_size_range"]
+        pagination_sleep_mean = params["pagination_sleep_mean"]
+        pagination_sleep_std = params["pagination_sleep_std"]
+        request_timeout_ms = params["request_timeout_ms"]
+        operation_timeout_seconds = params["operation_timeout_seconds"]
+
+        if stop_conditions is None:
+            stop_conditions = []
+        default_stop_conditions = assemble_default_stop_conditions(
+            endpoint=self.endpoint,
+            mode="hybrid",
+            sorting_setting=None,
+            params=params,
+        )
+        for d in default_stop_conditions:
+            stop_conditions.append(d)
+
+        total_paginations = 0
+        no_progress_streak = 0
+        previous_post_count = len(self.response_interceptor.get_posts())
+        iter_window: deque = deque(maxlen=HYBRID_CURSOR_RESET_WINDOW)
+
+        while True:
+            overrides = {
+                "commentsAfterCursor": cursor,
+                "commentsAfterCount": comments_after_count,
+                "feedLocation": feed_location,
+            }
+            body = self._hybrid_build_body(template_form, overrides)
+
+            cursor_sent_fp = self._hybrid_cursor_fp(cursor)
+            csr_len = len(self.response_interceptor.latest_csr or "")
+            dyn_len = len(self.response_interceptor.latest_dyn or "")
+            cursor_sent_this_iter = cursor
+
+            iter_start = datetime.now(timezone.utc)
+            response, text, error_str = await self._hybrid_send_replay(
+                handle=label,
+                body=body,
+                template_headers=template_headers,
+                request_timeout_ms=request_timeout_ms,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+            if error_str is not None:
+                return error_str, next_cursor
+
+            await self.record_scroll(endpoint=self.endpoint, count=1)
+            total_paginations += 1
+
+            try:
+                parsed = self.response_interceptor.parser.parse_comments_response(
+                    text.encode("utf-8"), GRAPHQL_API_URL
+                )
+            except Exception as e:
+                logger.warning(f"[hybrid] @{label}: comments parser raised: {e}")
+                parsed = None
+            comments = (parsed or {}).get("comments") or []
+            if comments:
+                self.response_interceptor.add_posts(comments)
+            end_cursor = (parsed or {}).get("end_cursor")
+            has_next_page = bool((parsed or {}).get("has_next_page"))
+
+            # Auth-ish errors → raise so Worker rotates the account.
+            # In-body rate-limits → return 'rate_limit'.
+            graphql_error_detail = self._hybrid_extract_graphql_error_detail(text)
+            if graphql_error_detail:
+                gql_msg = graphql_error_detail.get("message", "")
+                gql_code = graphql_error_detail.get("code")
+                logger.warning(
+                    f"[hybrid] @{label}: GraphQL error: {gql_msg} "
+                    f"(code={gql_code}, severity={graphql_error_detail.get('severity')})"
+                )
+                if self._hybrid_is_auth_error(gql_msg):
+                    raise FailedLoginError(
+                        f"Session invalid mid-scrape (graphql error: {gql_msg})"
+                    )
+                if self._hybrid_is_rate_limit_error(graphql_error_detail):
+                    return 'rate_limit', next_cursor
+
+            current_post_count = len(self.response_interceptor.get_posts())
+            new_posts_in_iter = current_post_count - previous_post_count
+            no_progress_streak = 0 if new_posts_in_iter else no_progress_streak + 1
+            previous_post_count = current_post_count
+
+            if end_cursor and has_next_page:
+                # When FB reports `has_next_page: false`, the cursor it
+                # echoes back is stale — drop it so the EndOfFeed stop
+                # condition fires cleanly. Mirrors how `_hybrid_extract_end_cursor`
+                # treats a falsy end_cursor.
+                next_cursor = end_cursor
+
+            elapsed_iter = (datetime.now(timezone.utc) - iter_start).total_seconds()
+            cursor_recv_fp = self._hybrid_cursor_fp(end_cursor)
+            posts_in_resp = len(comments)
+            logger.debug(
+                f"[hybrid] @{label} pagination {total_paginations}: "
+                f"{response.status} in {elapsed_iter:.2f}s, "
+                f"comments now={current_post_count} (+{new_posts_in_iter}, "
+                f"in_resp={posts_in_resp}), "
+                f"has_next_page={has_next_page}, "
+                f"cursor_sent={cursor_sent_fp}, "
+                f"cursor_recv={cursor_recv_fp}, "
+                f"__csr_len={csr_len}, __dyn_len={dyn_len}, "
+                f"resp_bytes={len(text or '')}"
+            )
+
+            iter_window.append({
+                "pagination_index": total_paginations,
+                "ts": iter_start.isoformat(),
+                "elapsed_s": elapsed_iter,
+                "status": response.status,
+                "request": {
+                    "body": body,
+                    "headers": template_headers,
+                    "cursor_sent_fp": cursor_sent_fp,
+                },
+                "response": {
+                    "text": text,
+                    "size_bytes": len(text or ""),
+                    "cursor_recv_fp": cursor_recv_fp,
+                    "has_next_page": has_next_page,
+                    "posts_in_resp": posts_in_resp,
+                },
+                "session": {
+                    "csr_len": csr_len,
+                    "dyn_len": dyn_len,
+                },
+            })
+
+            # Effective end_cursor for stop conditions: treat
+            # `has_next_page: false` as end-of-feed regardless of what
+            # FB echoes back in `end_cursor`. EndOfFeed.evaluate bails on
+            # a falsy end_cursor.
+            effective_end_cursor = end_cursor if has_next_page else None
+
+            state = StopState(
+                label=label,
+                endpoint=self.endpoint,
+                sorting_setting=None,
+                iter_index=total_paginations,
+                cursor_sent=cursor_sent_this_iter,
+                end_cursor=effective_end_cursor,
+                start_unix=None,
+                end_unix=None,
+                batch_creation_times=[],
+                oldest_in_batch=None,
+                newest_in_batch=None,
+                second_oldest_in_batch=None,
+                posts_in_resp=posts_in_resp,
+                new_posts_in_iter=new_posts_in_iter,
+                all_posts_count=current_post_count,
+                no_progress_streak=no_progress_streak,
+                response_text=text,
+                request_body=body,
+                template_headers=template_headers,
+                response_status=response.status,
+                iter_start_iso=iter_start.isoformat(),
+                elapsed_s=elapsed_iter,
+                cursor_sent_fp=cursor_sent_fp,
+                cursor_recv_fp=cursor_recv_fp,
+                csr_len=csr_len,
+                dyn_len=dyn_len,
+                iter_window=iter_window,
+                graphql_error_detail=graphql_error_detail,
+            )
+
+            for cond in stop_conditions:
+                result_string = cond.evaluate(state)
+                if result_string is not None:
+                    return result_string, next_cursor
+
+            cursor = end_cursor
+
+            if (total_paginations % scroll_burst_every) == 0:
+                await self._hybrid_organic_scroll_burst(
+                    *scroll_burst_size_range,
+                    operation_timeout_seconds=operation_timeout_seconds,
+                )
+
+            sleep_s = abs(random.gauss(pagination_sleep_mean, pagination_sleep_std))
+            await asyncio.sleep(sleep_s)
 
     async def page_transparency_hybrid(
         self,

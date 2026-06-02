@@ -84,6 +84,23 @@ Other notes:
 - Per-page count is 3 (matches FB UI). Bootstrap scroll is required (GCFRSPQ does not fire on raw navigation).
 - Response shape: each line carries a fanned-out subset of stories. The bootstrap line uses `data.node.group_feed.edges[].node = Story` (Shape A variant); subsequent stream lines use `data.node = Story` directly (Shape B). `FacebookGraphQLParser.parse_timeline_response` now fans Shape A into per-Story entries so every Story flows through `_flatten_grouptimeline_post` (a thin alias over `_flatten_pctfrq_post` — same Comet Story shape).
 
+### Paginated scrape strategy for `CommentsList`
+
+`mode="hybrid"` only — targets `CommentsListComponentsPaginationQuery` (CLCPQ). v1 scrapes **top-level comments only** (`depth=0`); nested replies live behind a separate query and are not collected here. Each record carries `replies_total_count` so callers can decide which comments to drill into via a future reply-fetching endpoint. The high-level shape mirrors `GroupTimeline` hybrid (navigate → bootstrap scroll → capture template → replay loop), with four deliberate differences:
+
+- **Response is single-chunk JSON, not JSONL.** CLCPQ doesn't ship `@stream`/`@defer` patches — `data.node` is a `Feedback` node carrying `comment_rendering_instance_for_feed_location.comments.{edges[], page_info}` directly. End-cursor extraction reads `page_info.end_cursor` straight from the (single) document; the chunk-path-aware logic used by `_hybrid_extract_end_cursor` for UserTimeline / GroupTimeline doesn't apply. Termination is driven by `page_info.has_next_page` (the loop treats `has_next_page: false` as end-of-feed regardless of what `end_cursor` echoes back).
+- **No date filter, no Story shape.** FB orders comments by "Most Relevant" (algorithmic), so `creation_time` is non-monotonic across batches and date-bound stops would be misleading. The default stop set is therefore `EndOfFeed`, `NoNewPostsStreak`, `MaxPostsReached` (driven by `max_results`), `MaxPaginations`, plus `GraphQLError` for forensics. `OldestInBatchBelowStartDate`, `ConsecutiveOutOfRange`, `CursorReset`, and `ResponseShapeError` are all dropped (none of their premises hold). See [`fbscrape/stop_conditions.py`](fbscrape/stop_conditions.py) `assemble_default_stop_conditions` — there's an explicit early-return for `endpoint == "CommentsList"`.
+- **Dedicated pagination loop.** `_hybrid_comments_pagination_loop` is a sibling to `_hybrid_pagination_loop`, sharing the same `_hybrid_send_replay` / `_hybrid_build_body` / `_hybrid_organic_scroll_burst` infrastructure but using `commentsAfterCursor` / `commentsAfterCount` as the pagination variables (not `cursor` / `count`) and `parse_comments_response` as the per-iter parser (not `parse_timeline_response`). The variable `feedLocation` (default `"POST_PERMALINK_DIALOG"`) is injected on every replay.
+- **No multi-leg cursor_reset resume.** Same policy as `GroupTimeline` / `PageTransparency` — `CursorReset` isn't in the assembled stop set, so the loop never returns `'cursor_reset'`.
+
+Other notes:
+- **Identifier**: required `handle` + `post_id`. `handle` is the post author / owning page's vanity handle (or numeric user/page id) — drives the navigation URL `/<handle>/posts/<post_id>/`. `post_id` accepts the **numeric form** OR the **pfbid form** (both work in FB's permalink URL). The base64-encoded `feedback:<numeric_post_id>` that the GraphQL replay needs as `variables.id` is captured automatically from the natural CLCPQ request's variables — callers don't supply it.
+- **Per-page count**: -1 (default) = FB picks (~10 per page empirically). Override via `--comments-after-count`.
+- **Bootstrap scroll required**: yes — CLCPQ is the "load more comments" query; an initial scroll on the post permalink renders the comments panel and fires the first paginated request.
+- **Dedup**: `parse_comments_response` synthesizes a top-level `post_id` key on each record (= the comment's `legacy_fbid`) so the generic `ResponseInterceptor.add_posts` dedup and the `_stream_resume_state` resume reader both work without endpoint-specific branches. Each flattened row also carries `comment_id`, `comment_id_b64`, `comment_feedback_id_b64`, and the parent's `post_feedback_id` for join-friendly downstream pipelines.
+- **Reactions on this endpoint**: `feedback.top_reactions.edges[]` ships only `{node:{id}, reaction_count}` — no `localized_name`. The flattener maps known FB reaction ids → canonical names via a hardcoded lookup (`_REACTION_ID_TO_NAME`); unknown ids land in `reactions_other` keyed by id so nothing is silently dropped if FB introduces a new reaction. Total `reactions` falls back to summing the breakdown when `reaction_count.count` is null (typical on this endpoint).
+- **Filename stem**: `<handle>_<post_id_truncated>_CommentsList_hybrid` (pfbid forms are truncated to 24 chars for filename readability; the full post_id stays in the saved JSON's `query.query`). One stem per (handle, post_id) pair so `--continue` / `--skip-existing` match per-post.
+
 ### Single-shot scrape strategy for `PageTransparency`
 
 `mode="hybrid"` only — there is no pagination, no scroll, no date filter. `Query.query` carries the numeric `page_id`; `handle` is optional (when supplied, it's used for the navigation URL; otherwise FB redirects `/<page_id>/` to the canonical page).
@@ -145,7 +162,7 @@ ENDPOINT_REGISTRY[endpoint] = {
 }
 ```
 
-Today's registered endpoints: `UserTimeline` (`manual` + `hybrid`), `Search` (`hybrid` only), `GroupTimeline` (`hybrid` only — paginated, client-side date filter), `PageTransparency` (`hybrid` only — single-shot, no pagination), `ProfileAuthenticity` (`hybrid` only — single-shot, no pagination). Adding a new endpoint = one nested dict entry + a `BrowserSession` method per mode + a row in `Worker.ENDPOINT_MODE_METHODS` + a flattener entry + test additions (fixture capture, unit flatten test, integration test, registry tripwire bump — see top-of-file Notes and [`tests/README.md`](tests/README.md)). Full playbook in [`docs/adding_endpoints.md`](docs/adding_endpoints.md).
+Today's registered endpoints: `UserTimeline` (`manual` + `hybrid`), `Search` (`hybrid` only), `GroupTimeline` (`hybrid` only — paginated, client-side date filter), `CommentsList` (`hybrid` only — paginated, no date filter, top-level comments only), `PageTransparency` (`hybrid` only — single-shot, no pagination), `ProfileAuthenticity` (`hybrid` only — single-shot, no pagination). Adding a new endpoint = one nested dict entry + a `BrowserSession` method per mode + a row in `Worker.ENDPOINT_MODE_METHODS` + a flattener entry + test additions (fixture capture, unit flatten test, integration test, registry tripwire bump — see top-of-file Notes and [`tests/README.md`](tests/README.md)). Full playbook in [`docs/adding_endpoints.md`](docs/adding_endpoints.md).
 
 `Query.__post_init__` validates the endpoint, mode, required query fields, and param keys; fills defaults from the registry. Unknown params raise `ValueError`.
 
@@ -207,6 +224,7 @@ Raw `ScrapingResult.data` records are deeply nested GraphQL trees. `FacebookGrap
 FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
     "UserTimeline":         "_flatten_pctfrq_post",
     "GroupTimeline":        "_flatten_grouptimeline_post",
+    "CommentsList":         "_flatten_commentslist_comment",
     "PageTransparency":     "_flatten_pagetransparency_record",
     "ProfileAuthenticity":  "_flatten_profile_authenticity_record",
     # Search: "_flatten_search_result_post" later
@@ -400,6 +418,13 @@ fbscrape scrape search --input-file queries.csv
 fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 --end-date 2025-01-01
 fbscrape scrape group-timeline 787909081545196 --start-date 2024-01-01
 fbscrape scrape group-timeline --input-file groups.csv --headless
+
+# Comments-list (hybrid only — top-level comments on a post; identifier is
+# `<handle>:<post_id>`, post_id accepts numeric OR pfbid form; exhaustion-only
+# by default with optional --max-results cap; no date filter)
+fbscrape scrape comments-list brianlilley:pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l
+fbscrape scrape comments-list zuck:10115311901107991 --max-results 200 --headless
+fbscrape scrape comments-list --input-file posts.csv
 
 # Page transparency (single-shot — pass bare `page_id` args (or `handle:page_id`
 # when you have the vanity handle), or --input-file with a `page_id` column

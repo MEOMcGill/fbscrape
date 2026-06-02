@@ -572,6 +572,96 @@ class FacebookScraper:
         )
         return result
 
+    async def comments_list(
+        self,
+        handle: str,
+        post_id: str,
+        mode: str = "hybrid",
+        max_results: int = -1,
+        resume_from: str | None = None,
+        **params,
+    ) -> ScrapingResult:
+        """
+        Scrape top-level comments on a Facebook post.
+
+        Targets `CommentsListComponentsPaginationQuery`. Exhaustion-only by
+        default (runs until FB reports `has_next_page: false`) with optional
+        `max_results` cap. Comments are returned non-chronologically by
+        FB's "Most Relevant" ranking — no date filtering applies. Replies
+        (depth>0) live behind a separate query and are not collected here;
+        each comment carries `replies_total_count` so callers can decide
+        whether to drill into a reply-fetching endpoint.
+
+        Like `group_timeline` / `page_transparency`, there is no cursor-
+        reset multi-leg resume — CommentsList has no server-side date
+        filter and the assembled stop set doesn't include `CursorReset`.
+
+        Args:
+            handle: Vanity handle (or numeric id) of the post's author /
+                owning page. Used in the navigation URL
+                (`https://www.facebook.com/<handle>/posts/<post_id>/`).
+            post_id: Numeric post id (e.g. `"1608937113934197"`) OR pfbid-
+                form (e.g. `"pfbid0Foc...EDshFTohjmixSo9l"`). Both forms
+                resolve via FB's permalink redirect.
+            mode: Currently only "hybrid" is supported.
+            max_results: Hard cap on total accumulated comments. `-1`
+                (default) disables the cap. Enforced at batch boundaries
+                (overshoots by up to ~one page). When the cap fires,
+                `result.result == "max_posts_reached"`.
+            resume_from: Path (`.json` or `.json.gz`) to a previously-saved
+                `ScrapingResult` from a partially-completed scrape. When
+                given, the loop starts from that file's `last_cursor` and
+                seeds the dedup set with saved comment_ids.
+            **params: mode-specific tuning knobs. Allowed keys and defaults
+                live in Query.ENDPOINT_REGISTRY[("CommentsList", mode)]["params"].
+                Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult with one record per top-level comment.
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+        cleaned_params["max_results"] = max_results
+
+        if resume_from:
+            saved_cursor, saved_post_ids = await asyncio.to_thread(
+                _stream_resume_state, resume_from,
+            )
+            cleaned_params["initial_cursor"] = saved_cursor
+            cleaned_params["seen_comment_ids_to_skip"] = saved_post_ids
+            logger.info(
+                f"CommentsList resume from {resume_from}: "
+                f"cursor={'<set>' if saved_cursor else '<null>'}, "
+                f"seen_comment_ids={len(saved_post_ids)}"
+            )
+
+        query = Query(
+            endpoint="CommentsList",
+            mode=mode,
+            query={
+                "handle": handle,
+                "post_id": post_id,
+            },
+            params=cleaned_params,
+        )
+
+        logger.debug(
+            f"Submitting CommentsList task (mode={mode}) for "
+            f"{handle}/{post_id}"
+        )
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed CommentsList (mode={mode}) for {handle}/{post_id}: "
+            f"{result.result} ({len(result.data)} comments, {result.time_taken})"
+        )
+        return result
+
     async def page_transparency(
         self,
         page_id: str,

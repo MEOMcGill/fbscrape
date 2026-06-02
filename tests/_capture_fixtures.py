@@ -73,6 +73,17 @@ TARGETS = {
         # Zuckerberg's user id (seen in data/page_transparency saves).
         "user_id": "100044331674441",
     },
+    "comments_list_hybrid": {
+        # A public post on Brian Lilley's page with many top-level comments.
+        # Substitute if it goes dark. The post_id is the pfbid form — both
+        # numeric and pfbid forms work in /<handle>/posts/<post_id>/.
+        "handle": "brianlilley",
+        "post_id": (
+            "pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l"
+        ),
+        # Bounded so the capture doesn't spin forever on a viral post.
+        "max_results": 30,
+    },
 }
 
 
@@ -102,6 +113,12 @@ async def _capture_profile_authenticity(scraper: FacebookScraper, spec: dict):
     return await scraper.profile_authenticity(spec["user_id"])
 
 
+async def _capture_comments_list(scraper: FacebookScraper, spec: dict):
+    return await scraper.comments_list(
+        spec["handle"], spec["post_id"], max_results=spec.get("max_results", -1),
+    )
+
+
 CAPTURERS = {
     "user_timeline_hybrid":  lambda s: _capture_user_timeline(s, "hybrid", TARGETS["user_timeline_hybrid"]),
     "user_timeline_manual":  lambda s: _capture_user_timeline(s, "manual", TARGETS["user_timeline_manual"]),
@@ -109,6 +126,7 @@ CAPTURERS = {
     "group_timeline_hybrid": lambda s: _capture_group_timeline(s, TARGETS["group_timeline_hybrid"]),
     "page_transparency":     lambda s: _capture_page_transparency(s, TARGETS["page_transparency"]),
     "profile_authenticity":  lambda s: _capture_profile_authenticity(s, TARGETS["profile_authenticity"]),
+    "comments_list_hybrid":  lambda s: _capture_comments_list(s, TARGETS["comments_list_hybrid"]),
 }
 
 

@@ -185,6 +185,7 @@ def test_endpoint_registry_top_level_keys_pinned():
         "UserTimeline",
         "Search",
         "GroupTimeline",
+        "CommentsList",
         "PageTransparency",
         "ProfileAuthenticity",
     }

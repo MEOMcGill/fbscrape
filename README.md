@@ -212,6 +212,28 @@ controls the warm-up navigation URL (`/<uid>/`) so the request looks like a
 real user clicking from a profile. The GraphQL body sent to FB carries
 `delegate_page_id` as `variables.pageID` regardless.
 
+### Comments on a post
+
+Top-level comments only (v1). Each comment carries `replies_total_count` so
+you can decide which comments to drill into via a future reply-fetching
+endpoint:
+
+```python
+from fbscrape import FacebookScraper
+
+async with FacebookScraper(db="accounts.db", max_browser_sessions=2) as scraper:
+    result = await scraper.comments_list(
+        handle="brianlilley",
+        post_id="pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l",
+        max_results=200,  # -1 (default) = exhaust
+    )
+    print(f"{len(result.data)} comments scraped, result={result.result!r}")
+    result.save(f"data/comments/brianlilley_top_comments.json", compress=True)
+```
+
+`post_id` accepts either the numeric form (e.g. `"1608937113934197"`) OR the
+pfbid form — both resolve via FB's permalink redirect.
+
 One edge case: pre-2010 accounts (Zuck = `"4"`, etc.) have a legacy short id
 as `author_id` on their own posts, but their modern `ProfileAuthenticity.user_id`
 is a different 15-digit number. The two ids refer to the same person but
@@ -312,6 +334,16 @@ fbscrape scrape group-timeline albertaseparatism --max-posts 500
 fbscrape scrape group-timeline albertaseparatism --start-date 2024-01-01 \
     --sorting-setting CHRONOLOGICAL --max-consecutive-out-of-range 30
 
+# CommentsList — top-level comments on a post. Identifier is `<handle>:<post_id>`;
+# post_id accepts numeric form OR the pfbid form (both work in FB's permalink URL).
+# Exhaustion-only by default; pass --max-results to cap. No date filter (comments
+# are returned non-chronologically by FB's "Most Relevant" ranking). Replies
+# (depth>0) are NOT collected here — each comment carries `replies_total_count`
+# so callers can decide which comments warrant a separate reply-fetching pass.
+fbscrape scrape comments-list brianlilley:pfbid0FocuLnBJtzSwMWrdRtkAX8oLDYM9koTY7Ph8RKVTTX9wxKNL8EDshFTohjmixSo9l
+fbscrape scrape comments-list zuck:10115311901107991 --max-results 200 --headless
+fbscrape scrape comments-list --input-file posts.csv
+
 # PageTransparency — single-shot, takes a page_id (handle optional)
 fbscrape scrape page-transparency 899800046546098
 fbscrape scrape page-transparency habsfanhub:899800046546098
@@ -342,8 +374,8 @@ fbscrape utils parse-curl "curl 'https://www.facebook.com/api/graphql/' -X POST 
 `--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
 depend on the subcommand: `handle` + optional `start_date` / `end_date` for
 `user-timeline` and `group-timeline`; `query_text` + dates for `search`;
-`page_id` (required) + `handle` (optional) for `page-transparency`; `user_id`
-for `profile-authenticity`.
+`handle` + `post_id` (both required) for `comments-list`; `page_id` (required) +
+`handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
 
 ### Account Management
 

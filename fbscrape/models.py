@@ -177,6 +177,53 @@ class Query:
                 },
             },
         },
+        "CommentsList": {
+            # Caller supplies the parent post's `handle` (vanity handle of the
+            # author / page that owns the post — needed for the navigation URL)
+            # and `post_id` (numeric form OR pfbid-form; both resolve via
+            # /<handle>/posts/<post_id>/). The base64-encoded `feedback:<id>`
+            # variable the GraphQL replay needs is inherited from the natural
+            # CommentsListComponentsPaginationQuery template captured during
+            # the bootstrap scroll, so callers don't have to know it.
+            "query_required": ["handle", "post_id"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        # FB UI mirrors: -1 lets the server pick the page size
+                        # (~10 comments per page empirically). Override to a
+                        # positive integer to cap; rarely useful since the
+                        # natural fingerprint is -1.
+                        "comments_after_count": -1,
+                        # `variables.feedLocation` on every replay. FB UI uses
+                        # POST_PERMALINK_DIALOG when viewing a post's single-
+                        # post permalink page (the surface our nav URL hits).
+                        # Other observed values include "DEDICATED_PAGE" /
+                        # "POST_PREVIEW"; leave at the default unless you've
+                        # verified a different value via DevTools capture.
+                        "feed_location": "POST_PERMALINK_DIALOG",
+                        "scroll_burst_every": 50,
+                        "scroll_burst_size_range": (2, 5),
+                        "pagination_sleep_mean": 2.5,
+                        "pagination_sleep_std": 0.5,
+                        "template_capture_timeout": 20.0,
+                        "max_paginations": -1,
+                        # -1 disables the cap; positive int caps total
+                        # accumulated comments. Batch-boundary enforced — the
+                        # actual return count can exceed by up to one page.
+                        "max_results": -1,
+                        # Resume support. Sentinel defaults so the registry's
+                        # `None` = required convention isn't triggered. Same
+                        # role as GroupTimeline's resume seeds.
+                        "initial_cursor": "",
+                        "seen_comment_ids_to_skip": [],
+                        "post_nav_sleep_seconds": 3.0,
+                        "request_timeout_ms": 30000,
+                        "max_no_progress_streak": 5,
+                        "operation_timeout_seconds": 900,
+                    },
+                },
+            },
+        },
         "GroupTimeline": {
             # `handle` accepts either a vanity group handle (e.g. "albertaseparatism")
             # or the numeric group id — both forms resolve via `/groups/<handle>/`.

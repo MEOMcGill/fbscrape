@@ -2,6 +2,7 @@
 Response interception and Facebook GraphQL parsing
 """
 
+import base64
 import json
 import os
 import traceback
@@ -134,6 +135,23 @@ class FacebookGraphQLParser:
         "GroupTimeline": "_flatten_grouptimeline_post",
         "PageTransparency": "_flatten_pagetransparency_record",
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
+        "CommentsList": "_flatten_commentslist_comment",
+    }
+
+    # FB's canonical reaction ids — stable per reaction type, used as edge
+    # `node.id` in `top_reactions.edges[]` on Comment.feedback (no
+    # `localized_name` is shipped on the CommentsList endpoint, so we map
+    # by id). Source: empirical observation across captures + FB's published
+    # reaction emoji ids. Unknown ids are passed through under their id key
+    # in the breakdown dict so we don't silently drop them.
+    _REACTION_ID_TO_NAME: dict[str, str] = {
+        "1635855486666999": "like",
+        "1678524932434102": "love",
+        "115940658764963":  "haha",
+        "1885436228231891": "wow",
+        "1538317126927996": "sad",
+        "478547315650144":  "angry",
+        "613557422527858":  "care",
     }
 
     # Edge-container keys that wrap one or more Stories. `parse_timeline_response`
@@ -194,6 +212,80 @@ class FacebookGraphQLParser:
                     break  # only one container key applies per response line
 
             return {'posts': posts}
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[PARSER ERROR] Failed to decode JSON: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[PARSER ERROR] {e}")
+            logger.error(traceback.print_exc())
+            return None
+
+    def parse_comments_response(self, body: bytes, url: str) -> dict | None:
+        """Parse a CommentsListComponentsPaginationQuery response into
+        `{comments: [...], end_cursor: str | None, has_next_page: bool}`.
+
+        The response is single-chunk JSON (no JSONL / @defer streaming):
+        `data.node.comment_rendering_instance_for_feed_location.comments` is
+        a Relay connection with `edges[].node` Comment nodes, `edges[].cursor`
+        being null (file-level cursor), and `page_info.end_cursor` /
+        `has_next_page` driving pagination. The parent post's base64
+        `feedback:<id>` is at `data.node.id` (top-level).
+
+        Returns None on decode/parse failure.
+        """
+        try:
+            response_data = parse_json_or_jsonl(body.decode('utf-8'))
+            comments: list[dict] = []
+            end_cursor: str | None = None
+            has_next_page: bool = False
+            parent_feedback_id: str | None = None
+            for data_line in response_data:
+                if not isinstance(data_line, dict) or 'data' not in data_line:
+                    continue
+                payload = data_line['data']
+                if not isinstance(payload, dict):
+                    continue
+                node = payload.get('node')
+                if not isinstance(node, dict):
+                    continue
+                if node.get('__typename') != 'Feedback':
+                    continue
+                if parent_feedback_id is None and isinstance(node.get('id'), str):
+                    parent_feedback_id = node['id']
+                cri = node.get('comment_rendering_instance_for_feed_location') or {}
+                connection = cri.get('comments') or {}
+                for edge in connection.get('edges') or []:
+                    inner = edge.get('node') if isinstance(edge, dict) else None
+                    if isinstance(inner, dict) and inner.get('id'):
+                        # Synthesize a top-level `post_id` from the numeric
+                        # comment id (`legacy_fbid`) so the interceptor's
+                        # generic post-id dedup (`add_posts`) and the resume
+                        # streamer (`_stream_resume_state`) both work without
+                        # endpoint-specific branches. Falls back to the b64
+                        # `id` if `legacy_fbid` is missing (defensive).
+                        synthetic_pid = (
+                            inner.get('legacy_fbid') or inner.get('id')
+                        )
+                        # Stash the parent feedback id on each comment so
+                        # the flattener can recover it without the caller
+                        # threading it through.
+                        comments.append({
+                            'node': inner,
+                            'post_id': synthetic_pid,
+                            '_parent_feedback_id_b64': parent_feedback_id,
+                        })
+                page_info = connection.get('page_info') or {}
+                if page_info.get('end_cursor'):
+                    end_cursor = page_info['end_cursor']
+                if page_info.get('has_next_page'):
+                    has_next_page = True
+            return {
+                'comments': comments,
+                'end_cursor': end_cursor,
+                'has_next_page': has_next_page,
+                'parent_feedback_id_b64': parent_feedback_id,
+            }
 
         except json.JSONDecodeError as e:
             logger.error(f"[PARSER ERROR] Failed to decode JSON: {e}")
@@ -476,6 +568,34 @@ class FacebookGraphQLParser:
             "section_token": modal.get("section_token"),
             "collection_token": modal.get("collection_token"),
         }
+
+    def _flatten_commentslist_comment(self, record: dict) -> dict | None:
+        """Orchestrator for CommentsListComponentsPaginationQuery (CommentsList).
+
+        `record` is one entry from `parse_comments_response`'s `comments`
+        list: `{"node": <Comment>, "_parent_feedback_id_b64": <str>}`. The
+        Comment shape is FB's Comet "Comment" node (distinct from Story —
+        different `feedback.id` namespace, no `metadata[]` strategy list, no
+        `comet_sections` wrapping). Returns one row dict per comment.
+        """
+        if not isinstance(record, dict):
+            return None
+        comment = record.get("node") if "node" in record else record
+        if not isinstance(comment, dict) or not comment.get("id"):
+            return None
+        parent_feedback_id_b64 = (
+            record.get("_parent_feedback_id_b64")
+            if isinstance(record, dict) else None
+        )
+        out: dict = {}
+        out.update(self._extract_comment_ids(comment, parent_feedback_id_b64))
+        out.update(self._extract_comment_times(comment))
+        out.update(self._extract_comment_author(comment))
+        out.update(self._extract_comment_body(comment))
+        out.update(self._extract_comment_reactions(comment))
+        out.update(self._extract_comment_replies(comment))
+        out["attachments"] = self._extract_attachments(comment)
+        return out
 
     # ----- per-aspect extractors -----
 
@@ -837,6 +957,175 @@ class FacebookGraphQLParser:
         })
         return out
 
+    # ----- comment-specific extractors (CommentsList) -----
+
+    @staticmethod
+    def _decode_b64_legacy(b64_id: str | None) -> str | None:
+        """Decode `<prefix>:<numeric_id>` from a base64 GraphQL id; tolerate junk."""
+        if not b64_id or not isinstance(b64_id, str):
+            return None
+        try:
+            decoded = base64.b64decode(b64_id).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        if ":" not in decoded:
+            return None
+        return decoded.split(":", 1)[1] or None
+
+    def _extract_comment_ids(
+        self, comment: dict, parent_feedback_id_b64: str | None
+    ) -> dict:
+        """Comment id, feedback id, parent ids — both numeric + b64 forms.
+
+        Comment.id is `comment:<post_id>_<comment_id>` (base64); legacy_fbid
+        is the numeric comment id directly. The parent post's feedback id is
+        captured at the response top-level (`data.node.id`) and threaded in
+        as `parent_feedback_id_b64`; we decode it to recover the numeric
+        post-feedback id.
+        """
+        comment_id_b64 = comment.get("id")
+        comment_feedback = comment.get("feedback") or {}
+        # `comment.feedback.id` decodes to `feedback:<post_id>_<comment_id>`;
+        # the numeric comment_id is `legacy_fbid` (preferred — no decoding).
+        comment_id = comment.get("legacy_fbid") or self._decode_b64_legacy(comment_id_b64)
+        # The parent's feedback (the post's feedback) id — we already have
+        # both b64 and numeric forms from the response top-level.
+        post_feedback_id = self._decode_b64_legacy(parent_feedback_id_b64)
+        # Reply parent (only populated when depth > 0; null in v1 captures).
+        parent = comment.get("comment_direct_parent") or {}
+        parent_comment_id_b64 = parent.get("id") if isinstance(parent, dict) else None
+        return {
+            "comment_id": comment_id,
+            "comment_id_b64": comment_id_b64,
+            "comment_feedback_id_b64": comment_feedback.get("id"),
+            "post_feedback_id": post_feedback_id,
+            "post_feedback_id_b64": parent_feedback_id_b64,
+            "depth": comment.get("depth"),
+            "parent_comment_id_b64": parent_comment_id_b64,
+            "url": _g(comment_feedback, "url"),
+        }
+
+    def _extract_comment_times(self, comment: dict) -> dict:
+        created_at = comment.get("created_time")
+        created_at_utc = (
+            datetime.fromtimestamp(created_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if isinstance(created_at, (int, float)) else None
+        )
+        return {"created_at": created_at, "created_at_utc": created_at_utc}
+
+    def _extract_comment_author(self, comment: dict) -> dict:
+        a = comment.get("author") or {}
+        return {
+            "author_id":   a.get("id"),
+            "author_name": a.get("name"),
+            "author_url":  a.get("url"),
+            "author_type": a.get("__typename"),
+        }
+
+    def _extract_comment_body(self, comment: dict) -> dict:
+        """Comment text + typed entities (hashtags, mentions, external URLs).
+
+        Comments carry text/ranges at `body.{text,ranges}`. Translation
+        variants live under `preferred_body.text` with `translation_type`
+        (e.g. "ORIGINAL"). The ranges schema matches Story posts —
+        `entity.__typename ∈ {Hashtag, User, ExternalUrl}` — so the entity-
+        extraction logic mirrors `_extract_message`.
+        """
+        body = comment.get("body") or {}
+        text = body.get("text")
+        ranges = body.get("ranges") or []
+
+        hashtags: list[str] = []
+        mentions: list[dict] = []
+        external_urls: list[str] = []
+        seen_h: set[str] = set()
+        seen_m: set[str] = set()
+        seen_u: set[str] = set()
+        for r in ranges:
+            entity = r.get("entity") or {}
+            tn = entity.get("__typename")
+            if tn == "Hashtag":
+                url = entity.get("url") or ""
+                name = url.rsplit("/", 1)[-1] if url else None
+                if name and name not in seen_h:
+                    seen_h.add(name)
+                    hashtags.append(name)
+            elif tn == "User":
+                uid = entity.get("id")
+                if uid and uid not in seen_m:
+                    seen_m.add(uid)
+                    mentions.append({
+                        "id":   uid,
+                        "name": entity.get("name"),
+                        "url":  entity.get("url"),
+                    })
+            elif tn == "ExternalUrl":
+                url = entity.get("external_url")
+                if url and url not in seen_u:
+                    seen_u.add(url)
+                    external_urls.append(url)
+
+        pref = comment.get("preferred_body") or {}
+        pref_text = pref.get("text")
+        translation_type = pref.get("translation_type")
+        return {
+            "text":             text,
+            "hashtags":         hashtags or None,
+            "mentions":         mentions or None,
+            "external_urls":    external_urls or None,
+            # Surface the translation only when it actually differs from the
+            # original (FB ships `preferred_body.text == body.text` when
+            # `translation_type == "ORIGINAL"`).
+            "translated_text":  pref_text if (pref_text and pref_text != text) else None,
+            "translation_type": translation_type,
+            "is_disabled":      comment.get("is_disabled"),
+        }
+
+    def _extract_comment_reactions(self, comment: dict) -> dict:
+        """Reactions breakdown by canonical name + total.
+
+        On CommentsListComponentsPaginationQuery, `feedback.top_reactions.edges`
+        carries `{node:{id}, reaction_count}` only — no `localized_name`. We
+        map known reaction ids to names via `_REACTION_ID_TO_NAME`; unknown
+        ids land in `reactions_other` keyed by id so nothing is silently
+        dropped if FB introduces a new reaction.
+        """
+        fb = comment.get("feedback") or {}
+        rxn_counts = {k: 0 for k in ("like", "love", "haha", "wow", "sad", "angry", "care")}
+        rxn_other: dict[str, int] = {}
+        for e in _g(fb, "top_reactions", "edges", default=[]) or []:
+            rid = _g(e, "node", "id")
+            count = e.get("reaction_count") or 0
+            name = self._REACTION_ID_TO_NAME.get(rid) if isinstance(rid, str) else None
+            if name:
+                rxn_counts[name] = count
+            elif rid:
+                rxn_other[rid] = count
+        # Comment.feedback.reaction_count.count is often null on this
+        # endpoint; sum as the canonical total.
+        total = _g(fb, "reaction_count", "count")
+        if total is None:
+            total = sum(rxn_counts.values()) + sum(rxn_other.values()) or None
+        return {
+            "reactions":       total,
+            **rxn_counts,
+            "reactions_other": rxn_other or None,
+        }
+
+    def _extract_comment_replies(self, comment: dict) -> dict:
+        """Reply counts (the inline reply edges are usually empty on this endpoint).
+
+        `replies_fields.total_count` tells you how many replies the comment
+        has — useful for deciding whether to drill into a follow-up
+        endpoint that fetches them. `count` is the same number minus
+        low-quality / hidden replies; both surface.
+        """
+        rf = _g(comment, "feedback", "replies_fields") or {}
+        return {
+            "replies_total_count": rf.get("total_count"),
+            "replies_count":       rf.get("count"),
+        }
+
     def _extract_shared_post(self, story: dict) -> dict | None:
         """Run extractors on `attached_story` (FB's repost/share slot).
 
@@ -919,6 +1208,10 @@ class ResponseInterceptor:
         # if any. Same role as latest_pctfrq_request, but for the GroupTimeline
         # endpoint's hybrid mode. Reset on flush().
         self.latest_gcfrspq_request: dict | None = None
+        # Latest captured CommentsListComponentsPaginationQuery request, if any.
+        # Same role as latest_pctfrq_request, but for the CommentsList
+        # endpoint's hybrid mode. Reset on flush().
+        self.latest_clcpq_request: dict | None = None
         # Latest captured natural GraphQL POST (any friendly-name). Populated
         # on every browser-issued GraphQL POST observed. Used by single-shot
         # endpoints (e.g., PageTransparency) that synthesize the request body
@@ -979,6 +1272,7 @@ class ResponseInterceptor:
             await self._track_pctfrq_template(response.request)
             await self._track_scrq_template(response.request)
             await self._track_gcfrspq_template(response.request)
+            await self._track_clcpq_template(response.request)
             await self._track_any_graphql_request(response.request)
 
         # Full network capture is opt-in via FB_NETWORK_CAPTURE_ALL=1. Off by
@@ -1306,6 +1600,45 @@ class ResponseInterceptor:
             "headers": headers,
         }
 
+    async def _track_clcpq_template(self, request):
+        """If this request is a `CommentsListComponentsPaginationQuery`, save
+        a small replay-template snapshot (post_data + headers) to
+        `self.latest_clcpq_request`. Mirrors `_track_pctfrq_template` for
+        the CommentsList endpoint's hybrid mode.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+
+        is_clcpq = headers.get("x-fb-friendly-name") == "CommentsListComponentsPaginationQuery"
+        post_data = None
+        if not is_clcpq:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            if post_data:
+                try:
+                    form = parse_qs(post_data, keep_blank_values=True)
+                    name = form.get("fb_api_req_friendly_name") or []
+                    if name and name[-1] == "CommentsListComponentsPaginationQuery":
+                        is_clcpq = True
+                except Exception:
+                    pass
+        if not is_clcpq:
+            return
+
+        if post_data is None:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+        self.latest_clcpq_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
     async def _track_any_graphql_request(self, request):
         """Save (post_data, headers) for any natural GraphQL POST to
         `self.latest_natural_graphql_request`. Called from intercept_response
@@ -1361,6 +1694,7 @@ class ResponseInterceptor:
         self.latest_pctfrq_request = None
         self.latest_scrq_request = None
         self.latest_gcfrspq_request = None
+        self.latest_clcpq_request = None
         self.latest_natural_graphql_request = None
         # network_capture is opt-in (FB_NETWORK_CAPTURE_ALL=1); reset anyway
         # so a fresh scrape starts with a clean slate when capture is enabled.

@@ -449,7 +449,23 @@ def assemble_default_stop_conditions(
     `ConsecutiveOutOfRange` is opt-in via `params['max_consecutive_out_of_range']`.
     Order matters — `GraphQLError` runs first so forensics dump before
     anything else interprets the response.
+
+    `CommentsList` is exhaustion-only with optional max_results — it skips
+    every date-bound and Story-shape-specific condition.
     """
+    # CommentsList: exhaustion-only + optional max cap. No date semantics
+    # (comments are non-chronological), no Story-shape parsing (so
+    # `ResponseShapeError`'s premise doesn't hold), no cursor-reset (no
+    # chronological monotonicity to anchor on).
+    if endpoint == "CommentsList":
+        return [
+            GraphQLError(),
+            EndOfFeed(),
+            NoNewPostsStreak(params["max_no_progress_streak"]),
+            MaxPostsReached(params.get("max_posts", -1)),
+            MaxPaginations(params["max_paginations"]),
+        ]
+
     is_chronological = (
         endpoint in ("UserTimeline", "Search")
         or (endpoint == "GroupTimeline" and sorting_setting == "CHRONOLOGICAL")
