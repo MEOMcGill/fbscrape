@@ -141,3 +141,25 @@ async def test_no_account_error_requeues_not_failed():
     with pytest.raises(NoAccountError):
         future.result()
     assert worker.closed
+
+
+async def test_startup_delay_defers_first_task():
+    # Staggered spin-up: a worker with a startup_delay must not pull (and thus
+    # not cold-start a browser) until the delay elapses. Steady-state behavior
+    # is unaffected; this only gates the first pull.
+    pool = _make_pool()
+    q = _make_query()
+    worker = _FakeWorker("worker-0", [_ok_result(q)])
+    pool.workers.append(worker)
+
+    future = asyncio.get_running_loop().create_future()
+    await pool.task_queue.put((q, future))
+
+    loop_task = asyncio.create_task(pool._worker_loop(worker, startup_delay=0.5))
+    await asyncio.sleep(0.2)
+    assert not future.done(), "worker pulled a task before its startup_delay elapsed"
+
+    result = await asyncio.wait_for(future, timeout=2.0)   # processes after the delay
+    assert result.result == "success"
+    pool._shutdown = True
+    await asyncio.wait_for(loop_task, timeout=2.0)

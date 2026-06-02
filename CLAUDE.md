@@ -31,6 +31,8 @@ FacebookScraper.user_timeline(handle, start_date, end_date, mode="hybrid", **par
 WorkerPool.submit_task(query) → asyncio.Future
     │
     │  lazily inits N workers (N = min(max_workers, active_accounts));
+    │  each worker's first task pull is staggered by index*WORKER_STARTUP_STAGGER_SECONDS
+    │  so N browsers don't cold-start at once (flattens the spin-up CPU spike);
     │  each worker pulls (query, future) tuples off a shared queue
     ▼
 Worker.execute_task(query)

@@ -15,6 +15,11 @@ from .models import Query, ScrapingResult
 from .worker import Worker
 
 IDLE_RELEASE_TIMEOUT_SECONDS = 60  # 1 minute; idle workers release accounts after this
+# At startup each worker delays its first task pull by (worker_index * this), so
+# N browsers don't all cold-start (launch + login) at the same instant — flattens
+# the spin-up CPU spike. One-shot: only the first pull is delayed; steady state
+# is unaffected. Total ramp ≈ (num_workers-1) * this.
+WORKER_STARTUP_STAGGER_SECONDS = 15.0
 
 class WorkerPool:
     """
@@ -120,8 +125,12 @@ class WorkerPool:
                 )
                 self.workers.append(worker)
 
-                # Start worker loop as background task
-                task = asyncio.create_task(self._worker_loop(worker))
+                # Start worker loop as background task. Stagger each worker's
+                # first task pull by index*stagger so browsers don't all
+                # cold-start at once (see WORKER_STARTUP_STAGGER_SECONDS).
+                task = asyncio.create_task(
+                    self._worker_loop(worker, startup_delay=i * WORKER_STARTUP_STAGGER_SECONDS)
+                )
                 self.worker_tasks.append(task)
 
                 logger.info(f"WorkerPool created {worker.id}")
@@ -140,14 +149,19 @@ class WorkerPool:
         self._initialized = True
         return len(self.workers)
 
-    async def _worker_loop(self, worker: Worker):
+    async def _worker_loop(self, worker: Worker, startup_delay: float = 0.0):
         """
         Worker loop - processes tasks from queue until shutdown.
 
         Args:
             worker: Worker instance to execute tasks
+            startup_delay: one-shot delay before the first task pull, used to
+                stagger browser cold-starts across workers at spin-up.
         """
         logger.info(f"WorkerPool: {worker.id} loop started")
+        if startup_delay:
+            logger.debug(f"WorkerPool: {worker.id} staggering startup by {startup_delay:.0f}s")
+            await asyncio.sleep(startup_delay)
         idle_seconds: int = 0
         try: # wrap in try/finally so clean exit of workers runs regardless of exit strategy (e.g., double Ctrl+C)
             while not self._shutdown:
