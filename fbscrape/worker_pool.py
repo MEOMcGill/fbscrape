@@ -14,7 +14,7 @@ from .logger import logger
 from .models import Query, ScrapingResult
 from .worker import Worker
 
-IDLE_RELEASE_TIMEOUT_SECONDS = 60  # 1 minute; idle workers release accounts after this
+IDLE_RELEASE_TIMEOUT_SECONDS = 1800  # 30 min; idle workers release accounts after this. Set high so workers survive a slow --continue startup (resume-reads of a large corpus feed the queue slowly) instead of idle-quitting during the ramp.
 # At startup each worker delays its first task pull by (worker_index * this), so
 # N browsers don't all cold-start (launch + login) at the same instant — flattens
 # the spin-up CPU spike. One-shot: only the first pull is delayed; steady state
