@@ -52,6 +52,7 @@ def _find_unstick_cursor(
     """
     # Local import to avoid putting fbscrape.response in cli.py's top-level imports.
     from .response import FacebookGraphQLParser
+    from .merge import _unstick_select
     parser = FacebookGraphQLParser()
 
     items: list[tuple[int, int, str | None]] = []  # (created_at, idx, cursor)
@@ -64,19 +65,9 @@ def _find_unstick_cursor(
         cursor = rec.get('cursor')
         if isinstance(ct, (int, float)):
             items.append((int(ct), i, cursor))
-    items.sort(key=lambda x: x[0])  # oldest first
 
-    if len(items) < rank:
-        return None
-
-    for cur_rank, (ct, idx, cursor) in enumerate(items[rank - 1:], start=rank):
-        if cursor:
-            return (cursor, {
-                "chosen_rank": cur_rank,
-                "chosen_idx":  idx,
-                "chosen_created_at": ct,
-            })
-    return None
+    # Shared selection — identical logic to the streaming merge's unstick path.
+    return _unstick_select(items, rank)
 
 from .accounts_pool import AccountsPool
 from .utils import gather, get_home_dir_path, utc
@@ -1184,6 +1175,7 @@ def scrape_user_timeline(
             raise_when_no_account=not wait_for_account,
         ) as scraper:
             finalize_tasks: list[asyncio.Task] = []
+            finalize_sem = asyncio.Semaphore(MERGE_CONCURRENCY)
             async for result in gather(
                 scraper.user_timeline(
                     handle=t['handle'],
@@ -1199,9 +1191,7 @@ def scrape_user_timeline(
                 # result enter this loop body immediately instead of
                 # stalling behind a multi-minute json.load + gzip-write.
                 finalize_tasks.append(asyncio.create_task(
-                    asyncio.to_thread(
-                        _finalize_continue_result, result, output_dir, continue_,
-                    )
+                    _finalize_guarded(finalize_sem, result, output_dir, continue_)
                 ))
             if finalize_tasks:
                 await asyncio.gather(*finalize_tasks)
@@ -1407,6 +1397,7 @@ def scrape_group_timeline(
             raise_when_no_account=not wait_for_account,
         ) as scraper:
             finalize_tasks: list[asyncio.Task] = []
+            finalize_sem = asyncio.Semaphore(MERGE_CONCURRENCY)
             async for result in gather(
                 scraper.group_timeline(
                     handle=t['handle'],
@@ -1419,9 +1410,7 @@ def scrape_group_timeline(
             ):
                 # Merge + save off the event loop: see `scrape user-timeline`.
                 finalize_tasks.append(asyncio.create_task(
-                    asyncio.to_thread(
-                        _finalize_continue_result, result, output_dir, continue_,
-                    )
+                    _finalize_guarded(finalize_sem, result, output_dir, continue_)
                 ))
             if finalize_tasks:
                 await asyncio.gather(*finalize_tasks)
@@ -1429,68 +1418,56 @@ def scrape_group_timeline(
     run_async(_scrape())
 
 
+# Cap on concurrent --continue finalize/merge tasks. Each streams its prior file
+# disk→disk (KDD 25), so per-merge memory is bounded by the new leg; this cap is
+# cheap insurance against many merges thrashing disk/CPU at once.
+MERGE_CONCURRENCY = 3
+
+
+async def _finalize_guarded(sem, data, output_dir, continue_):
+    """Run `_finalize_continue_result` off the event loop under a concurrency
+    cap (semaphore-bounded), so completions keep yielding without N merges
+    contending at once."""
+    async with sem:
+        await asyncio.to_thread(_finalize_continue_result, data, output_dir, continue_)
+
+
 def _finalize_continue_result(
     data: 'ScrapingResult',
     output_dir: str,
     continue_: bool,
 ) -> None:
-    """Merge prior data, auto-unstick cursor, save the merged result.
+    """Merge prior data, auto-unstick cursor, save the merged result + sidecar.
 
     Synchronous so it can be dispatched via `asyncio.to_thread` —
     running it inline in the async for-loop blocks every other worker's
-    completion behind a single ~10k-post `json.load` + gzip-write,
-    turning a batch of 6 concurrent target completions into ~hours of
-    serialized post-processing. With to_thread the merges run on the
-    default thread pool and the scrape coroutines keep yielding.
+    completion behind a single merge + gzip-write, turning a batch of
+    concurrent target completions into serialized post-processing.
 
-    No-op contract: if `continue_` is False, this is just a save; the
-    auto-unstick branch only fires on `no_new_posts_streak`.
+    The `--continue` merge streams the prior file disk→disk (KDD 25) so peak
+    memory is bounded by the new leg, not the prior-file size — and the sidecar
+    + auto-unstick are computed in that same pass. `continue_` False is just an
+    atomic save + sidecar (no prior to merge).
     """
     from .logger import logger
     handle = data.query.query.get('handle')
     stem = _build_stem_for_query(data.query)
+    dest = os.path.join(output_dir, f"{stem}.json.gz")
     if continue_:
-        prior = None
-        for ext in ('.json.gz', '.json'):
-            p = os.path.join(output_dir, f"{stem}{ext}")
-            if os.path.exists(p):
-                with _open_scrape_input(p) as f:
-                    prior = json.load(f)
-                break
-        if prior is not None:
-            prior_data = prior.get('data') or prior.get('posts') or []
-            if prior_data:
-                data.data = prior_data + data.data
-                logger.info(
-                    f"@{handle}: merged {len(prior_data)} prior + "
-                    f"{len(data.data) - len(prior_data)} new posts "
-                    f"(total {len(data.data)})"
-                )
-    if continue_ and data.result == 'no_new_posts_streak':
-        chosen = _find_unstick_cursor(
-            data.data, endpoint=data.query.endpoint, rank=3,
-        )
-        if chosen:
-            new_cursor, diag = chosen
-            chosen_iso = datetime.fromtimestamp(
-                diag["chosen_created_at"], tz=timezone.utc,
-            ).isoformat()
-            logger.info(
-                f"@{handle}: no_new_posts_streak on --continue resume — "
-                f"auto-unsticking cursor to rank #{diag['chosen_rank']}, "
-                f"data[{diag['chosen_idx']}] @ {chosen_iso}"
+        from .merge import stream_merge_and_save
+        prior_path = _existing_output_for_stem(output_dir, stem)
+        stream_merge_and_save(data, prior_path, dest, handle=handle)
+    else:
+        saved_path = data.save(dest, compress=True)
+        # Resume-state sidecar so the next --continue recovers cursor + recent
+        # post_ids without re-parsing the whole file (KDD 24). Best-effort.
+        try:
+            from .resume_sidecar import write_sidecar
+            write_sidecar(data, saved_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"@{handle}: resume sidecar write failed ({type(e).__name__}: {e})"
             )
-            data.last_cursor = new_cursor
-    saved_path = data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
-    # Persist a resume-state sidecar so the next --continue recovers cursor +
-    # recent post_ids without re-parsing this whole file (KDD 24). Best-effort:
-    # a sidecar-write failure must not fail the save — the reader falls back to
-    # the full ijson parse when the sidecar is absent.
-    try:
-        from .resume_sidecar import write_sidecar
-        write_sidecar(data, saved_path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"@{handle}: resume sidecar write failed ({type(e).__name__}: {e})")
 
 
 def _sanitize_query_for_filename(s: str) -> str:
@@ -1975,6 +1952,7 @@ def scrape_comments_list(
             raise_when_no_account=not wait_for_account,
         ) as scraper:
             finalize_tasks: list[asyncio.Task] = []
+            finalize_sem = asyncio.Semaphore(MERGE_CONCURRENCY)
             async for result in gather(
                 scraper.comments_list(
                     handle=t['handle'],
@@ -1986,9 +1964,7 @@ def scrape_comments_list(
                 for t in targets
             ):
                 finalize_tasks.append(asyncio.create_task(
-                    asyncio.to_thread(
-                        _finalize_continue_result, result, output_dir, continue_,
-                    )
+                    _finalize_guarded(finalize_sem, result, output_dir, continue_)
                 ))
             if finalize_tasks:
                 await asyncio.gather(*finalize_tasks)
