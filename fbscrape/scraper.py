@@ -15,6 +15,7 @@ from .accounts_pool import AccountsPool
 from .logger import logger
 from .models import Query, ScrapingResult
 from .response import FacebookGraphQLParser
+from .resume_sidecar import read_sidecar
 from .worker_pool import WorkerPool
 
 
@@ -60,6 +61,23 @@ def _stream_resume_state(path: str) -> tuple[str, list[str]]:
                 node_pid = None
                 top_pid = None
     return last_cursor, post_ids
+
+
+def _read_resume_state(path: str) -> tuple[str, list[str]]:
+    """Resume-state read with a sidecar fast-path.
+
+    Tries the tiny `<stem>.resume.json` companion first (an O(1) load of the
+    cursor + recent post_ids that `write_sidecar` persisted at save time); only
+    falls back to the full streaming `_stream_resume_state` parse when the
+    sidecar is missing, stale, or malformed. The fallback save then writes a
+    fresh sidecar, so the next `--continue` for that file is fast. See Key
+    Design Decision 24.
+    """
+    hit = read_sidecar(path)
+    if hit is not None:
+        return hit
+    return _stream_resume_state(path)
+
 
 # Cap on how many times a single high-level user_timeline call will resume
 # after a `cursor_reset` leg. Each resume submits a fresh task with end_date
@@ -229,11 +247,11 @@ class FacebookScraper:
                     f"resume_from is only supported with mode='hybrid'; "
                     f"manual mode has no cursor concept (got mode={mode!r})"
                 )
-            # Streamed via ijson on a thread so concurrent --continue
-            # targets don't serialize on the event loop.
+            # Sidecar fast-path, else streamed via ijson on a thread so
+            # concurrent --continue targets don't serialize on the event loop.
             try:
                 initial_cursor, saved_post_ids = await asyncio.to_thread(
-                    _stream_resume_state, resume_from,
+                    _read_resume_state, resume_from,
                 )
                 logger.info(
                     f"UserTimeline resume from {resume_from}: "
@@ -547,11 +565,11 @@ class FacebookScraper:
         # ScrapingResult and thread them through as Query params. Accepts
         # both .json and .json.gz transparently.
         if resume_from:
-            # Streamed via ijson on a thread so concurrent --continue
-            # targets don't serialize on the event loop.
+            # Sidecar fast-path, else streamed via ijson on a thread so
+            # concurrent --continue targets don't serialize on the event loop.
             try:
                 saved_cursor, saved_post_ids = await asyncio.to_thread(
-                    _stream_resume_state, resume_from,
+                    _read_resume_state, resume_from,
                 )
                 cleaned_params["initial_cursor"] = saved_cursor
                 cleaned_params["seen_post_ids_to_skip"] = saved_post_ids
@@ -649,7 +667,7 @@ class FacebookScraper:
 
         if resume_from:
             saved_cursor, saved_post_ids = await asyncio.to_thread(
-                _stream_resume_state, resume_from,
+                _read_resume_state, resume_from,
             )
             cleaned_params["initial_cursor"] = saved_cursor
             cleaned_params["seen_comment_ids_to_skip"] = saved_post_ids

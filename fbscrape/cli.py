@@ -1481,7 +1481,16 @@ def _finalize_continue_result(
                 f"data[{diag['chosen_idx']}] @ {chosen_iso}"
             )
             data.last_cursor = new_cursor
-    data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
+    saved_path = data.save(os.path.join(output_dir, f"{stem}.json.gz"), compress=True)
+    # Persist a resume-state sidecar so the next --continue recovers cursor +
+    # recent post_ids without re-parsing this whole file (KDD 24). Best-effort:
+    # a sidecar-write failure must not fail the save — the reader falls back to
+    # the full ijson parse when the sidecar is absent.
+    try:
+        from .resume_sidecar import write_sidecar
+        write_sidecar(data, saved_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"@{handle}: resume sidecar write failed ({type(e).__name__}: {e})")
 
 
 def _sanitize_query_for_filename(s: str) -> str:
