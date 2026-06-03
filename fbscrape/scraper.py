@@ -231,14 +231,25 @@ class FacebookScraper:
                 )
             # Streamed via ijson on a thread so concurrent --continue
             # targets don't serialize on the event loop.
-            initial_cursor, saved_post_ids = await asyncio.to_thread(
-                _stream_resume_state, resume_from,
-            )
-            logger.info(
-                f"UserTimeline resume from {resume_from}: "
-                f"cursor={'<set>' if initial_cursor else '<null>'}, "
-                f"seen_post_ids={len(saved_post_ids)}"
-            )
+            try:
+                initial_cursor, saved_post_ids = await asyncio.to_thread(
+                    _stream_resume_state, resume_from,
+                )
+                logger.info(
+                    f"UserTimeline resume from {resume_from}: "
+                    f"cursor={'<set>' if initial_cursor else '<null>'}, "
+                    f"seen_post_ids={len(saved_post_ids)}"
+                )
+            except Exception as e:
+                # A corrupt/unreadable resume file (e.g. a .json.gz truncated by
+                # a killed save) must NOT propagate through gather() and tear
+                # down the whole batch — fall back to a fresh scrape for this
+                # handle (no cursor, no seen-id dedup).
+                logger.warning(
+                    f"UserTimeline resume from {resume_from} failed "
+                    f"({type(e).__name__}: {e}); scraping fresh (no resume)"
+                )
+                initial_cursor, saved_post_ids = "", []
 
         # Multi-leg resume loop. Each leg is a single submit→await; if a leg
         # comes back with `result='cursor_reset'` we adjust `end_date` back
@@ -538,16 +549,24 @@ class FacebookScraper:
         if resume_from:
             # Streamed via ijson on a thread so concurrent --continue
             # targets don't serialize on the event loop.
-            saved_cursor, saved_post_ids = await asyncio.to_thread(
-                _stream_resume_state, resume_from,
-            )
-            cleaned_params["initial_cursor"] = saved_cursor
-            cleaned_params["seen_post_ids_to_skip"] = saved_post_ids
-            logger.info(
-                f"GroupTimeline resume from {resume_from}: "
-                f"cursor={'<set>' if saved_cursor else '<null>'}, "
-                f"seen_post_ids={len(saved_post_ids)}"
-            )
+            try:
+                saved_cursor, saved_post_ids = await asyncio.to_thread(
+                    _stream_resume_state, resume_from,
+                )
+                cleaned_params["initial_cursor"] = saved_cursor
+                cleaned_params["seen_post_ids_to_skip"] = saved_post_ids
+                logger.info(
+                    f"GroupTimeline resume from {resume_from}: "
+                    f"cursor={'<set>' if saved_cursor else '<null>'}, "
+                    f"seen_post_ids={len(saved_post_ids)}"
+                )
+            except Exception as e:
+                # Corrupt/unreadable resume file must not propagate through
+                # gather() and kill the batch — scrape this group fresh.
+                logger.warning(
+                    f"GroupTimeline resume from {resume_from} failed "
+                    f"({type(e).__name__}: {e}); scraping fresh (no resume)"
+                )
 
         query = Query(
             endpoint="GroupTimeline",
