@@ -7,6 +7,8 @@ from datetime import datetime, date, timedelta
 from typing import ClassVar
 import json
 import gzip
+import os
+import tempfile
 
 from .logger import logger
 
@@ -513,14 +515,32 @@ class ScrapingResult:
         in a `.json`-named file and downstream tools (`open()` / `json.load`)
         would crash with `UnicodeDecodeError` on the magic bytes.
         """
-        if compress:
-            if not path.endswith('.gz'):
-                path = path + '.gz'
-            with gzip.open(path, 'wt') as f:
-                json.dump(self.to_dict(), f, indent=2)
-        else:
-            with open(path, 'w') as f:
-                json.dump(self.to_dict(), f, indent=2)
+        if compress and not path.endswith('.gz'):
+            path = path + '.gz'
+        # Atomic write: stream to a temp file in the same directory, then
+        # os.replace() it over the destination. os.replace is atomic on POSIX
+        # (same filesystem), so a crash/kill mid-write leaves the prior file
+        # intact and at most a stray .tmp — never a truncated/corrupt target.
+        # (A killed in-place gzip write previously produced corrupt .json.gz
+        # files that broke the next --continue resume-read; see scraper.py.)
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        os.close(fd)
+        try:
+            if compress:
+                with gzip.open(tmp, 'wt') as f:
+                    json.dump(self.to_dict(), f, indent=2)
+            else:
+                with open(tmp, 'w') as f:
+                    json.dump(self.to_dict(), f, indent=2)
+            os.chmod(tmp, 0o644)  # mkstemp is 0600; match the prior open()/gzip default
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return path
 
     def add_record(self, record: dict):
