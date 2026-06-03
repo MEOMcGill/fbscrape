@@ -74,7 +74,7 @@ class Query:
                 "hybrid": {
                     "params": {
                         "pagination_count": 3,
-                        "scroll_burst_every": 50,
+                        "scroll_burst_every": 100,
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,

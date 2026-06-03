@@ -18,4 +18,9 @@ services:
       - SCREEN_RES=1920x1080x24
     stdin_open: true
     tty: true
-    shm_size: 18gb
+    shm_size: 24gb
+    # --- resource limits (container-create-time; require `down` + `up -d`) ---
+    cpus: 12.0            # cap at 12 of 16 cores; leaves 4 for host/OS
+    mem_limit: 48g        # hard RAM cap; leaves ~14Gi for host + buff/cache
+    memswap_limit: 48g    # == mem_limit → no swap (prevents renderer-wedging thrash)
+    mem_reservation: 24g  # soft floor honored under host memory pressure
