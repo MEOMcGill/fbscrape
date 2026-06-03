@@ -460,6 +460,18 @@ class ScrapeOutcome:
     time_started: datetime
     time_taken: timedelta
     last_cursor: str | None = None
+    # Write-on-parse spill (JSONL migration). When a paginated scrape streams
+    # each post to a `.jsonl.gz` as it parses (instead of accumulating in RAM),
+    # `data` is left empty and the records live in the file at `spill_path`;
+    # `post_count` is the number written. `spill_path is None` => records are
+    # inline in `data` (single-shot endpoints, manual mode), and `num_records`
+    # falls back to `len(data)`.
+    post_count: int | None = None
+    spill_path: str | None = None
+
+    @property
+    def num_records(self) -> int:
+        return self.post_count if self.post_count is not None else len(self.data)
 
 
 @dataclass
@@ -477,6 +489,23 @@ class ScrapingResult:
     time_started: datetime
     time_taken: timedelta
     last_cursor: str | None = None
+    # See ScrapeOutcome — `spill_path`/`post_count` carry write-on-parse output
+    # (JSONL migration); `data` is empty when a spill is present.
+    post_count: int | None = None
+    spill_path: str | None = None
+
+    @property
+    def num_records(self) -> int:
+        return self.post_count if self.post_count is not None else len(self.data)
+
+    def iter_posts(self):
+        """Iterate the scraped records regardless of storage. Streams from the
+        spill file when present (write-on-parse), else iterates inline `data`."""
+        if self.spill_path is not None:
+            from .jsonl_store import iter_posts
+            yield from iter_posts(self.spill_path)
+        else:
+            yield from self.data
 
     @classmethod
     def from_outcome(cls, query: Query, outcome: ScrapeOutcome) -> "ScrapingResult":
@@ -490,6 +519,8 @@ class ScrapingResult:
             time_started=outcome.time_started,
             time_taken=outcome.time_taken,
             last_cursor=outcome.last_cursor,
+            post_count=outcome.post_count,
+            spill_path=outcome.spill_path,
         )
 
     def to_dict(self) -> dict:
