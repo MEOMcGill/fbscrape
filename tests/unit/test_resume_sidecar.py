@@ -151,3 +151,65 @@ def test_read_resume_state_falls_back_when_no_sidecar(tmp_path, monkeypatch):
     cursor, ids = scraper_mod._read_resume_state(main)
     assert cursor == "FALLBACK_CURSOR"
     assert ids == ["x", "y"]
+
+
+# --- backfill (streaming retrofit, `fbscrape utils backfill-sidecars`) -------
+
+def _save_real_file(tmp_path, data, last_cursor="HEAD",
+                    endpoint="UserTimeline", query=None, compress=True):
+    """Save a genuine ScrapingResult to disk so the streaming backfill has a
+    real (optionally gzipped) JSON file to parse."""
+    res = _result(data, last_cursor=last_cursor, endpoint=endpoint, query=query)
+    return res.save(str(tmp_path / "saved.json"), compress=compress)
+
+
+def test_backfill_matches_inmemory_and_full_parse(tmp_path):
+    """The streaming backfill must produce the SAME (head, post_ids) as both the
+    in-memory writer and scraper._stream_resume_state on the same file."""
+    data = [
+        {"node": {"post_id": "n1"}, "post_id": "ignored", "cursor": "c1"},
+        {"post_id": "t2", "cursor": "c2"},
+        {"node": {}, "post_id": "t3"},
+    ]
+    main = _save_real_file(tmp_path, data, last_cursor="HEAD")
+
+    outcome, info = resume_sidecar.backfill_file(main)
+    assert outcome == "written"
+    assert info["endpoint"] == "UserTimeline"
+    assert info["post_count"] == 3
+
+    head, post_ids = read_sidecar(main)
+    assert head == "HEAD"
+    assert post_ids == ["n1", "t2", "t3"]
+
+    # Identical to the full ijson parse the sidecar replaces.
+    full_cursor, full_ids = scraper_mod._stream_resume_state(main)
+    assert full_cursor == "HEAD"
+    assert full_ids == ["n1", "t2", "t3"]
+
+
+def test_backfill_idempotent_and_force(tmp_path):
+    main = _save_real_file(tmp_path, [{"post_id": "p1", "cursor": "c1"}])
+    assert resume_sidecar.backfill_file(main)[0] == "written"
+    # Second pass: a current sidecar exists -> skipped.
+    assert resume_sidecar.backfill_file(main)[0] == "skipped-current"
+    # --force rewrites regardless.
+    assert resume_sidecar.backfill_file(main, force=True)[0] == "written"
+
+
+def test_backfill_dry_run_writes_nothing(tmp_path):
+    main = _save_real_file(tmp_path, [{"post_id": "p1"}])
+    outcome, _ = resume_sidecar.backfill_file(main, dry_run=True)
+    assert outcome == "written"
+    assert read_sidecar(main) is None  # nothing actually written
+
+
+def test_backfill_skips_non_resumable_endpoint(tmp_path):
+    main = _save_real_file(
+        tmp_path, [{"id": "x"}], endpoint="PageTransparency",
+        query={"page_id": "123"},
+    )
+    outcome, info = resume_sidecar.backfill_file(main)
+    assert outcome == "skipped-endpoint"
+    assert info["endpoint"] == "PageTransparency"
+    assert read_sidecar(main) is None

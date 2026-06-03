@@ -2691,6 +2691,70 @@ def parse_curl_cmd(curl_string: str, full: bool, raw: bool) -> None:
     click.echo(format_parsed_curl(parsed, full=full, redact=not raw))
 
 
+@utils.command(name='backfill-sidecars')
+@click.argument('paths', nargs=-1, required=True)
+@click.option('--force', is_flag=True, default=False,
+              help='Rewrite even if a valid sidecar already exists.')
+@click.option('--dry-run', is_flag=True, default=False,
+              help='Report what would be written; touch nothing.')
+@click.option('-q', '--quiet', is_flag=True, default=False,
+              help='Only print the final summary.')
+def backfill_sidecars_cmd(paths, force, dry_run, quiet):
+    """Backfill resume-state sidecars for existing scrape outputs.
+
+    Given post file(s) or directories, writes one `<stem>.resume.json` per
+    resumable-endpoint file so the next `--continue` recovers cursor + recent
+    post_ids without re-parsing the whole file (see KDD 24). Uses a single
+    streaming ijson pass per file (safe on multi-hundred-MB outputs). Skips
+    files that already have a current sidecar (unless --force) and non-resumable
+    endpoints (Search / PageTransparency / ProfileAuthenticity).
+
+    Run on a quiescent corpus — a file the live scrape re-saves mid-backfill
+    invalidates its just-written sidecar (size+mtime validator), needing a rerun.
+
+        fbscrape utils backfill-sidecars data/posts/ --dry-run
+        fbscrape utils backfill-sidecars data/posts/
+    """
+    from fbscrape.resume_sidecar import collect_post_files, backfill_file
+
+    inputs = collect_post_files(list(paths))
+    if not inputs:
+        raise click.ClickException("No post files found.")
+
+    click.echo(f"Processing {len(inputs)} file(s){' (dry-run)' if dry_run else ''}...")
+    tally: dict = {}
+    for path in inputs:
+        outcome, info = backfill_file(path, force=force, dry_run=dry_run)
+        tally[outcome] = tally.get(outcome, 0) + 1
+        if quiet:
+            continue
+        base = os.path.basename(path)
+        if outcome == "written":
+            verb = "WOULD" if dry_run else "wrote"
+            click.echo(
+                f"  {verb}  {os.path.basename(info['sidecar'])} "
+                f"(endpoint={info['endpoint']}, posts={info['post_count']}, "
+                f"post_ids={info['post_ids']}, cursors={info['cursors']}, "
+                f"head_cursor={'set' if info['head_cursor'] else 'null'})"
+            )
+        elif outcome == "skipped-current":
+            click.echo(f"  current  {base}")
+        elif outcome == "skipped-endpoint":
+            click.echo(f"  skip-ep  {base} (endpoint={info.get('endpoint')})")
+        elif outcome == "error":
+            click.echo(f"  ERROR  {base}: {info.get('error')}", err=True)
+
+    click.echo(
+        "=== done: "
+        f"written={tally.get('written', 0)}, "
+        f"current={tally.get('skipped-current', 0)}, "
+        f"non-resumable={tally.get('skipped-endpoint', 0)}, "
+        f"errors={tally.get('error', 0)} ==="
+    )
+    if tally.get("error"):
+        raise SystemExit(1)
+
+
 def main():
     cli(obj={})
 

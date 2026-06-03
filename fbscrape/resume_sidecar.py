@@ -33,9 +33,14 @@ the same payload via a streaming ijson pass instead of an in-memory result).
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import tempfile
+from collections import deque
+from pathlib import Path
+
+import ijson
 
 SCHEMA_VERSION = 1
 
@@ -70,7 +75,24 @@ def _post_id(rec: dict) -> str | None:
     return node.get("post_id") or rec.get("post_id")
 
 
-def _build_payload(result) -> dict:
+def _assemble_cursors(head: str, rec_cursors: list[str]) -> list[str]:
+    """Resume head (`cursors[0]`) + the last `MAX_CURSORS - 1` distinct per-post
+    cursors, in collection order. Shared by the in-memory and streaming builders
+    so both produce an identical ladder."""
+    cursors = [head]
+    seen = {head}
+    for c in rec_cursors[-MAX_CURSORS:]:
+        if len(cursors) >= MAX_CURSORS:
+            break
+        if c not in seen:
+            cursors.append(c)
+            seen.add(c)
+    return cursors
+
+
+def _build_payload_from_result(result) -> dict:
+    """Derive the sidecar payload from an in-memory ScrapingResult (the hot
+    save path — `result.data` is already materialized)."""
     data = result.data or []
     post_ids: list[str] = []
     rec_cursors: list[str] = []
@@ -82,53 +104,50 @@ def _build_payload(result) -> dict:
         if c:
             rec_cursors.append(c)
 
-    head = result.last_cursor or ""
-    cursors = [head]
-    seen = {head}
-    for c in rec_cursors[-MAX_CURSORS:]:
-        if len(cursors) >= MAX_CURSORS:
-            break
-        if c not in seen:
-            cursors.append(c)
-            seen.add(c)
-
     return {
         "schema": SCHEMA_VERSION,
         "endpoint": result.query.endpoint,
-        "cursors": cursors,
+        "cursors": _assemble_cursors(result.last_cursor or "", rec_cursors),
         "post_ids": post_ids[-MAX_POST_IDS:],
         "post_count": len(data),
     }
 
 
-def write_sidecar(result, main_path: str) -> str | None:
-    """Write `<stem>.resume.json` next to `main_path` (the just-saved scrape
-    file) for resumable endpoints. No-op (returns None) for non-resumable
-    endpoints. Atomic (tempfile + os.replace). Raises on IO error — callers
-    treat sidecar failure as non-fatal (the full-parse fallback still works)."""
-    if result.query.endpoint not in RESUMABLE_ENDPOINTS:
-        return None
-    payload = _build_payload(result)
-    st = os.stat(main_path)
-    payload["source_size"] = st.st_size
-    payload["source_mtime"] = st.st_mtime
-
-    sc_path = sidecar_path(main_path)
-    directory = os.path.dirname(sc_path) or "."
+def _atomic_write_json(path: str, obj: dict) -> None:
+    directory = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     os.close(fd)
     try:
         with open(tmp, "w") as f:
-            json.dump(payload, f)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, sc_path)
+            json.dump(obj, f)
+        os.chmod(tmp, 0o644)  # mkstemp is 0600; match the save() default
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def _write_payload(payload: dict, main_path: str) -> str:
+    """Stamp the size+mtime validator from `main_path` onto `payload` and write
+    it atomically to the sidecar path. Returns the sidecar path."""
+    st = os.stat(main_path)
+    payload = {**payload, "source_size": st.st_size, "source_mtime": st.st_mtime}
+    sc_path = sidecar_path(main_path)
+    _atomic_write_json(sc_path, payload)
     return sc_path
+
+
+def write_sidecar(result, main_path: str) -> str | None:
+    """Write `<stem>.resume.json` next to `main_path` (the just-saved scrape
+    file) for resumable endpoints. No-op (returns None) for non-resumable
+    endpoints. Atomic. Raises on IO error — callers treat sidecar failure as
+    non-fatal (the full-parse fallback still works)."""
+    if result.query.endpoint not in RESUMABLE_ENDPOINTS:
+        return None
+    return _write_payload(_build_payload_from_result(result), main_path)
 
 
 def read_sidecar(main_path: str) -> tuple[str, list[str]] | None:
@@ -152,3 +171,124 @@ def read_sidecar(main_path: str) -> tuple[str, list[str]] | None:
     cursors = d.get("cursors") or [""]
     head = cursors[0] if cursors else ""
     return head, list(d.get("post_ids") or [])
+
+
+# ---------------------------------------------------------------------------
+# Backfill: retrofit sidecars onto an existing corpus (the `fbscrape utils
+# backfill-sidecars` subcommand). Derives the SAME payload as the in-memory
+# writer, but via a single bounded streaming ijson pass — for files whose
+# ScrapingResult is no longer in memory.
+# ---------------------------------------------------------------------------
+
+# ijson prefixes — accept both the modern `data` key and the legacy `posts`
+# key (pre-rename files), mirroring scraper._stream_resume_state.
+_TOP_PID = ("data.item.post_id", "posts.item.post_id")
+_NODE_PID = ("data.item.node.post_id", "posts.item.node.post_id")
+_REC_CURSOR = ("data.item.cursor", "posts.item.cursor")
+_REC_END = ("data.item", "posts.item")
+
+
+def _opener(path: str):
+    """gzip vs plain, sniffed by magic bytes (matches cli._open_scrape_input)."""
+    with open(path, "rb") as fh:
+        is_gzip = fh.read(2) == b"\x1f\x8b"
+    return gzip.open if is_gzip else open
+
+
+def _build_payload_streaming(main_path: str) -> dict:
+    """Single bounded-memory ijson pass over a saved scrape file. Sliding
+    `deque` windows keep only the tails, so this never materializes the posts
+    array (safe on multi-hundred-MB files). Parser-free — pulls endpoint /
+    last_cursor / per-post cursor / post_id by prefix, same as
+    `_stream_resume_state` pulls post_id."""
+    opener = _opener(main_path)
+    endpoint: str | None = None
+    last_cursor = ""
+    post_ids: deque = deque(maxlen=MAX_POST_IDS)
+    rec_cursors: deque = deque(maxlen=MAX_CURSORS)
+    post_count = 0
+    node_pid = top_pid = rec_cursor = None
+
+    with opener(main_path, "rb") as fh:
+        for prefix, event, value in ijson.parse(fh):
+            if prefix == "query.endpoint" and event == "string":
+                endpoint = value
+            elif prefix == "last_cursor" and event == "string":
+                last_cursor = value or ""
+            elif prefix in _TOP_PID and event == "string":
+                top_pid = value
+            elif prefix in _NODE_PID and event == "string":
+                node_pid = value
+            elif prefix in _REC_CURSOR and event == "string":
+                rec_cursor = value or None
+            elif prefix in _REC_END and event == "end_map":
+                post_count += 1
+                pid = node_pid or top_pid
+                if pid:
+                    post_ids.append(pid)
+                if rec_cursor:
+                    rec_cursors.append(rec_cursor)
+                node_pid = top_pid = rec_cursor = None
+
+    return {
+        "schema": SCHEMA_VERSION,
+        "endpoint": endpoint,
+        "cursors": _assemble_cursors(last_cursor, list(rec_cursors)),
+        "post_ids": list(post_ids),
+        "post_count": post_count,
+    }
+
+
+def backfill_file(main_path: str, *, force: bool = False, dry_run: bool = False):
+    """Write a sidecar for one saved scrape file by streaming it.
+
+    Returns `(outcome, info)` where outcome is one of:
+      - 'written'           sidecar written (or would be, under dry_run)
+      - 'skipped-current'   a valid sidecar already exists (use force to rewrite)
+      - 'skipped-endpoint'  non-resumable endpoint (no sidecar applicable)
+      - 'error'             the streaming parse raised (info['error'] has detail)
+    """
+    if not force and read_sidecar(main_path) is not None:
+        return "skipped-current", {}
+    try:
+        payload = _build_payload_streaming(main_path)
+    except Exception as e:  # noqa: BLE001 - reported per-file, batch continues
+        return "error", {"error": f"{type(e).__name__}: {e}"}
+
+    if payload["endpoint"] not in RESUMABLE_ENDPOINTS:
+        return "skipped-endpoint", {"endpoint": payload["endpoint"]}
+
+    info = {
+        "endpoint": payload["endpoint"],
+        "post_count": payload["post_count"],
+        "post_ids": len(payload["post_ids"]),
+        "cursors": len(payload["cursors"]),
+        "head_cursor": bool(payload["cursors"][0]),
+        "sidecar": sidecar_path(main_path),
+    }
+    if not dry_run:
+        _write_payload(payload, main_path)
+    return "written", info
+
+
+def collect_post_files(paths: list[str]) -> list[str]:
+    """Expand files/dirs into a deduped list of post files. Skips sidecars and
+    .tmp; when both `X.json` and `X.json.gz` exist, prefers the `.gz`."""
+    by_stem: dict[str, str] = {}
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            candidates = sorted(p.glob("*.json")) + sorted(p.glob("*.json.gz"))
+        elif p.exists():
+            candidates = [p]
+        else:
+            continue
+        for c in candidates:
+            name = c.name
+            if name.endswith(".resume.json") or name.endswith(".tmp"):
+                continue
+            stem = sidecar_path(str(c))  # same stem for X.json and X.json.gz
+            if stem in by_stem and by_stem[stem].endswith(".json.gz"):
+                continue
+            by_stem[stem] = str(c)
+    return list(by_stem.values())
