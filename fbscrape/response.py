@@ -1163,6 +1163,13 @@ class ResponseInterceptor:
 
     def __init__(self):
         self.posts = []
+        # Write-on-parse sink (JSONL migration). When set (by paginated hybrid
+        # scrapes), `add_posts` routes each deduped post here — to a
+        # JsonlPostWriter — instead of appending to `self.posts`, so the leg is
+        # never accumulated in RAM. None => append to `self.posts` (manual mode,
+        # single-shot endpoints). `post_count` tracks total added either way.
+        self.post_sink = None
+        self.post_count = 0
         # post_ids of every post in `self.posts`. Maintained by `add_posts`
         # so the auto-extract path and the hybrid replay path share dedup.
         # Without this, FB cursor-degraded responses (which can re-serve the
@@ -1447,7 +1454,11 @@ class ResponseInterceptor:
                 if pid in self.seen_post_ids:
                     continue
                 self.seen_post_ids.add(pid)
-            self.posts.append(post)
+            if self.post_sink is not None:
+                self.post_sink(post)        # write-on-parse: stream to disk
+            else:
+                self.posts.append(post)     # accumulate in RAM (manual/single-shot)
+            self.post_count += 1
             added += 1
         return added
 
@@ -1685,6 +1696,8 @@ class ResponseInterceptor:
     def flush(self):
         """Clear collected data and reset counters"""
         self.posts = []
+        self.post_sink = None
+        self.post_count = 0
         self.seen_post_ids = set()
         self.graphql_request_count = 0
         self.last_response_time = None
