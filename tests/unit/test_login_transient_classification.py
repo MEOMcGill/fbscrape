@@ -29,7 +29,9 @@ from __future__ import annotations
 import pytest
 
 from fbscrape import login as login_mod
-from fbscrape.login import login, PlaywrightTimeoutError, TargetClosedError
+from fbscrape.login import (
+    login, PlaywrightTimeoutError, TargetClosedError, PlaywrightError,
+)
 from fbscrape.exceptions import (
     TransientLoginError,
     FailedLoginError,
@@ -118,3 +120,36 @@ async def test_terminal_failed_login_not_reclassified(monkeypatch):
 async def test_successful_login_returns_none(monkeypatch):
     monkeypatch.setattr(login_mod, "login_with_cookies", _async_return(True))
     assert await login(_FakeSession()) is None
+
+
+async def test_ns_binding_aborted_reclassified_as_transient(monkeypatch):
+    # The dead-worker case: a base playwright Error from page.reload with a
+    # nav-abort marker must become TransientLoginError (worker rotates+retries),
+    # not escape untyped as task_failed.
+    monkeypatch.setattr(
+        login_mod, "login_with_cookies",
+        _async_raise(PlaywrightError("Page.reload: NS_BINDING_ABORTED")),
+    )
+    with pytest.raises(TransientLoginError):
+        await login(_FakeSession())
+
+
+async def test_net_err_marker_reclassified_as_transient(monkeypatch):
+    monkeypatch.setattr(
+        login_mod, "login_with_cookies",
+        _async_raise(PlaywrightError("Page.goto: net::ERR_ABORTED at https://...")),
+    )
+    with pytest.raises(TransientLoginError):
+        await login(_FakeSession())
+
+
+async def test_unrelated_playwright_error_not_reclassified(monkeypatch):
+    # A base playwright Error WITHOUT a known nav-abort marker must propagate
+    # untouched — we don't broadly swallow every playwright Error.
+    monkeypatch.setattr(
+        login_mod, "login_with_cookies",
+        _async_raise(PlaywrightError("Page.evaluate: some unrelated failure")),
+    )
+    with pytest.raises(PlaywrightError) as exc_info:
+        await login(_FakeSession())
+    assert not isinstance(exc_info.value, TransientLoginError)

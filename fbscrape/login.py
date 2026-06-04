@@ -41,12 +41,33 @@ from typing import TYPE_CHECKING
 
 from playwright.async_api import (
     Locator,
+    Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
 )
 try:  # not re-exported from the public API on older playwright versions
     from playwright.async_api import TargetClosedError
 except ImportError:
     from playwright._impl._errors import TargetClosedError
+
+# Renderer/network nav-abort markers that warrant a transient rotate+retry
+# rather than a batch-killing untyped escape. These surface as a *base*
+# playwright Error (not Timeout/TargetClosed) from bare page.goto/page.reload
+# in the login helpers — e.g. `Page.reload: NS_BINDING_ABORTED` from a wedged
+# or proxy-flaky session (observed: one worker dead-churning task_failed every
+# ~90s, never rotating, because the error was untyped). Gecko (Camoufox) uses
+# the NS_* codes; net::ERR_ is the Chromium-fallback prefix.
+_TRANSIENT_NAV_MARKERS = (
+    "NS_BINDING_ABORTED",
+    "NS_ERROR_ABORT",
+    "NS_ERROR_NET_RESET",
+    "NS_ERROR_NET_INTERRUPT",
+    "NS_ERROR_NET_TIMEOUT",
+    "NS_ERROR_CONNECTION_REFUSED",
+    "NS_ERROR_PROXY_CONNECTION_REFUSED",
+    "NS_ERROR_UNKNOWN_HOST",
+    "NS_ERROR_UNKNOWN_PROXY_HOST",
+    "net::ERR_",
+)
 
 from .exceptions import (
     FailedLoginError, CheckpointError, AccountDisabledError,
@@ -83,11 +104,15 @@ async def login(session: "BrowserSession") -> None:
     flake there raises a raw playwright `TimeoutError` / `TargetClosedError`,
     which is NOT one of the worker's typed-retry exceptions — so it would
     escape untyped through `gather()` and tear down the ENTIRE batch (one
-    bad navigation killing every other handle). We reclassify those two
-    specific errors as `TransientLoginError` so the worker rotates to a fresh
-    account + browser and retries (account stays `active=True`). The catch is
-    deliberately narrow: checkpoint / ban / disabled signals raise their own
-    typed exceptions and pass straight through, never swallowed here.
+    bad navigation killing every other handle). We reclassify those into
+    `TransientLoginError` so the worker rotates to a fresh account + browser
+    and retries (account stays `active=True`). Some nav flakes instead surface
+    as a *base* playwright `Error` (e.g. `Page.reload: NS_BINDING_ABORTED` from
+    a wedged/proxy-flaky session) — those are reclassified too, but ONLY when
+    the message matches a known nav/network-abort marker (`_TRANSIENT_NAV_MARKERS`);
+    any other base `Error` re-raises untouched. The catch is deliberately
+    narrow: checkpoint / ban / disabled signals raise their own typed
+    exceptions and pass straight through, never swallowed here.
     """
     try:
         if await login_with_cookies(session):
@@ -105,6 +130,19 @@ async def login(session: "BrowserSession") -> None:
             f"Login navigation flaked (transient) for "
             f"{session.account.display_name}: {e}"
         ) from e
+    except PlaywrightError as e:
+        # Base playwright Error from a nav flake (e.g. Page.reload:
+        # NS_BINDING_ABORTED). Reclassify ONLY known nav/network-abort markers
+        # to TransientLoginError so the worker rotates to a fresh account +
+        # browser and retries (account stays active); any other playwright
+        # Error re-raises untouched — no broad swallowing.
+        msg = str(e)
+        if any(marker in msg for marker in _TRANSIENT_NAV_MARKERS):
+            raise TransientLoginError(
+                f"Login navigation aborted (transient) for "
+                f"{session.account.display_name}: {e}"
+            ) from e
+        raise
 
 
 async def login_automatic(session: "BrowserSession") -> bool:
