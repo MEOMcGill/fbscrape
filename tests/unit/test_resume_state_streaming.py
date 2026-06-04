@@ -144,10 +144,13 @@ def test_matches_scraping_result_save_roundtrip(tmp_path):
         time_taken=timedelta(seconds=12),
         last_cursor="real_cursor_blob",
     )
-    plain = result.save(str(tmp_path / "rt.json"))
-    gz = result.save(str(tmp_path / "rt.json"), compress=True)
+    # `save()` now emits JSONL; the resume read goes through the dual-format
+    # dispatcher (`_read_resume_state` → `read_resume_tail` for JSONL).
+    from fbscrape.scraper import _read_resume_state
+    plain = result.save(str(tmp_path / "rt.jsonl"), compress=False)
+    gz = result.save(str(tmp_path / "rt2.jsonl"), compress=True)
 
     for path in (plain, gz):
-        cursor, ids = _stream_resume_state(path)
+        cursor, ids = _read_resume_state(path)
         assert cursor == "real_cursor_blob"
         assert ids == ["p1", "p2", "p3"]

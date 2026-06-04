@@ -15,7 +15,6 @@ from .accounts_pool import AccountsPool
 from .logger import logger
 from .models import Query, ScrapingResult
 from .response import FacebookGraphQLParser
-from .resume_sidecar import read_sidecar
 from .worker_pool import WorkerPool
 
 
@@ -64,18 +63,16 @@ def _stream_resume_state(path: str) -> tuple[str, list[str]]:
 
 
 def _read_resume_state(path: str) -> tuple[str, list[str]]:
-    """Resume-state read with a sidecar fast-path.
+    """Dual-format resume read.
 
-    Tries the tiny `<stem>.resume.json` companion first (an O(1) load of the
-    cursor + recent post_ids that `write_sidecar` persisted at save time); only
-    falls back to the full streaming `_stream_resume_state` parse when the
-    sidecar is missing, stale, or malformed. The fallback save then writes a
-    fresh sidecar, so the next `--continue` for that file is fast. See Key
-    Design Decision 24.
+    For one-post-per-line JSONL (current format), tail-read recovers the last
+    line's `last_cursor` plus the recent `post_id`s for cross-leg dedup —
+    decompression-bound, no separate sidecar. For a legacy whole-file envelope,
+    fall back to the streaming ijson parse (`_stream_resume_state`).
     """
-    hit = read_sidecar(path)
-    if hit is not None:
-        return hit
+    from .jsonl_store import looks_like_jsonl, read_resume_tail
+    if looks_like_jsonl(path):
+        return read_resume_tail(path)
     return _stream_resume_state(path)
 
 

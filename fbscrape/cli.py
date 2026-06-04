@@ -52,7 +52,6 @@ def _find_unstick_cursor(
     """
     # Local import to avoid putting fbscrape.response in cli.py's top-level imports.
     from .response import FacebookGraphQLParser
-    from .merge import _unstick_select
     parser = FacebookGraphQLParser()
 
     items: list[tuple[int, int, str | None]] = []  # (created_at, idx, cursor)
@@ -65,9 +64,20 @@ def _find_unstick_cursor(
         cursor = rec.get('cursor')
         if isinstance(ct, (int, float)):
             items.append((int(ct), i, cursor))
+    items.sort(key=lambda x: x[0])  # oldest first
 
-    # Shared selection — identical logic to the streaming merge's unstick path.
-    return _unstick_select(items, rank)
+    if len(items) < rank:
+        return None
+    # From the rank-th oldest, walk forward to the first cursored post. The
+    # rank-1 skip dodges the bootstrap-edge highlight outlier.
+    for cur_rank, (ct, idx, cursor) in enumerate(items[rank - 1:], start=rank):
+        if cursor:
+            return (cursor, {
+                "chosen_rank": cur_rank,
+                "chosen_idx": idx,
+                "chosen_created_at": ct,
+            })
+    return None
 
 from .accounts_pool import AccountsPool
 from .utils import gather, get_home_dir_path, utc
@@ -963,8 +973,10 @@ def _build_stem_for_query(query) -> str:
 
 
 def _existing_output_for_stem(output_dir: str, stem: str) -> str | None:
-    """Return path to a prior `.json{,.gz}` for this stem, or None."""
-    for ext in ('.json.gz', '.json'):
+    """Return path to a prior output for this stem, or None. Prefers the current
+    `.jsonl.gz` format, then legacy whole-file envelopes (`.json.gz` / `.json`)
+    so `--continue` / `--skip-existing` match across the migration."""
+    for ext in ('.jsonl.gz', '.json.gz', '.json'):
         p = os.path.join(output_dir, f"{stem}{ext}")
         if os.path.exists(p):
             return p
@@ -1437,37 +1449,78 @@ def _finalize_continue_result(
     output_dir: str,
     continue_: bool,
 ) -> None:
-    """Merge prior data, auto-unstick cursor, save the merged result + sidecar.
+    """Save the leg as JSONL; on `--continue`, APPEND to the rolling archive.
 
-    Synchronous so it can be dispatched via `asyncio.to_thread` —
-    running it inline in the async for-loop blocks every other worker's
-    completion behind a single merge + gzip-write, turning a batch of
-    concurrent target completions into serialized post-processing.
+    Synchronous so it can be dispatched via `asyncio.to_thread` — running it
+    inline in the async for-loop would block other workers' completions behind
+    the gzip write.
 
-    The `--continue` merge streams the prior file disk→disk (KDD 25) so peak
-    memory is bounded by the new leg, not the prior-file size — and the sidecar
-    + auto-unstick are computed in that same pass. `continue_` False is just an
-    atomic save + sidecar (no prior to merge).
+    JSONL makes `--continue` an append (a new gzip member), not a whole-file
+    rewrite — the memory floor is the new leg, never the prior-file size. A
+    legacy whole-file envelope prior is migrated to JSONL once (self-healing),
+    then appended to. On a `no_new_posts_streak` resume leg, a deeper cursor is
+    chosen (auto-unstick) and appended as a trailing status line so the next
+    resume jumps past the dedup wall.
     """
     from .logger import logger
+    from .jsonl_store import convert_envelope_to_jsonl, looks_like_jsonl
     handle = data.query.query.get('handle')
     stem = _build_stem_for_query(data.query)
-    dest = os.path.join(output_dir, f"{stem}.json.gz")
-    if continue_:
-        from .merge import stream_merge_and_save
-        prior_path = _existing_output_for_stem(output_dir, stem)
-        stream_merge_and_save(data, prior_path, dest, handle=handle)
+    dest = os.path.join(output_dir, f"{stem}.jsonl.gz")
+
+    if not continue_:
+        data.save(dest, compress=True)
+        return
+
+    prior = _existing_output_for_stem(output_dir, stem)  # .jsonl.gz | .json.gz | .json | None
+    if prior is None:
+        data.save(dest, compress=True)
+    elif looks_like_jsonl(prior):
+        # Already JSONL — append the new leg's lines (no rewrite). In steady
+        # state `prior == dest`; if it's a differently-named .jsonl, append there.
+        target = dest if prior == dest else prior
+        data.save(target, compress=target.endswith('.gz'), append=True)
+        dest = target
     else:
-        saved_path = data.save(dest, compress=True)
-        # Resume-state sidecar so the next --continue recovers cursor + recent
-        # post_ids without re-parsing the whole file (KDD 24). Best-effort.
-        try:
-            from .resume_sidecar import write_sidecar
-            write_sidecar(data, saved_path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"@{handle}: resume sidecar write failed ({type(e).__name__}: {e})"
-            )
+        # Legacy whole-file envelope → migrate to the JSONL dest once, then append.
+        n, _ = convert_envelope_to_jsonl(prior, dest)
+        logger.info(f"@{handle}: migrated legacy envelope ({n} posts) → {os.path.basename(dest)}")
+        if prior != dest and os.path.exists(prior):
+            try:
+                os.remove(prior)
+            except OSError:
+                pass
+        data.save(dest, compress=True, append=True)
+
+    if data.result == 'no_new_posts_streak':
+        _append_unstick_line(dest, data, handle)
+
+
+def _append_unstick_line(dest: str, data: 'ScrapingResult', handle) -> None:
+    """On a `no_new_posts_streak` --continue leg, pick the rank-3 chronologically
+    oldest cursored post in the (merged) file and append a status-only line
+    carrying that cursor — so the next `--continue`'s tail-read resumes from a
+    deeper anchor, past the dedup wall. Best-effort; no-op if too few cursored
+    posts. (Streams the file via load_records — materializes for this rare path;
+    a streaming selection is a follow-up.)"""
+    from .logger import logger
+    from .jsonl_store import load_records, JsonlPostWriter
+    try:
+        records = load_records(dest)
+        chosen = _find_unstick_cursor(records, endpoint=data.query.endpoint, rank=3)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"@{handle}: auto-unstick scan failed ({type(e).__name__}: {e})")
+        return
+    if not chosen:
+        return
+    new_cursor, diag = chosen
+    writer = JsonlPostWriter(dest, data.query.to_dict(), data.time_started,
+                             append=True, compress=dest.endswith('.gz'))
+    writer.finalize(data.result, data.time_taken, last_cursor=new_cursor)  # status-only line
+    logger.info(
+        f"@{handle}: no_new_posts_streak on --continue — auto-unstuck cursor to "
+        f"rank #{diag['chosen_rank']} (data[{diag['chosen_idx']}])"
+    )
 
 
 def _sanitize_query_for_filename(s: str) -> str:
@@ -1767,7 +1820,7 @@ def scrape_search(
                 filename = (
                     f"{_sanitize_query_for_filename(qt)}"
                     f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}.json"
+                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}.jsonl"
                 )
                 data.save(os.path.join(output_dir, filename))
 
@@ -2074,7 +2127,7 @@ def scrape_page_transparency(
                 ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
                 filename = (
                     f"{label.replace('.', '_')}"
-                    f"_pagetransparency_{ts}.json"
+                    f"_pagetransparency_{ts}.jsonl"
                 )
                 data.save(os.path.join(output_dir, filename))
 
@@ -2182,7 +2235,7 @@ def scrape_profile_authenticity(
                 user_id = data.query.query.get('user_id')
 
                 ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
-                filename = f"{user_id}_profileauthenticity_{ts}.json"
+                filename = f"{user_id}_profileauthenticity_{ts}.jsonl"
                 data.save(os.path.join(output_dir, filename))
 
     run_async(_scrape())
@@ -2227,6 +2280,7 @@ def flatten(input_path, output, fmt, concat, endpoint):
     import json
     import polars as pl
     from .response import FacebookGraphQLParser
+    from .jsonl_store import load_scrape_file
 
     if not os.path.exists(input_path):
         raise click.UsageError(f"Path not found: {input_path}")
@@ -2237,10 +2291,10 @@ def flatten(input_path, output, fmt, concat, endpoint):
         files = sorted(
             os.path.join(input_path, f)
             for f in os.listdir(input_path)
-            if f.endswith('.json') or f.endswith('.json.gz')
+            if f.endswith(('.jsonl.gz', '.jsonl', '.json.gz', '.json'))
         )
         if not files:
-            raise click.UsageError(f"No .json or .json.gz files in {input_path}")
+            raise click.UsageError(f"No .jsonl/.json (.gz) files in {input_path}")
     else:
         files = [input_path]
 
@@ -2297,7 +2351,7 @@ def flatten(input_path, output, fmt, concat, endpoint):
             os.makedirs(parent, exist_ok=True)
 
     def _strip_json_ext(path: str) -> str:
-        for ext in ('.json.gz', '.json'):
+        for ext in ('.jsonl.gz', '.jsonl', '.json.gz', '.json'):
             if path.endswith(ext):
                 return path[:-len(ext)]
         return os.path.splitext(path)[0]
@@ -2371,13 +2425,9 @@ def flatten(input_path, output, fmt, concat, endpoint):
         total_in = 0
         per_file_summary = []
         for f in files:
-            with _open_scrape_input(f) as fh:
-                data = json.load(fh)
-            ep = endpoint or (data.get('query') or {}).get('endpoint') or 'UserTimeline'
+            query_meta, records = load_scrape_file(f)
+            ep = endpoint or (query_meta or {}).get('endpoint') or 'UserTimeline'
             endpoints_seen.add(ep)
-            records = data.get('data')
-            if records is None:
-                records = data.get('posts', [])
             rows = [r for p in records if (r := parser.flatten(p, ep))]
             all_rows.extend(rows)
             total_in += len(records)
@@ -2409,16 +2459,11 @@ def flatten(input_path, output, fmt, concat, endpoint):
 
     total_in = total_out = 0
     for f in files:
-        with _open_scrape_input(f) as fh:
-            data = json.load(fh)
-
         # Endpoint priority: CLI flag > saved query.endpoint > UserTimeline default.
-        ep = endpoint or (data.get('query') or {}).get('endpoint') or 'UserTimeline'
-        # Result-records list lives under 'data' on new files, 'posts' on legacy
-        # files (pre-rename). Accept either so old saves keep flattening.
-        records = data.get('data')
-        if records is None:
-            records = data.get('posts', [])
+        # load_scrape_file is dual-format: one-post-per-line JSONL (current) or a
+        # legacy whole-file envelope (data/posts key).
+        query_meta, records = load_scrape_file(f)
+        ep = endpoint or (query_meta or {}).get('endpoint') or 'UserTimeline'
         rows = [r for p in records if (r := parser.flatten(p, ep))]
         total_in += len(records)
         total_out += len(rows)
@@ -2486,24 +2531,35 @@ def unstick_cursor(paths, rank, only_if_stuck, dry_run, log_level):
     skipped: list[tuple[str, str]] = []
     errored: list[tuple[str, str]] = []
 
+    from .jsonl_store import looks_like_jsonl, load_scrape_file, read_meta, JsonlPostWriter
     for path in paths:
         try:
-            with _open_scrape_input(path) as f:
-                d = json.load(f)
+            is_jsonl = looks_like_jsonl(path)
+            if is_jsonl:
+                meta = read_meta(path) or {}
+                query = meta.get('query') or {}
+                result = meta.get('result')
+                old_lc = meta.get('last_cursor')
+                _, data = load_scrape_file(path)
+            else:
+                with _open_scrape_input(path) as f:
+                    d = json.load(f)
+                query = d.get('query') or {}
+                result = d.get('result')
+                old_lc = d.get('last_cursor')
+                data = d.get('data') or d.get('posts') or []
         except Exception as e:
             errored.append((path, f"failed to load: {e}"))
             click.echo(f"[ERROR] {path}: {e}")
             continue
 
-        result = d.get('result')
-        endpoint = (d.get('query') or {}).get('endpoint') or 'GroupTimeline'
+        endpoint = query.get('endpoint') or 'GroupTimeline'
 
         if only_if_stuck and result != 'no_new_posts_streak':
             skipped.append((path, f"result={result!r}"))
             click.echo(f"[skip ] {path}  (result={result!r}; --only-if-stuck specified)")
             continue
 
-        data = d.get('data') or d.get('posts') or []
         chosen = _find_unstick_cursor(data, endpoint=endpoint, rank=rank)
         if chosen is None:
             msg = f"no cursored post at or beyond rank #{rank} (data has {len(data)} entries)"
@@ -2512,7 +2568,6 @@ def unstick_cursor(paths, rank, only_if_stuck, dry_run, log_level):
             continue
 
         new_cursor, diag = chosen
-        old_lc = d.get('last_cursor')
         old_fp = hashlib.sha1(old_lc.encode()).hexdigest()[:8] if old_lc else '<null>'
         new_fp = hashlib.sha1(new_cursor.encode()).hexdigest()[:8]
         chosen_iso = datetime.fromtimestamp(
@@ -2529,14 +2584,20 @@ def unstick_cursor(paths, rank, only_if_stuck, dry_run, log_level):
             )
             continue
 
-        d['last_cursor'] = new_cursor
-        # Write back with the same compression as input.
-        if path.endswith('.gz'):
-            with gzip.open(path, 'wt') as f:
-                json.dump(d, f, indent=2)
+        if is_jsonl:
+            # Append a status-only line carrying the new cursor — the next
+            # tail-read resumes from it. No whole-file rewrite.
+            writer = JsonlPostWriter(path, query, meta.get('time_started'),
+                                     append=True, compress=path.endswith('.gz'))
+            writer.finalize(result, None, last_cursor=new_cursor)
         else:
-            with open(path, 'w') as f:
-                json.dump(d, f, indent=2)
+            d['last_cursor'] = new_cursor
+            if path.endswith('.gz'):
+                with gzip.open(path, 'wt') as f:
+                    json.dump(d, f, indent=2)
+            else:
+                with open(path, 'w') as f:
+                    json.dump(d, f, indent=2)
 
         fixed.append(path)
         click.echo(
@@ -2593,15 +2654,15 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
         files = sorted(
             os.path.join(input_path, f)
             for f in os.listdir(input_path)
-            if f.endswith('.json') or f.endswith('.json.gz')
+            if f.endswith(('.jsonl.gz', '.jsonl', '.json.gz', '.json'))
         )
         if not files:
-            raise click.UsageError(f"No .json or .json.gz files in {input_path}")
+            raise click.UsageError(f"No .jsonl/.json (.gz) files in {input_path}")
     else:
         files = [input_path]
 
     def _strip_json_ext(name: str) -> str:
-        for ext in ('.json.gz', '.json'):
+        for ext in ('.jsonl.gz', '.jsonl', '.json.gz', '.json'):
             if name.endswith(ext):
                 return name[:-len(ext)]
         return os.path.splitext(name)[0]
@@ -2609,13 +2670,10 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
     async def _run():
         totals = {"total": 0, "saved": 0, "skipped": 0, "failed": 0}
         for f in files:
-            with _open_scrape_input(f) as fh:
-                data = _json.load(fh)
-            # New files put records under 'data'; legacy files used 'posts'.
-            posts = data.get('data')
-            if posts is None:
-                posts = data.get('posts', [])
-            handle = (data.get('query') or {}).get('query', {}).get('handle') or _strip_json_ext(os.path.basename(f))
+            # Dual-format: one-post-per-line JSONL (current) or legacy envelope.
+            from .jsonl_store import load_scrape_file
+            query_meta, posts = load_scrape_file(f)
+            handle = (query_meta or {}).get('query', {}).get('handle') or _strip_json_ext(os.path.basename(f))
 
             if out_dir:
                 target_dir = out_dir if len(files) == 1 else os.path.join(out_dir, handle)
@@ -2667,67 +2725,80 @@ def parse_curl_cmd(curl_string: str, full: bool, raw: bool) -> None:
     click.echo(format_parsed_curl(parsed, full=full, redact=not raw))
 
 
-@utils.command(name='backfill-sidecars')
+@utils.command(name='convert-to-jsonl')
 @click.argument('paths', nargs=-1, required=True)
-@click.option('--force', is_flag=True, default=False,
-              help='Rewrite even if a valid sidecar already exists.')
+@click.option('--delete-original', is_flag=True, default=False,
+              help='Remove the legacy envelope file after a successful convert.')
 @click.option('--dry-run', is_flag=True, default=False,
-              help='Report what would be written; touch nothing.')
+              help='Report what would be converted; write nothing.')
 @click.option('-q', '--quiet', is_flag=True, default=False,
               help='Only print the final summary.')
-def backfill_sidecars_cmd(paths, force, dry_run, quiet):
-    """Backfill resume-state sidecars for existing scrape outputs.
+def convert_to_jsonl_cmd(paths, delete_original, dry_run, quiet):
+    """Convert legacy whole-file envelope outputs to one-post-per-line JSONL.
 
-    Given post file(s) or directories, writes one `<stem>.resume.json` per
-    resumable-endpoint file so the next `--continue` recovers cursor + recent
-    post_ids without re-parsing the whole file (see KDD 24). Uses a single
-    streaming ijson pass per file (safe on multi-hundred-MB outputs). Skips
-    files that already have a current sidecar (unless --force) and non-resumable
-    endpoints (Search / PageTransparency / ProfileAuthenticity).
+    Given file(s) or directories, writes `<stem>.jsonl.gz` next to each legacy
+    `<stem>.json{,.gz}` by streaming its `data` array (one ijson pass per file —
+    safe on multi-hundred-MB outputs). Files already in JSONL are skipped.
+    `--continue` also migrates a legacy prior on first resume, so this is an
+    optional up-front bulk pass.
 
-    Run on a quiescent corpus — a file the live scrape re-saves mid-backfill
-    invalidates its just-written sidecar (size+mtime validator), needing a rerun.
-
-        fbscrape utils backfill-sidecars data/posts/ --dry-run
-        fbscrape utils backfill-sidecars data/posts/
+        fbscrape utils convert-to-jsonl data/posts/ --dry-run
+        fbscrape utils convert-to-jsonl data/posts/ --delete-original
     """
-    from fbscrape.resume_sidecar import collect_post_files, backfill_file
+    from fbscrape.jsonl_store import looks_like_jsonl, convert_envelope_to_jsonl
 
-    inputs = collect_post_files(list(paths))
+    def _collect(ps):
+        out = []
+        for raw in ps:
+            if os.path.isdir(raw):
+                out += sorted(
+                    os.path.join(raw, f) for f in os.listdir(raw)
+                    if f.endswith(('.json.gz', '.json'))
+                )
+            elif os.path.exists(raw):
+                out.append(raw)
+            else:
+                click.echo(f"  (missing: {raw})", err=True)
+        return out
+
+    inputs = _collect(list(paths))
     if not inputs:
-        raise click.ClickException("No post files found.")
+        raise click.ClickException("No .json/.json.gz files found.")
 
     click.echo(f"Processing {len(inputs)} file(s){' (dry-run)' if dry_run else ''}...")
-    tally: dict = {}
+    tally = {"converted": 0, "skipped-jsonl": 0, "error": 0}
     for path in inputs:
-        outcome, info = backfill_file(path, force=force, dry_run=dry_run)
-        tally[outcome] = tally.get(outcome, 0) + 1
-        if quiet:
-            continue
         base = os.path.basename(path)
-        if outcome == "written":
-            verb = "WOULD" if dry_run else "wrote"
-            click.echo(
-                f"  {verb}  {os.path.basename(info['sidecar'])} "
-                f"(endpoint={info['endpoint']}, posts={info['post_count']}, "
-                f"post_ids={info['post_ids']}, cursors={info['cursors']}, "
-                f"head_cursor={'set' if info['head_cursor'] else 'null'})"
-            )
-        elif outcome == "skipped-current":
-            click.echo(f"  current  {base}")
-        elif outcome == "skipped-endpoint":
-            click.echo(f"  skip-ep  {base} (endpoint={info.get('endpoint')})")
-        elif outcome == "error":
-            click.echo(f"  ERROR  {base}: {info.get('error')}", err=True)
+        try:
+            if looks_like_jsonl(path):
+                tally["skipped-jsonl"] += 1
+                if not quiet:
+                    click.echo(f"  already-jsonl  {base}")
+                continue
+            stem = path[:-len('.json.gz')] if path.endswith('.json.gz') else path[:-len('.json')]
+            dest = stem + '.jsonl.gz'
+            if dry_run:
+                tally["converted"] += 1
+                click.echo(f"  WOULD  {os.path.basename(dest)}")
+                continue
+            n, endpoint = convert_envelope_to_jsonl(path, dest)
+            tally["converted"] += 1
+            if delete_original and os.path.abspath(path) != os.path.abspath(dest):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if not quiet:
+                click.echo(f"  wrote  {os.path.basename(dest)} (endpoint={endpoint}, posts={n})")
+        except Exception as e:  # noqa: BLE001
+            tally["error"] += 1
+            click.echo(f"  ERROR  {base}: {type(e).__name__}: {e}", err=True)
 
     click.echo(
-        "=== done: "
-        f"written={tally.get('written', 0)}, "
-        f"current={tally.get('skipped-current', 0)}, "
-        f"non-resumable={tally.get('skipped-endpoint', 0)}, "
-        f"errors={tally.get('error', 0)} ==="
+        f"=== done: converted={tally['converted']}, "
+        f"already-jsonl={tally['skipped-jsonl']}, errors={tally['error']} ==="
     )
-    if tally.get("error"):
+    if tally["error"]:
         raise SystemExit(1)
 
 

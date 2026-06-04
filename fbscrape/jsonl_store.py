@@ -80,12 +80,13 @@ class JsonlPostWriter:
     existing file) for `--continue`. Readers decompress all members transparently.
     """
 
-    def __init__(self, path: str, query: dict, time_started, append: bool = False):
+    def __init__(self, path: str, query: dict, time_started,
+                 append: bool = False, compress: bool = True):
         self.path = path
         self.query = query
         self.time_started = str(time_started) if time_started is not None else None
         mode = "at" if append else "wt"
-        self._fh = _open_text(path, mode)
+        self._fh = gzip.open(path, mode) if compress else open(path, mode)
         self._buffered = None  # (post, cursor) awaiting flush
         self._finalized = False
         self.count = 0  # posts handed to write_post()
@@ -148,9 +149,14 @@ class JsonlPostWriter:
 
 def looks_like_jsonl(path: str) -> bool:
     """True if `path` is one-post-per-line JSONL (vs. a legacy whole-file
-    envelope). Heuristic: the first non-empty line of JSONL is a complete JSON
-    object; a legacy envelope's first line is `{` (indented) or an incomplete
-    `{"query": … "data": [` (compact) — neither parses alone."""
+    envelope).
+
+    A JSONL line is a complete JSON object whose `data` is a *single* record
+    (dict, or null on a status-only line). A whole-file envelope — pretty-printed
+    (first line `{`, doesn't parse alone) or compact (whole object on one line) —
+    carries a *list* under `data` (or the legacy `posts` key). So: first line
+    must parse as a dict AND neither `data` nor `posts` is a list.
+    """
     try:
         with _open_text(path, "rt") as f:
             for line in f:
@@ -161,7 +167,11 @@ def looks_like_jsonl(path: str) -> bool:
                     obj = json.loads(line)
                 except ValueError:
                     return False
-                return isinstance(obj, dict)
+                return (
+                    isinstance(obj, dict)
+                    and not isinstance(obj.get("data"), list)
+                    and not isinstance(obj.get("posts"), list)
+                )
     except OSError:
         return False
     return False
@@ -189,6 +199,42 @@ def iter_posts(path: str):
         post = obj.get("data")
         if post is not None:
             yield post
+
+
+def load_records(path: str) -> list[dict]:
+    """Dual-format loader: return the post records from a scrape file whether
+    it's one-post-per-line JSONL (current) or a legacy whole-file envelope
+    (`{… "data": [...] …}` / legacy `"posts"`). Materializes the list — for
+    offline post-processing (flatten / download-media), matching prior behavior.
+    """
+    if looks_like_jsonl(path):
+        return list(iter_posts(path))
+    import json as _json
+    with _open_text(path, "rt") as f:
+        doc = _json.load(f)
+    return doc.get("data") or doc.get("posts") or []
+
+
+def load_scrape_file(path: str) -> tuple[dict | None, list[dict]]:
+    """Dual-format loader returning `(query, records)` in a single pass. Handles
+    one-post-per-line JSONL (current) and the legacy whole-file envelope. The
+    `query` comes from the first JSONL line / the envelope's top-level `query`;
+    `records` are the posts (status-only `data: null` lines skipped).
+    Materializes `records` — for offline post-processing (flatten / download)."""
+    if looks_like_jsonl(path):
+        query = None
+        records: list[dict] = []
+        for obj in iter_post_lines(path):
+            if query is None:
+                query = obj.get("query")
+            post = obj.get("data")
+            if post is not None:
+                records.append(post)
+        return query, records
+    import json as _json
+    with _open_text(path, "rt") as f:
+        doc = _json.load(f)
+    return doc.get("query"), (doc.get("data") or doc.get("posts") or [])
 
 
 def read_meta(path: str) -> dict | None:

@@ -538,33 +538,44 @@ class ScrapingResult:
         """Convert to JSON string"""
         return json.dumps(self.to_dict())
 
-    def save(self, path: str, compress: bool = False) -> str:
-        """Save to JSON file. Returns the final path written.
+    def save(self, path: str, compress: bool = True, append: bool = False) -> str:
+        """Save as one-post-per-line JSONL. Returns the final path written.
 
-        When `compress=True` and `path` does not already end with `.gz`, the
-        extension is appended automatically — otherwise gzip bytes would land
-        in a `.json`-named file and downstream tools (`open()` / `json.load`)
-        would crash with `UnicodeDecodeError` on the magic bytes.
+        Each line is a self-contained envelope `{query, result, time_started,
+        time_taken, last_cursor, data: <single record>}` (see `jsonl_store`).
+        The records come from `iter_posts()` — the in-memory `data` list, or the
+        write-on-parse spill when `spill_path` is set. The leg's terminal
+        `result`/`time_taken` are stamped on the final line; mid-leg lines carry
+        null. `query` (constant for the leg) rides every line.
+
+        `append=True` appends a new gzip member to an existing file (`--continue`
+        — no whole-file rewrite). A fresh write goes to a temp + `os.replace`
+        (atomic; a crash leaves the prior file intact). `compress` toggles gzip.
         """
+        from .jsonl_store import JsonlPostWriter
         if compress and not path.endswith('.gz'):
             path = path + '.gz'
-        # Atomic write: stream to a temp file in the same directory, then
-        # os.replace() it over the destination. os.replace is atomic on POSIX
-        # (same filesystem), so a crash/kill mid-write leaves the prior file
-        # intact and at most a stray .tmp — never a truncated/corrupt target.
-        # (A killed in-place gzip write previously produced corrupt .json.gz
-        # files that broke the next --continue resume-read; see scraper.py.)
+        query_dict = self.query.to_dict()
+
+        def _drain(writer: 'JsonlPostWriter') -> None:
+            for post in self.iter_posts():
+                writer.write_post(post, self.last_cursor)
+            writer.finalize(self.result, self.time_taken, last_cursor=self.last_cursor)
+
+        if append and os.path.exists(path):
+            writer = JsonlPostWriter(path, query_dict, self.time_started,
+                                     append=True, compress=compress)
+            _drain(writer)
+            return path
+
+        # Fresh write: temp + os.replace (atomic on the same filesystem).
         directory = os.path.dirname(path) or "."
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         os.close(fd)
         try:
-            if compress:
-                with gzip.open(tmp, 'wt') as f:
-                    json.dump(self.to_dict(), f, indent=2)
-            else:
-                with open(tmp, 'w') as f:
-                    json.dump(self.to_dict(), f, indent=2)
-            os.chmod(tmp, 0o644)  # mkstemp is 0600; match the prior open()/gzip default
+            writer = JsonlPostWriter(tmp, query_dict, self.time_started, compress=compress)
+            _drain(writer)
+            os.chmod(tmp, 0o644)  # mkstemp is 0600; match the prior default
             os.replace(tmp, path)
         except BaseException:
             try:

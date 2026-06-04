@@ -113,7 +113,7 @@ def test_iter_posts_skips_status_only_lines(tmp_path):
 
 def test_iter_posts_tolerates_malformed_trailing_line(tmp_path):
     p = str(tmp_path / "o.jsonl")  # plain so we can append raw text
-    w = JsonlPostWriter(p, _query(), None)
+    w = JsonlPostWriter(p, _query(), None, compress=False)
     w.write_post({"post_id": "a"}, "C")
     w.finalize("success", timedelta(seconds=1))
     with open(p, "a") as f:
@@ -177,21 +177,29 @@ def test_looks_like_jsonl_true(tmp_path):
 
 
 def test_looks_like_jsonl_false_on_legacy_envelope(tmp_path):
-    p = str(tmp_path / "legacy.json.gz")
-    _save_legacy(tmp_path, "legacy.json", [{"post_id": "a"}])
-    assert looks_like_jsonl(str(tmp_path / "legacy.json.gz")) is False
+    p = _save_legacy(tmp_path, "legacy.json", [{"post_id": "a"}])
+    assert looks_like_jsonl(p) is False
 
 
 # --- converter --------------------------------------------------------------
 
 def _save_legacy(tmp_path, name, data, last_cursor="LEGACYCUR", result="success"):
-    res = ScrapingResult(
-        query=Query("UserTimeline", "hybrid", {"handle": "h"}, {}),
-        result=result, data=data,
-        time_started=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        time_taken=timedelta(seconds=3), last_cursor=last_cursor,
-    )
-    return res.save(str(tmp_path / name), compress=True)  # writes <name>.gz envelope
+    """Write a genuine legacy whole-file envelope (NOT via save(), which now
+    emits JSONL). Compact one-line gzip — `data` is a list, so looks_like_jsonl
+    classifies it as legacy."""
+    envelope = {
+        "query": {"endpoint": "UserTimeline", "mode": "hybrid",
+                  "query": {"handle": "h"}, "params": {}},
+        "result": result,
+        "data": data,
+        "time_started": "2026-01-01 00:00:00+00:00",
+        "time_taken": "0:00:03",
+        "last_cursor": last_cursor,
+    }
+    p = str(tmp_path / (name + ".gz"))
+    with gzip.open(p, "wt") as f:
+        json.dump(envelope, f)
+    return p
 
 
 def test_convert_envelope_roundtrip(tmp_path):
