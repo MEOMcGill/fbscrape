@@ -1501,13 +1501,13 @@ def _append_unstick_line(dest: str, data: 'ScrapingResult', handle) -> None:
     oldest cursored post in the (merged) file and append a status-only line
     carrying that cursor — so the next `--continue`'s tail-read resumes from a
     deeper anchor, past the dedup wall. Best-effort; no-op if too few cursored
-    posts. (Streams the file via load_records — materializes for this rare path;
-    a streaming selection is a follow-up.)"""
+    posts. Streams the file via `iter_posts` (a generator) so `_find_unstick_cursor`
+    holds only the (created_at, idx, cursor) tuples, never the full posts —
+    bounded memory even on a large merged archive."""
     from .logger import logger
-    from .jsonl_store import load_records, JsonlPostWriter
+    from .jsonl_store import iter_posts, JsonlPostWriter
     try:
-        records = load_records(dest)
-        chosen = _find_unstick_cursor(records, endpoint=data.query.endpoint, rank=3)
+        chosen = _find_unstick_cursor(iter_posts(dest), endpoint=data.query.endpoint, rank=3)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"@{handle}: auto-unstick scan failed ({type(e).__name__}: {e})")
         return
