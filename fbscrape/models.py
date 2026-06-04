@@ -78,7 +78,7 @@ class Query:
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         # -1 disables the cap entirely; otherwise a positive
                         # int caps how many replays a single session fires.
                         "max_paginations": -1,
@@ -119,7 +119,7 @@ class Query:
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         "max_paginations": -1,
                         # -1 disables the cap; positive int caps total
                         # accumulated posts. Batch-boundary enforced.
@@ -150,7 +150,7 @@ class Query:
                 "hybrid": {
                     "params": {
                         "post_nav_sleep_seconds": 3.0,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         "request_timeout_ms": 30000,
                         "operation_timeout_seconds": 120,
                     },
@@ -172,7 +172,7 @@ class Query:
                     "params": {
                         "scale": 3,
                         "post_nav_sleep_seconds": 3.0,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         "request_timeout_ms": 30000,
                         "operation_timeout_seconds": 120,
                     },
@@ -207,7 +207,7 @@ class Query:
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         "max_paginations": -1,
                         # -1 disables the cap; positive int caps total
                         # accumulated comments. Batch-boundary enforced — the
@@ -276,7 +276,7 @@ class Query:
                         "scroll_burst_size_range": (2, 5),
                         "pagination_sleep_mean": 2.5,
                         "pagination_sleep_std": 0.5,
-                        "template_capture_timeout": 20.0,
+                        "template_capture_timeout": 45.0,
                         "max_paginations": -1,
                         # -1 disables the cap; positive int caps total
                         # accumulated posts. Batch-boundary enforced.

@@ -463,7 +463,7 @@ class BrowserSession:
         scroll_burst_size_range: tuple[int, int] = (2, 5),
         pagination_sleep_mean: float = 2.5,
         pagination_sleep_std: float = 0.5,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         max_paginations: int = 10000,
         max_posts: int = -1,
         initial_cursor: str = "",
@@ -613,7 +613,7 @@ class BrowserSession:
         scroll_burst_size_range: tuple[int, int] = (2, 5),
         pagination_sleep_mean: float = 2.5,
         pagination_sleep_std: float = 0.5,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         max_paginations: int = -1,
         max_posts: int = -1,
         post_nav_sleep_seconds: float = 3.0,
@@ -728,7 +728,7 @@ class BrowserSession:
         scroll_burst_size_range: tuple[int, int] = (2, 5),
         pagination_sleep_mean: float = 2.5,
         pagination_sleep_std: float = 0.5,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         max_paginations: int = -1,
         max_posts: int = -1,
         initial_cursor: str = "",
@@ -940,7 +940,7 @@ class BrowserSession:
         scroll_burst_size_range: tuple[int, int] = (2, 5),
         pagination_sleep_mean: float = 2.5,
         pagination_sleep_std: float = 0.5,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         max_paginations: int = -1,
         max_results: int = -1,
         initial_cursor: str = "",
@@ -1320,7 +1320,7 @@ class BrowserSession:
         page_id: str,
         handle: str | None = None,
         post_nav_sleep_seconds: float = 3.0,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         request_timeout_ms: int = 30000,
         operation_timeout_seconds: float = 120,
     ) -> ScrapeOutcome:
@@ -1430,7 +1430,7 @@ class BrowserSession:
         user_id: str,
         scale: int = 3,
         post_nav_sleep_seconds: float = 3.0,
-        template_capture_timeout: float = 20.0,
+        template_capture_timeout: float = 45.0,
         request_timeout_ms: int = 30000,
         operation_timeout_seconds: float = 120,
     ) -> ScrapeOutcome:
@@ -1597,6 +1597,8 @@ class BrowserSession:
             template_capture_timeout,
             friendly_name=friendly_name,
             interceptor_attr=interceptor_attr,
+            rescroll=True,
+            operation_timeout_seconds=operation_timeout_seconds,
         )
         if not template:
             try:
@@ -2298,14 +2300,28 @@ class BrowserSession:
         timeout_seconds: float,
         friendly_name: str = HYBRID_TARGET_FRIENDLY_NAME,
         interceptor_attr: str = "latest_pctfrq_request",
+        rescroll: bool = False,
+        rescroll_every_seconds: float = 3.0,
+        rescroll_coefficient: float = 2.0,
+        operation_timeout_seconds: float = 900.0,
     ) -> dict | None:
         """Poll until a natural <friendly_name> GraphQL request has been observed, or timeout.
 
         Returns `{"post_data": str|None, "headers": dict}` or None. Falls back
         to `network_capture` if FB_NETWORK_CAPTURE_ALL=1 has populated it.
+
+        When `rescroll=True` (scroll-driven endpoints) the loop keeps scrolling
+        every `rescroll_every_seconds` while it waits. A single bootstrap scroll
+        often fails to provoke the feed-refetch query under load — the page may
+        not have rendered when it fired, or one viewport isn't past FB's
+        server-rendered posts. `scrollBy` is relative, so repeated scrolls walk
+        progressively deeper until the query fires (or we time out). Single-shot
+        endpoints don't scroll, so they leave `rescroll=False`. Scroll hiccups
+        are swallowed — they must not abort the capture.
         """
         elapsed = 0.0
         interval = 0.5
+        since_scroll = 0.0
         while elapsed < timeout_seconds:
             tpl = getattr(self.response_interceptor, interceptor_attr, None)
             if tpl is not None:
@@ -2318,8 +2334,18 @@ class BrowserSession:
                 form = self._hybrid_parse_form_data(req.get("post_data"))
                 if form.get("fb_api_req_friendly_name") == friendly_name:
                     return {"post_data": req.get("post_data"), "headers": headers}
+            if rescroll and since_scroll >= rescroll_every_seconds:
+                since_scroll = 0.0
+                try:
+                    await asyncio.wait_for(
+                        self.scroll(window_height_coefficient=rescroll_coefficient),
+                        timeout=operation_timeout_seconds,
+                    )
+                except Exception as e:  # noqa: BLE001 - a scroll hiccup must not abort capture
+                    logger.debug(f"[hybrid] rescroll during template wait failed: {e}")
             await asyncio.sleep(interval)
             elapsed += interval
+            since_scroll += interval
         return None
 
     @staticmethod
