@@ -191,6 +191,7 @@ async def login_automatic(session: "BrowserSession") -> bool:
     # Wipe any lingering cookies so FB serves the regular login form (bad
     # cookies can otherwise hide the form by making FB think we're partially
     # logged in). No-op when there are no cookies.
+    logger.debug(f"Clearing any lingering cookies before automatic login for {session.account.display_name}")
     await session._context.clear_cookies()
 
     # Check if login form is visible
@@ -337,6 +338,9 @@ async def login_with_cookies(session: "BrowserSession") -> bool:
     # URL classification or viewer probe makes sense.
     await session.page.goto("https://www.facebook.com", wait_until="domcontentloaded")
 
+    # might need to click the "Continue" button here
+    await _handle_continue_interstitial(session)
+
     # URL classification first — raises typed exception on checkpoint URLs.
     # Returns True for "home"-shaped URLs (necessary-but-not-sufficient for
     # being logged in); False if URL didn't settle into any known pattern.
@@ -423,7 +427,7 @@ async def check_logged_in(session: "BrowserSession", timeout: float = 10.0) -> b
 
         # Wait for a viewer-bearing GraphQL response (authenticated user context)
         elapsed = 0.0
-        interval = 0.5
+        interval = 4
         while elapsed < timeout:
             if temp_interceptor.has_viewer_response():
                 logger.info(
@@ -501,26 +505,30 @@ async def _pass_continue_button(session: "BrowserSession") -> None:
         logger.debug(f"Failed to click post-login 'Continue' button: {e}")
         return
 
-    # insert the password for the login
-    try:
-        await _human_type(
-            session.page.get_by_role("textbox", name="Password"),
-            session.account.password
-        )
-        logger.debug("Filled post-login 'Password' field")
-        await asyncio.sleep(2)
-    except Exception as e:
-        logger.debug(f"Failed to fill post-login 'Password' field: {e}")
-        return
+    # sometimes you need to add the password
+    if session.page.get_by_role("textbox", name="Password") is None:
+        logger.debug("Password field not found")
+    else:
+        try:
+            await asyncio.sleep(2)
+            await _human_type(
+                session.page.get_by_role("textbox", name="Password"),
+                session.account.password
+            )
+            logger.debug("Filled post-login 'Password' field")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.debug(f"Failed to fill post-login 'Password' field: {e}")
+            return
 
-    # press login button
-    try:
-        await session.page.get_by_role("button", name="Log in", exact=True).click(timeout=10000)
-        logger.debug("Clicked post-login 'Log in' button")
-        await asyncio.sleep(2)
-    except Exception as e:
-        logger.debug(f"Failed to click post-login 'Log in' button: {e}")
-        return
+        # press login button
+        try:
+            await session.page.get_by_role("button", name="Log in", exact=True).click(timeout=10000)
+            logger.debug("Clicked post-login 'Log in' button")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Failed to click post-login 'Log in' button: {e}")
+            return
 
     # now check if you've hit some issues logging in
     await _wait_for_log_in_outcome(session)

@@ -606,7 +606,7 @@ def export_cookies(ctx, identifier, output_file):
 # ============== Login ==============
 
 @cli.command()
-@click.argument('identifier')
+@click.argument('identifier', nargs=-1)
 @click.option(
     '--mode',
     type=click.Choice(['manual', 'automatic']),
@@ -629,15 +629,33 @@ def export_cookies(ctx, identifier, output_file):
     default=False,
     help='Run browser headless (auto-resolves to "virtual" on Linux). Default: --no-headless.',
 )
+@click.option(
+    "--log-level",
+    type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']),
+    default='INFO',
+    help="Set the logging level. Default: INFO. "
+         "DEBUG is useful for debugging, but may log sensitive information. "
+         "Use INFO for normal operation. "
+         "WARNING is for expected errors. "
+         "ERROR is for unexpected errors. "
+         "CRITICAL is for critical failures that may prevent the program from running. "
+         "Use --log-level DEBUG to see all logs.",
+)
 @click.pass_context
-def login(ctx, identifier, mode, cookies, headless):
-    """Log in to a Facebook account and persist cookies to the DB.
+def login(ctx, identifier, mode, cookies, headless, log_level):
+    """Log in to one or more Facebook accounts and persist cookies to the DB.
+
+    IDENTIFIER accepts one or more account identifiers (email or phone). With
+    multiple accounts they are processed sequentially — one browser at a time —
+    and a per-account summary is printed at the end. A failure on one account
+    does not abort the others; the command exits non-zero if any failed.
 
     \b
     --mode manual: opens facebook.com in a non-headless browser (use noVNC at
         localhost:6080 in the container) and pauses at a (Pdb) prompt.
         Log in by hand, type 'c' + Enter to save cookies; 'q' + Enter
-        (or Ctrl-D) to abort without saving.
+        (or Ctrl-D) to abort without saving. With multiple accounts you are
+        prompted once per account, in order.
 
     \b
     --mode automatic: runs the form-fill login the worker uses on scrape
@@ -654,13 +672,19 @@ def login(ctx, identifier, mode, cookies, headless):
     from .browser_session import BrowserSession
     from .login import login_automatic, login_manual, login_with_cookies
     from .exceptions import FailedLoginError
+    from .logger import set_log_level
 
-    async def _login():
-        pool = AccountsPool(ctx.obj['db'])
+    if not identifier:
+        raise click.ClickException("Provide at least one account identifier.")
+
+    async def _login_one(pool, ident) -> bool:
+        """Drive login for a single account. Returns True on success, False on
+        any per-account failure (already reported to the user)."""
         try:
-            account = await pool.get(identifier)
+            account = await pool.get(ident)
         except ValueError:
-            raise click.ClickException(f"Account not found: {identifier}")
+            click.echo(f"Account not found: {ident}")
+            return False
 
         # auto_login=False so initialize() opens the browser without trying
         # cookies/form login on its own — we drive login explicitly below.
@@ -670,12 +694,12 @@ def login(ctx, identifier, mode, cookies, headless):
             if mode == 'manual':
                 if cookies:
                     if not session.account.cookies:
-                        click.echo(f"--cookies: no stored cookies for {identifier}; ignoring flag.")
+                        click.echo(f"--cookies: no stored cookies for {ident}; ignoring flag.")
                     else:
                         try:
                             await session._context.add_cookies(session.account.cookies)
                             click.echo(
-                                f"Injected {len(session.account.cookies)} cookies for {identifier}."
+                                f"Injected {len(session.account.cookies)} cookies for {ident}."
                             )
                         except Exception as e:
                             click.echo(f"--cookies: injection failed ({e}); continuing without.")
@@ -684,11 +708,11 @@ def login(ctx, identifier, mode, cookies, headless):
                     await login_manual(session)
                 except FailedLoginError as e:
                     click.echo(f"Aborted; no cookies saved. ({e})")
-                    return
+                    return False
                 # Manual flow doesn't run _on_login_success, so save explicitly.
                 await session.save_cookies()
-                click.echo(f"Saved cookies for {identifier}.")
-                return
+                click.echo(f"Saved cookies for {ident}.")
+                return True
 
             # mode == 'automatic'
             # If --cookies, try the cookie path first. login_with_cookies
@@ -698,10 +722,10 @@ def login(ctx, identifier, mode, cookies, headless):
             try:
                 if cookies:
                     if not session.account.cookies:
-                        click.echo(f"--cookies: no stored cookies for {identifier}; ignoring flag.")
+                        click.echo(f"--cookies: no stored cookies for {ident}; ignoring flag.")
                     elif await login_with_cookies(session):
-                        click.echo(f"Login OK via cookies for {identifier} (refreshed in DB).")
-                        return
+                        click.echo(f"Login OK via cookies for {ident} (refreshed in DB).")
+                        return True
                     else:
                         click.echo("Cookies didn't validate — falling back to form-fill.")
 
@@ -709,14 +733,35 @@ def login(ctx, identifier, mode, cookies, headless):
                 # raises typed exceptions on checkpoint / disabled / transient.
                 # On success it runs _on_login_success which already saves cookies.
                 if not await login_automatic(session):
-                    raise click.ClickException(
-                        f"Automatic login failed for {identifier}: no login form visible"
-                    )
-                click.echo(f"Login OK for {identifier} (cookies persisted).")
+                    click.echo(f"Automatic login failed for {ident}: no login form visible")
+                    return False
+                click.echo(f"Login OK for {ident} (cookies persisted).")
+                return True
             except FailedLoginError as e:
                 # Covers CheckpointError, AccountDisabledError, AutomationCheckpointError,
                 # TransientLoginError, and generic FailedLoginError — all subclasses.
-                raise click.ClickException(f"Login failed for {identifier}: {e}")
+                click.echo(f"Login failed for {ident}: {e}")
+                return False
+
+    async def _login():
+        set_log_level(log_level)
+
+        pool = AccountsPool(ctx.obj['db'])
+        results: dict[str, bool] = {}
+        for ident in identifier:
+            if len(identifier) > 1:
+                click.echo(f"\n=== {ident} ({len(results) + 1}/{len(identifier)}) ===")
+            results[ident] = await _login_one(pool, ident)
+
+        if len(identifier) > 1:
+            ok = [i for i, r in results.items() if r]
+            failed = [i for i, r in results.items() if not r]
+            click.echo(f"\nDone: {len(ok)} succeeded, {len(failed)} failed.")
+            if failed:
+                click.echo("Failed: " + ", ".join(failed))
+
+        if not all(results.values()):
+            raise click.ClickException("One or more logins failed.")
 
     run_async(_login())
 
