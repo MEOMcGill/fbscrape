@@ -14,7 +14,6 @@ scrape. The new extractor selects the cursor from the chunk with the
 shortest `path` — the page-level connection's `page_info` — making it
 robust to any sub-stream cursors at deeper paths.
 """
-from __future__ import annotations
 
 import json
 

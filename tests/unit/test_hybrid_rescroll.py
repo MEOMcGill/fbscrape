@@ -6,7 +6,6 @@ wait used to just dead-poll. With `rescroll=True` the wait keeps scrolling
 (scrollBy is relative → progressively deeper) until the query fires or it times
 out. Single-shot endpoints leave `rescroll=False` and must not scroll.
 """
-from __future__ import annotations
 
 import pytest
 

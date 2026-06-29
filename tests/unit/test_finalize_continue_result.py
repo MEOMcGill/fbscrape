@@ -13,7 +13,6 @@ Invariants:
 - `--continue` + no_new_posts_streak: trailing status line carries a deeper cursor.
 """
 
-from __future__ import annotations
 
 import gzip
 import json

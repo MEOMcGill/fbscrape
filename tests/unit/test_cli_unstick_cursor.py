@@ -10,7 +10,6 @@ through it. Verifies:
   - the CLI subcommand round-trips (load → unstick → save → load again)
 """
 
-from __future__ import annotations
 
 import gzip
 import json

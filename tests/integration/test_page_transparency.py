@@ -1,6 +1,5 @@
 """PageTransparency single-shot — headless against the Meta page."""
 
-from __future__ import annotations
 
 import pytest
 

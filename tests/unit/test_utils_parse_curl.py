@@ -7,7 +7,6 @@ Exercises:
   - CLI smoke test through `CliRunner` for the `utils parse-curl` command.
 """
 
-from __future__ import annotations
 
 import textwrap
 

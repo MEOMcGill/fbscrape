@@ -5,7 +5,6 @@ point, argument parsing, async loop, all of it) and asserts the output
 parquet is readable + carries the expected columns.
 """
 
-from __future__ import annotations
 
 import json
 import os

@@ -30,7 +30,6 @@ Internal helpers (popup dismissal, human-like typing, login-form detection,
 post-form URL classification) live as module-level coroutines and take the
 session explicitly. They were previously methods on BrowserSession.
 """
-from __future__ import annotations
 
 import asyncio
 import bdb

@@ -18,7 +18,6 @@ Asserted invariants:
   drain path surfaces it as a raised `NoAccountError`, NOT a `task_failed`).
 """
 
-from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone

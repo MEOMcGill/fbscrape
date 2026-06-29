@@ -1,6 +1,5 @@
 """Flatten ProfileAuthenticity record against captured fixture (zuck)."""
 
-from __future__ import annotations
 
 import copy
 

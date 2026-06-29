@@ -24,7 +24,6 @@ Asserted invariants:
 - A successful login returns None (no spurious raise).
 """
 
-from __future__ import annotations
 
 import pytest
 

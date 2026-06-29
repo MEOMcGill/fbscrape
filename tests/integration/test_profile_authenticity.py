@@ -1,6 +1,5 @@
 """ProfileAuthenticity single-shot — headless against zuck's profile."""
 
-from __future__ import annotations
 
 import pytest
 

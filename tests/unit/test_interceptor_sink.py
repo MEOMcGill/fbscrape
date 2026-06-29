@@ -5,7 +5,6 @@ post either to `self.posts` (default — manual mode / single-shot) or to a
 configured `post_sink` (write-on-parse — paginated hybrid streams to disk).
 `post_count` tracks total added regardless of route; `flush` resets both.
 """
-from __future__ import annotations
 
 from fbscrape.response import ResponseInterceptor
 

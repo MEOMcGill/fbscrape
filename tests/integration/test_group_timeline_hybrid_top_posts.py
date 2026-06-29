@@ -11,7 +11,6 @@ Verifies the new default works end-to-end against a real group without
 depending on FB returning posts in any particular order.
 """
 
-from __future__ import annotations
 
 import datetime
 

@@ -6,7 +6,6 @@ Date-bounded stop conditions (`OldestInBatchBelowStartDate`,
 the scrape should terminate via `MaxPostsReached` (driven by `max_posts`).
 """
 
-from __future__ import annotations
 
 import pytest
 

@@ -6,7 +6,6 @@ write, append for `--continue`. Loadable via `jsonl_store` (and the dual-format
 loaders the CLI flatten/download use). Legacy whole-file envelopes still load.
 """
 
-from __future__ import annotations
 
 import gzip
 import json

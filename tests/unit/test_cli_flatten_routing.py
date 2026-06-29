@@ -5,7 +5,6 @@ the parser or polars. A captured UserTimeline fixture is the input, so the
 flatten path itself must produce a non-empty parquet/csv/jsonl.
 """
 
-from __future__ import annotations
 
 import gzip
 import json

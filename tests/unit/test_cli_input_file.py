@@ -6,7 +6,6 @@ CLI uses across `scrape user-timeline`, `scrape search`,
 should produce identical normalized rows.
 """
 
-from __future__ import annotations
 
 import json
 from pathlib import Path

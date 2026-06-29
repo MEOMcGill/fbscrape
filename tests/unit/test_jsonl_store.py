@@ -11,7 +11,6 @@ Pins the format contract the migration depends on:
 - `looks_like_jsonl` distinguishes JSONL from a legacy envelope;
 - `convert_envelope_to_jsonl` round-trips a legacy file to JSONL.
 """
-from __future__ import annotations
 
 import gzip
 import json

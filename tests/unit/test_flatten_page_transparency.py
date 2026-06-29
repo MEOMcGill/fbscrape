@@ -1,6 +1,5 @@
 """Flatten PageTransparency record against captured fixture (Meta page)."""
 
-from __future__ import annotations
 
 import pytest
 

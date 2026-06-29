@@ -8,7 +8,6 @@
   when no active account exists.
 """
 
-from __future__ import annotations
 
 import json
 import os

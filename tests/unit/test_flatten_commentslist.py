@@ -8,7 +8,6 @@ each record. The unit tests exercise the orchestrator + each
 `_extract_comment_*` helper indirectly through the flattened row schema.
 """
 
-from __future__ import annotations
 
 import pytest
 

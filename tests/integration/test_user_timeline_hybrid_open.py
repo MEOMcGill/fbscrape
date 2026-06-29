@@ -10,7 +10,6 @@ This test mirrors what the CLI produces when neither `--start-date` nor
 `--end-date` is passed: start=None, end=today.
 """
 
-from __future__ import annotations
 
 import datetime
 

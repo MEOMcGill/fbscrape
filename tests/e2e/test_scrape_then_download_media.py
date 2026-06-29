@@ -5,7 +5,6 @@ the media download must run within the same process as the scrape — that's
 exactly the contract this test exercises.
 """
 
-from __future__ import annotations
 
 import os
 import subprocess

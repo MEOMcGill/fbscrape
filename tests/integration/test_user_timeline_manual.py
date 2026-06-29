@@ -5,7 +5,6 @@ scrolls one page-height at a time and only terminates on start_date reached
 or stall watchdog.
 """
 
-from __future__ import annotations
 
 import pytest
 

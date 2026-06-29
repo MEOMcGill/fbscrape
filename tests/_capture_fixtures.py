@@ -23,7 +23,6 @@ NOT auto-captured by this script:
   via `tests/unit/test_flatten_user_timeline.py::test_variant_b_records_are_actually_variant_b`.
 """
 
-from __future__ import annotations
 
 import argparse
 import asyncio

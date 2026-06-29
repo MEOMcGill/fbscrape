@@ -7,7 +7,6 @@ Mirrors `test_group_timeline_hybrid.py`. Differences specific to CommentsList:
     "CommentsList".
 """
 
-from __future__ import annotations
 
 import pytest
 

@@ -9,7 +9,6 @@ Mirrors `test_user_timeline_hybrid.py`. Differences specific to GroupTimeline:
     flattener, but routing through the registry keeps the wiring honest).
 """
 
-from __future__ import annotations
 
 import datetime
 

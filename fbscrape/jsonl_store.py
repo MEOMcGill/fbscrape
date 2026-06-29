@@ -26,7 +26,6 @@ Per-line metadata semantics:
 `JsonlPostWriter` keeps a 1-post buffer so it can stamp the terminal
 `result`/`time_taken` onto the final post's line without holding the whole leg.
 """
-from __future__ import annotations
 
 import decimal
 import gzip

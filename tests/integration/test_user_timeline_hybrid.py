@@ -1,6 +1,5 @@
 """UserTimeline hybrid (default) — headless scrape of zuck."""
 
-from __future__ import annotations
 
 import pytest
 
