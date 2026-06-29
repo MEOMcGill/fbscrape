@@ -132,6 +132,7 @@ class FacebookGraphQLParser:
     # routes via this. Adding an endpoint = one new orchestrator + one row here.
     ENDPOINT_FLATTENERS: dict[str, str] = {
         "UserTimeline": "_flatten_pctfrq_post",
+        "Search": "_flatten_pctfrq_post",
         "GroupTimeline": "_flatten_grouptimeline_post",
         "PageTransparency": "_flatten_pagetransparency_record",
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
@@ -286,6 +287,61 @@ class FacebookGraphQLParser:
                 'has_next_page': has_next_page,
                 'parent_feedback_id_b64': parent_feedback_id,
             }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[PARSER ERROR] Failed to decode JSON: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[PARSER ERROR] {e}")
+            logger.error(traceback.print_exc())
+            return None
+
+    def parse_search_response(self, body: bytes, url: str) -> dict | None:
+        """Parse a SearchCometResultsPaginatedResultsQuery response body into
+        `{posts: [...]}`.
+
+        Each entry has shape `{node: Story, post_id: str}`. Stories live at
+        `data.serpResponse.results.edges[].rendering_strategy.view_model
+        .click_model.story` in the main (non-deferred) chunk only — deferred
+        lines carry partial media/feedback patches for the same edges and are
+        skipped. Non-story edges (SearchSimpleModuleViewModel, etc.) are
+        silently dropped (no story or post_id present).
+
+        Returns None on any decode/parse failure.
+        """
+        try:
+            response_data = parse_json_or_jsonl(body.decode('utf-8'))
+            posts = []
+            for data_line in response_data:
+                if not isinstance(data_line, dict) or 'data' not in data_line:
+                    continue
+                if data_line.get('path') is not None:
+                    continue  # skip deferred patches — full Story objects not present
+                serp = data_line['data'].get('serpResponse')
+                if not isinstance(serp, dict):
+                    continue
+                results = serp.get('results')
+                if not isinstance(results, dict):
+                    continue
+                for edge in (results.get('edges') or []):
+                    if not isinstance(edge, dict):
+                        continue
+                    rm = edge.get('rendering_strategy')
+                    if not isinstance(rm, dict):
+                        continue
+                    vm = rm.get('view_model')
+                    if not isinstance(vm, dict):
+                        continue
+                    cm = vm.get('click_model')
+                    if not isinstance(cm, dict):
+                        continue
+                    story = cm.get('story')
+                    if (isinstance(story, dict)
+                            and story.get('__typename') == 'Story'
+                            and isinstance(story.get('post_id'), str)
+                            and story['post_id']):
+                        posts.append({'node': story, 'post_id': story['post_id']})
+            return {'posts': posts}
 
         except json.JSONDecodeError as e:
             logger.error(f"[PARSER ERROR] Failed to decode JSON: {e}")

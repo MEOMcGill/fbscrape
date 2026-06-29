@@ -57,6 +57,75 @@ PROFILE_AUTHENTICITY_FRIENDLY_NAME = "ProfileCometDirectoryAuthenticityModalQuer
 # silently by FB — the param is passed through as-is, no validation.
 GROUP_TIMELINE_SORTING_SETTINGS = ("CHRONOLOGICAL", "RECENT_ACTIVITY", "TOP_POSTS")
 
+# Registry of known Search URL filters. Maps user-facing name → FB outer-key
+# prefix, inner "name" field, and an arg encoder. Unknown keys passed to
+# _build_search_url are treated as raw passthrough entries.
+_SEARCH_FILTER_REGISTRY: dict[str, dict] = {
+    # Sort
+    "recent_posts": {
+        "fb_key": "recent_posts",
+        "name":   "recent_posts",
+        "encode": lambda **_: "",
+    },
+    # Date range
+    "creation_time": {
+        "fb_key": "rp_creation_time",
+        "name":   "creation_time",
+        "encode": lambda start=None, end=None: _encode_creation_time_args(start, end),
+    },
+    # Author / source — "Posts from" filter. Pass source= (mutually exclusive),
+    # see _POSTS_FROM_SOURCES for the accepted values.
+    "posts_from": {
+        "fb_key": "rp_author",
+        "name": lambda source="public": _posts_from_name(source),
+        "encode": lambda **_: "",
+    },
+}
+
+
+# "Posts from" filter: user-facing source → FB inner `name`.
+_POSTS_FROM_SOURCES = {
+    "public":           "merged_public_posts",
+    "me":               "author_me",
+    "friends":          "author_friends_feed",
+    "groups_and_pages": "my_groups_and_pages_posts",
+}
+
+
+def _posts_from_name(source: str = "public") -> str:
+    try:
+        return _POSTS_FROM_SOURCES[source]
+    except KeyError:
+        raise ValueError(
+            f"posts_from source {source!r} is not valid; "
+            f"choose one of {sorted(_POSTS_FROM_SOURCES)}"
+        )
+
+
+def _encode_creation_time_args(start: str | None = None, end: str | None = None) -> str:
+    """Encode start/end YYYY-MM-DD strings into the FB creation_time args blob.
+
+    Date components are not zero-padded (FB UI format: "2025-1-1").
+    One-sided bounds are supported — pass only start or only end.
+    """
+    args: dict[str, str] = {}
+    if start:
+        dt = datetime.strptime(start, "%Y-%m-%d")
+        args.update({
+            "start_year":  str(dt.year),
+            "start_month": f"{dt.year}-{dt.month}",
+            "start_day":   f"{dt.year}-{dt.month}-{dt.day}",
+        })
+    if end:
+        dt = datetime.strptime(end, "%Y-%m-%d")
+        args.update({
+            "end_year":  str(dt.year),
+            "end_month": f"{dt.year}-{dt.month}",
+            "end_day":   f"{dt.year}-{dt.month}-{dt.day}",
+        })
+    return json.dumps(args, separators=(",", ":"))
+
+
 # Bump when FB ships a schema update to the persisted query.
 PAGE_TRANSPARENCY_DOC_ID = "35170702705850131"
 PROFILE_AUTHENTICITY_DOC_ID = "26932128459750707"
@@ -606,10 +675,9 @@ class BrowserSession:
     async def search_hybrid(
         self,
         query_text: str,
-        start_date: str,
-        end_date: str,
+        filters: dict | None = None,
         pagination_count: int = 5,
-        scroll_burst_every: int = 10,
+        scroll_burst_every: int = 50,
         scroll_burst_size_range: tuple[int, int] = (2, 5),
         pagination_sleep_mean: float = 2.5,
         pagination_sleep_std: float = 0.5,
@@ -621,15 +689,23 @@ class BrowserSession:
         max_no_progress_streak: int = 5,
         operation_timeout_seconds: float = 900,
     ) -> ScrapeOutcome:
-        """Scrape Facebook search results for `query_text` between two dates.
+        """Scrape Facebook search results for `query_text`.
 
-        Date bounds are server-enforced via the URL filter blob (see
-        `_build_search_url`); GraphQL replay variables only override `cursor`
-        and `count`.
+        Search filters (sort order, date range, etc.) are applied via the
+        URL &filters= blob (see `_build_search_url` and `_SEARCH_FILTER_REGISTRY`).
+        Replay bodies carry no `beforeTime`/`afterTime`. When a "creation_time"
+        filter is present, `start_unix`/`end_unix` are extracted from it so
+        stop conditions have their anchors even though they don't flow into
+        the request body.
+
+        The first cursor is extracted from the captured SCRQ template form
+        (SCRQ uses `{"page_number":0,...}` on its first request, not null).
 
         Args:
             query_text: Free-form search term.
-            start_date / end_date: YYYY-MM-DD (inputs are not re-validated here).
+            filters: Optional dict of search filters. Known keys: "recent_posts",
+                "creation_time" (with "start"/"end" YYYY-MM-DD sub-keys).
+                Unknown keys are passed as raw blob entries. None = no filters.
 
         Returns:
             ScrapeOutcome.
@@ -637,11 +713,28 @@ class BrowserSession:
         self.endpoint = "Search"
         logger.info(
             f"[hybrid] search {query_text!r}: starting hybrid scrape "
-            f"({start_date} → {end_date}, count={pagination_count})"
+            f"(filters={filters!r}, count={pagination_count})"
         )
 
-        target_url = self._build_search_url(query_text, start_date, end_date)
+        target_url = self._build_search_url(query_text, filters)
         scrape_start_time = datetime.now(timezone.utc)
+
+        # Extract date anchors from creation_time filter for stop conditions.
+        # They don't flow into the replay body (inject_before_time=False).
+        creation_time_kwargs = (filters or {}).get("creation_time") or {}
+        start_date = creation_time_kwargs.get("start") if isinstance(creation_time_kwargs, dict) else None
+        end_date = creation_time_kwargs.get("end") if isinstance(creation_time_kwargs, dict) else None
+        start_unix: int | None = None
+        if start_date:
+            start_unix = int(
+                datetime.strptime(start_date, "%Y-%m-%d")
+                .replace(tzinfo=timezone.utc).timestamp()
+            )
+        end_unix: int | None = None
+        if end_date:
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end_of_day = end_datetime + timedelta(days=1) - timedelta(seconds=1)
+            end_unix = int(min(end_of_day, datetime.now(timezone.utc)).timestamp())
 
         loop_params = {
             "pagination_count": pagination_count,
@@ -657,10 +750,9 @@ class BrowserSession:
         }
 
         self.response_interceptor.flush()
-        # All posts come from explicit replays; matches user_timeline_hybrid's source-of-posts.
         self.response_interceptor.extract_posts = False
 
-        # Phase 1 — navigate
+        # Phase 1 — navigate to filtered search URL
         error = await self._hybrid_navigate(
             target_url=target_url,
             post_nav_sleep_seconds=post_nav_sleep_seconds,
@@ -671,20 +763,20 @@ class BrowserSession:
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
             )
 
-        # Phase 2 — bootstrap scroll
+        # Phase 2 — bootstrap scroll (SCRQ does not fire on raw navigation)
         error = await self._hybrid_bootstrap(operation_timeout_seconds)
         if error:
             return ScrapeOutcome(
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
             )
 
-        # Phase 3 — capture pagination template (SCRQ instead of PCTFRQ)
+        # Phase 3 — capture SCRQ template
         error, template = await self._hybrid_capture_template(
             template_capture_timeout=template_capture_timeout,
             operation_timeout_seconds=operation_timeout_seconds,
@@ -696,18 +788,34 @@ class BrowserSession:
                 result=error,
                 data=self.response_interceptor.get_posts(),
                 time_started=scrape_start_time,
-                time_taken=datetime.now(timezone.utc) - scrape_start_time
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
             )
         logger.info(
             f"[hybrid] search {query_text!r}: template captured "
             f"(doc_id={template['doc_id']})"
         )
 
-        # Phase 4 — pagination loop. URL filter is the date authority, so leave start/end_unix unset.
+        # SCRQ's first request uses cursor="{page_number:0,...}", NOT null.
+        # _hybrid_capture_template always sets template["cursor"]=None, so we
+        # extract the real initial cursor from the form variables here.
+        try:
+            initial_vars = json.loads(template["form"].get("variables", "{}"))
+            initial_cursor = initial_vars.get("cursor") or ""
+        except json.JSONDecodeError:
+            initial_cursor = ""
+
+        # Phase 4 — pagination loop.
+        # inject_before_time=False: date bounds live in the URL, not the body.
+        # parse_response: SCRQ responses use serpResponse.results.edges[], not data.node.
         result_str, next_cursor = await self._hybrid_pagination_loop(
             label=query_text,
             template=template,
             params=loop_params,
+            start_unix=start_unix,
+            end_unix=end_unix,
+            inject_before_time=False,
+            initial_cursor=initial_cursor or None,
+            parse_response=self.response_interceptor.parser.parse_search_response,
         )
         return ScrapeOutcome(
             result=result_str,
@@ -1638,6 +1746,7 @@ class BrowserSession:
         initial_cursor: str | None = None,
         stop_conditions: list[StopCondition] | None = None,
         inject_before_time: bool = True,
+        parse_response=None,
     ) -> tuple[str, str | None]:
         """Drive paginations via page.request.post() until a stop condition fires.
 
@@ -1744,10 +1853,9 @@ class BrowserSession:
             await self.record_scroll(endpoint=self.endpoint, count=1)
             total_paginations += 1
 
+            _parse = parse_response or self.response_interceptor.parser.parse_timeline_response
             try:
-                parsed = self.response_interceptor.parser.parse_timeline_response(
-                    text.encode("utf-8"), GRAPHQL_API_URL
-                )
+                parsed = _parse(text.encode("utf-8"), GRAPHQL_API_URL)
             except Exception as e:
                 logger.warning(f"[hybrid] @{label}: parser raised: {e}")
                 parsed = None
@@ -1789,7 +1897,11 @@ class BrowserSession:
 
             # Collapse the three per-post extractor calls into one pass; the
             # per-post list is also needed for ConsecutiveOutOfRange.
-            batch_times = list(self._hybrid_iter_wrapping_creation_times(text))
+            # Use the already-parsed response dict to avoid re-parsing — this
+            # also makes Search work (parse_search_response returns Story-shaped
+            # posts that _hybrid_iter_wrapping_creation_times would miss because
+            # it calls parse_timeline_response internally).
+            batch_times = list(self._hybrid_iter_batch_creation_times_from_parsed(parsed))
             oldest_in_batch = min(batch_times) if batch_times else None
             newest_in_batch = max(batch_times) if batch_times else None
             second_oldest_in_batch = (
@@ -2094,35 +2206,49 @@ class BrowserSession:
             return {}
 
     @staticmethod
-    def _build_search_url(query_text: str, start_date: str, end_date: str) -> str:
-        """Build a Facebook search URL with a "Latest posts" sort + creation_time date filter.
+    def _build_search_url(query_text: str, filters: dict | None = None) -> str:
+        """Build a Facebook search URL with an optional filters blob.
 
-        FB encodes filters as a base64 JSON blob in the `filters=` query param.
-        Date components are not zero-padded (matches FB's UI: "2025", "2025-1", "2025-1-1").
+        Known filter names are looked up in `_SEARCH_FILTER_REGISTRY` and
+        encoded. Unrecognised keys are treated as raw passthrough: the key
+        is used verbatim as the outer dict key (e.g. ``"city:0"``) and the
+        value must be ``{"name": ..., "args": ...}``.
+
+        If `filters` is None or empty, no ``filters=`` param is added and
+        FB returns results under its default ranking.
         """
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        creation_args = {
-            "start_year":  f"{start_dt.year}",
-            "start_month": f"{start_dt.year}-{start_dt.month}",
-            "end_year":    f"{end_dt.year}",
-            "end_month":   f"{end_dt.year}-{end_dt.month}",
-            "start_day":   f"{start_dt.year}-{start_dt.month}-{start_dt.day}",
-            "end_day":     f"{end_dt.year}-{end_dt.month}-{end_dt.day}",
-        }
-        outer = {
-            "recent_posts:0": json.dumps(
-                {"name": "recent_posts", "args": ""},
-                separators=(",", ":"),
-            ),
-            "rp_creation_time:0": json.dumps(
-                {
-                    "name": "creation_time",
-                    "args": json.dumps(creation_args, separators=(",", ":")),
-                },
-                separators=(",", ":"),
-            ),
-        }
+        if not filters:
+            return f"https://www.facebook.com/search/top?q={quote(query_text)}"
+
+        outer: dict[str, str] = {}
+        counts: dict[str, int] = {}
+        for key, kwargs in filters.items():
+            if key in _SEARCH_FILTER_REGISTRY:
+                spec = _SEARCH_FILTER_REGISTRY[key]
+                fb_key = spec["fb_key"]
+                idx = counts.get(fb_key, 0)
+                counts[fb_key] = idx + 1
+                kw = kwargs or {}
+                args = spec["encode"](**kw)
+                name = spec["name"](**kw) if callable(spec["name"]) else spec["name"]
+                outer[f"{fb_key}:{idx}"] = json.dumps(
+                    {"name": name, "args": args},
+                    separators=(",", ":"),
+                )
+            else:
+                # Raw passthrough — key is the full outer dict key (e.g. "city:0"),
+                # value must be {"name": ..., "args": ...}. We require a ':' in the
+                # key as the signal that the caller *intends* a raw blob entry; a
+                # bare key (no ':') is almost certainly a typo'd known-filter name,
+                # which would otherwise be silently ignored by FB. Reject it loudly.
+                if ":" not in key:
+                    raise ValueError(
+                        f"Unknown search filter {key!r}. Known filters: "
+                        f"{sorted(_SEARCH_FILTER_REGISTRY)}. For a raw passthrough "
+                        f"entry, use a FB outer key containing ':' (e.g. 'city:0')."
+                    )
+                outer[key] = json.dumps(kwargs, separators=(",", ":"))
+
         filters_b64 = base64.b64encode(
             json.dumps(outer, separators=(",", ":")).encode("utf-8")
         ).decode("ascii")
@@ -2467,6 +2593,37 @@ class BrowserSession:
             return
         if not parsed:
             return
+        for post in parsed.get("posts") or []:
+            node = (post or {}).get("node") or {}
+            stories: list[dict] = []
+            tlfu = node.get("timeline_list_feed_units") if isinstance(node, dict) else None
+            if isinstance(tlfu, dict):
+                for edge in (tlfu.get("edges") or []):
+                    inner = edge.get("node") if isinstance(edge, dict) else None
+                    if isinstance(inner, dict):
+                        stories.append(inner)
+            elif isinstance(node, dict) and "post_id" in node:
+                stories.append(node)
+            for story in stories:
+                ct = (parser._extract_times(story) or {}).get("created_at")
+                if isinstance(ct, (int, float)):
+                    yield int(ct)
+
+    @staticmethod
+    def _hybrid_iter_batch_creation_times_from_parsed(parsed: dict | None):
+        """Yield wrapping creation_times from an already-parsed response dict.
+
+        Accepts the output of `parse_timeline_response` or
+        `parse_search_response` (both produce `{posts: [{node: Story, ...}]}`).
+        Used by `_hybrid_pagination_loop` after the parse step to avoid
+        re-parsing — and to correctly handle Search responses, which
+        `_hybrid_iter_wrapping_creation_times` would miss because it calls
+        `parse_timeline_response` internally (which doesn't know about the
+        `serpResponse` shape).
+        """
+        if not parsed:
+            return
+        parser = FacebookGraphQLParser()
         for post in parsed.get("posts") or []:
             node = (post or {}).get("node") or {}
             stories: list[dict] = []

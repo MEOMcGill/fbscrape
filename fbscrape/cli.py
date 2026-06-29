@@ -1014,6 +1014,9 @@ def _build_stem_for_query(query) -> str:
             f"{_commentslist_post_id_label(post_id)}_"
             f"{endpoint}_{mode}"
         )
+    if endpoint == "Search":
+        query_text = query.query["query_text"]
+        return _build_stem(_sanitize_query_for_filename(query_text), endpoint, mode)
     return _build_stem(query.query["handle"], endpoint, mode)
 
 
@@ -1695,22 +1698,63 @@ def _resolve_handle_pair_targets(
     return targets
 
 
+def _parse_filter_options(
+    filter_opts: tuple[str, ...],
+    raw_filter_opts: tuple[tuple[str, str, str], ...],
+) -> dict | None:
+    """Parse ``--filter`` and ``--raw-filter`` CLI values into a filters dict.
+
+    ``--filter`` formats::
+
+        NAME                 no-arg filter      e.g. ``recent_posts``
+        NAME.key=value       known filter kwarg e.g. ``creation_time.start=2025-01-01``
+        NAME=JSON            full kwargs        e.g. ``creation_time={"start":"2025-01-01"}``
+
+    ``--raw-filter`` format (three space-separated values)::
+
+        FB_KEY NAME ARGS_JSON   e.g. ``city:0 city '{"city_id":"123"}'``
+    """
+    import json as _json
+    filters: dict = {}
+    for v in filter_opts:
+        if '=' in v:
+            lhs, rhs = v.split('=', 1)
+            if '.' in lhs:
+                name, kwarg = lhs.rsplit('.', 1)
+                filters.setdefault(name, {})[kwarg] = rhs
+            else:
+                try:
+                    filters[lhs] = _json.loads(rhs)
+                except _json.JSONDecodeError:
+                    raise click.UsageError(
+                        f"--filter {v!r}: value after '=' must be valid JSON"
+                    )
+        else:
+            filters[v] = {}
+    for fb_key, name, args_json in raw_filter_opts:
+        filters[fb_key] = {"name": name, "args": args_json}
+    return filters or None
+
+
 @scrape.command(name='search')
 @click.argument('queries', nargs=-1)
 @click.option('--input-file', default=None, type=click.Path(exists=True),
-              help='Read (query_text, start_date?, end_date?) rows from a CSV, '
-                   'Parquet, YAML, or JSON/JSONL file. Mutually exclusive with '
-                   'positional queries. If the file supplies start_date / '
-                   'end_date columns, the matching CLI flag must NOT be set.')
-@click.option('--start-date', default=None,
-              help='Start date YYYY-MM-DD (oldest post date, inclusive). Required '
-                   'unless supplied per-row via --input-file.')
-@click.option('--end-date', default=None,
-              help='End date YYYY-MM-DD (most recent post date, inclusive). '
-                   'Default: today (UTC). Mutually exclusive with an end_date '
-                   'column in --input-file.')
+              help='Read query_text rows from a CSV, Parquet, YAML, or JSON/JSONL '
+                   'file. Mutually exclusive with positional queries.')
+@click.option('--filter', 'filter_opts', multiple=True, metavar='NAME[.key=value|=JSON]',
+              help='Add a search filter. May be specified multiple times. '
+                   'Formats: "recent_posts" (no args), '
+                   '"creation_time.start=YYYY-MM-DD" or "creation_time.end=YYYY-MM-DD" '
+                   '(date bounds), "NAME=JSON" (full kwargs as JSON). '
+                   'Example: --filter recent_posts --filter creation_time.start=2025-01-01 '
+                   '--filter creation_time.end=2025-12-31')
+@click.option('--raw-filter', 'raw_filter_opts', type=(str, str, str), multiple=True,
+              metavar='FB_KEY NAME ARGS_JSON',
+              help='Add a raw filter blob entry for unknown filter types. '
+                   'Provide the FB outer key, inner name, and args JSON string. '
+                   'Example: --raw-filter "city:0" "city" \'{"city_id":"123"}\'')
 @click.option('--output-dir', default=None,
-              help='Directory to save results (default: data/posts/{start}_{end})')
+              help='Directory to save results (default: data/posts/)')
 @click.option('--max-sessions', default=2, type=int,
               help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=5000, type=int,
@@ -1753,7 +1797,7 @@ def _resolve_handle_pair_targets(
               help='Skip queries whose output JSON file already exists in --output-dir.')
 @click.pass_context
 def scrape_search(
-    ctx, queries, input_file, start_date, end_date, output_dir, max_sessions,
+    ctx, queries, input_file, filter_opts, raw_filter_opts, output_dir, max_sessions,
     scroll_threshold, headless, mobile, log_level,
     pagination_count, scroll_burst_every, scroll_burst_min, scroll_burst_max,
     max_paginations, max_posts, pagination_sleep_mean, pagination_sleep_std,
@@ -1761,22 +1805,24 @@ def scrape_search(
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
     skip_existing,
 ):
-    """Scrape Facebook search results between two dates.
+    """Scrape Facebook search results.
 
     \b
-    Targets the SearchCometResultsPaginatedResultsQuery GraphQL endpoint with
-    a "Latest posts" + creation_time URL filter. Hybrid mode only — there is
-    no scroll-driven `manual` strategy for search.
+    Targets the SearchCometResultsPaginatedResultsQuery GraphQL endpoint.
+    Filters (sort order, date range, etc.) are optional — without any
+    --filter flags Facebook returns results under its default ranking.
+    Hybrid mode only.
 
     \b
     Examples:
-      fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
-      fbscrape scrape search 'mark carney' 'pierre poilievre' --start-date 2025-01-01 --headless
+      fbscrape scrape search 'mark carney'
+      fbscrape scrape search 'mark carney' --filter recent_posts --filter creation_time.start=2025-01-01 --filter creation_time.end=2025-12-31
+      fbscrape scrape search 'mark carney' 'pierre poilievre' --filter recent_posts --headless
 
     \b
     Read targets from a file (CSV / Parquet / YAML / JSON / JSONL):
       fbscrape scrape search --input-file queries.csv
-      fbscrape scrape search --input-file queries.yaml --start-date 2025-01-01
+      fbscrape scrape search --input-file queries.yaml --filter recent_posts
     """
     from .scraper import FacebookScraper
     from .logger import set_log_level, logger
@@ -1784,32 +1830,34 @@ def scrape_search(
 
     set_log_level(log_level)
 
-    targets = _resolve_targets(
-        queries, input_file, start_date, end_date, key_field='query_text',
-    )
+    filters = _parse_filter_options(filter_opts, raw_filter_opts)
+
+    if queries and input_file:
+        raise click.UsageError("Cannot use both positional queries and --input-file. Pick one.")
+    if not queries and not input_file:
+        raise click.UsageError("Must provide either positional queries or --input-file.")
+
+    if input_file:
+        rows = _load_scrape_targets(input_file, key_field='query_text', extra_keys=())
+        targets = [{'query_text': row['query_text'], 'filters': filters} for row in rows]
+    else:
+        targets = [{'query_text': q, 'filters': filters} for q in queries]
 
     mode = 'hybrid'
 
     if output_dir is None:
-        starts = [t['start_date'] for t in targets]
-        ends = [t['end_date'] for t in targets]
-        output_dir = os.path.join(
-            get_home_dir_path(), "data", "posts",
-            f"{min(starts)}_{max(ends)}",
-        )
+        output_dir = os.path.join(get_home_dir_path(), "data", "posts")
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
+
+    def _stem_for_target(t: dict) -> str:
+        return _build_stem(_sanitize_query_for_filename(t['query_text']), 'Search', mode)
 
     if skip_existing:
         before = len(targets)
         targets = [
             t for t in targets
-            if not os.path.exists(os.path.join(
-                output_dir,
-                f"{_sanitize_query_for_filename(t['query_text'])}"
-                f"_Search_{mode}"
-                f"_{t['start_date']}_{t['end_date']}.json",
-            ))
+            if _existing_output_for_stem(output_dir, _stem_for_target(t)) is None
         ]
         skipped = before - len(targets)
         if skipped:
@@ -1853,21 +1901,20 @@ def scrape_search(
             async for result in gather(
                 scraper.search(
                     query_text=t['query_text'],
-                    start_date=t['start_date'],
-                    end_date=t['end_date'],
+                    filters=t['filters'],
                     mode=mode,
                     **mode_params,
                 )
                 for t in targets
             ):
-                data: ScrapingResult = result
-                qt = data.query.query.get('query_text')
-                filename = (
-                    f"{_sanitize_query_for_filename(qt)}"
-                    f"_{data.query.endpoint}_{data.query.mode}"
-                    f"_{data.query.query['start_date']}_{data.query.query['end_date']}.jsonl"
+                qt = result.query.query.get('query_text')
+                stem = _stem_for_target({'query_text': qt})
+                outpath = os.path.join(output_dir, f"{stem}.jsonl.gz")
+                result.save(outpath)
+                logger.info(
+                    f"[search] {qt!r}: {result.result}, "
+                    f"{result.num_records} records → {outpath}"
                 )
-                data.save(os.path.join(output_dir, filename))
 
     run_async(_scrape())
 

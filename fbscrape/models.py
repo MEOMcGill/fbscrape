@@ -105,7 +105,7 @@ class Query:
             },
         },
         "Search": {
-            "query_required": ["query_text", "start_date", "end_date"],
+            "query_required": ["query_text"],
             "modes": {
                 # Hybrid only — Search has no scroll-driven `manual` mode and
                 # never will. Date bounds are enforced server-side via the

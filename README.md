@@ -114,7 +114,7 @@ Two are paginated post streams; two are single-shot record fetches.
 | Endpoint | Required `query` | Mode(s) | Output shape |
 |---|---|---|---|
 | `UserTimeline` | `handle`, `start_date`, `end_date` | `manual`, `hybrid` *(default)* | `data: list[dict]` — one element per post |
-| `Search` | `query_text`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per search-result post |
+| `Search` | `query_text` (filters optional) | `hybrid` | `data: list[dict]` — one element per search-result post |
 | `GroupTimeline` | `handle`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per group post (date filter is client-side; default sort `TOP_POSTS`) |
 | `PageTransparency` | `page_id` (handle optional) | `hybrid` | `data: [transparency_dict]` — single-element list |
 | `ProfileAuthenticity` | `user_id` | `hybrid` | `data: [authenticity_dict]` — single-element list |
@@ -312,9 +312,12 @@ fbscrape scrape user-timeline zuck --max-posts 500
 # Force the scroll-driven path (deprecated; UserTimeline only)
 fbscrape scrape user-timeline zuck --start-date 2024-01-01 --mode manual
 
-# Search — paginated, date-bounded, hybrid only (no-date URL form is TODO).
-fbscrape scrape search 'mark carney' --start-date 2025-01-01 --end-date 2025-12-31
-fbscrape scrape search --input-file queries.csv
+# Search — paginated, hybrid only. Filters optional; no filters = FB default ranking.
+fbscrape scrape search 'mark carney'
+fbscrape scrape search 'mark carney' --filter recent_posts \
+    --filter creation_time.start=2025-01-01 --filter creation_time.end=2025-12-31
+fbscrape scrape search 'mark carney' --filter posts_from.source=public
+fbscrape scrape search --input-file queries.csv --filter recent_posts
 
 # GroupTimeline — paginated, hybrid only. `handle` accepts vanity OR numeric
 # group id. `--start-date` and `--end-date` are BOTH OPTIONAL (FB's UI sends
@@ -373,7 +376,7 @@ fbscrape utils parse-curl "curl 'https://www.facebook.com/api/graphql/' -X POST 
 
 `--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
 depend on the subcommand: `handle` + optional `start_date` / `end_date` for
-`user-timeline` and `group-timeline`; `query_text` + dates for `search`;
+`user-timeline` and `group-timeline`; `query_text` for `search` (filters via `--filter`, not file columns);
 `handle` + `post_id` (both required) for `comments-list`; `page_id` (required) +
 `handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
 

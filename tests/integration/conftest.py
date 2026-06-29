@@ -9,7 +9,6 @@ don't spin up a fresh accounts-pool per test (cheap, but the bigger win is
 that all tests share one headless camoufox install and one pool init).
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -27,6 +26,6 @@ async def fb_scraper(require_active_account: Path):
     async with FacebookScraper(
         db=str(require_active_account),
         max_browser_sessions=1,
-        headless=True,
+        headless=False,
     ) as scraper:
         yield scraper

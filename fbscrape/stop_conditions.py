@@ -6,7 +6,6 @@ terminates the loop. Auth errors and in-body rate-limits short-circuit
 inline before the walk. Conditions are stateful, so build a fresh list
 per scrape via `assemble_default_stop_conditions`.
 """
-from __future__ import annotations
 
 import json
 import os
@@ -445,7 +444,10 @@ def assemble_default_stop_conditions(
 
     Always: `GraphQLError`, `EndOfFeed`, `NoNewPostsStreak`,
     `MaxPostsReached`, `ResponseShapeError`, `MaxPaginations`.
-    Chronological sorts add `OldestInBatchBelowStartDate` + `CursorReset`.
+    Strictly chronological feeds (UserTimeline, GroupTimeline CHRONOLOGICAL) add
+    `OldestInBatchBelowStartDate` + `CursorReset`. Search is excluded: its date
+    bounds are server-enforced via the URL filter blob and results within the
+    range are not strictly ordered, so neither condition is reliable.
     `ConsecutiveOutOfRange` is opt-in via `params['max_consecutive_out_of_range']`.
     Order matters — `GraphQLError` runs first so forensics dump before
     anything else interprets the response.
@@ -467,7 +469,7 @@ def assemble_default_stop_conditions(
         ]
 
     is_chronological = (
-        endpoint in ("UserTimeline", "Search")
+        endpoint == "UserTimeline"
         or (endpoint == "GroupTimeline" and sorting_setting == "CHRONOLOGICAL")
     )
 

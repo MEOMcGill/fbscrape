@@ -6,7 +6,6 @@ Covers `_resolve_targets` per-endpoint policy flags (`require_start`,
 file-name construction.
 """
 
-from __future__ import annotations
 
 import os
 
@@ -100,16 +99,6 @@ def test_resolve_targets_usertimeline_only_end_flag():
     )
     assert out[0] == {"handle": "zuck", "start_date": None, "end_date": "2025-01-01"}
 
-
-def test_resolve_targets_search_style_still_requires_dates():
-    """Default flags (require_start=True, require_end=True) preserve Search behavior."""
-    with pytest.raises(click.UsageError, match="start_date missing"):
-        _resolve_targets(
-            keys=["mark carney"], input_file=None,
-            start_date=None, end_date=None,
-            key_field="query_text",
-            # defaults: require_start=True, require_end=True, default_end_to_today=True
-        )
 
 
 def test_resolve_targets_both_dates_passed_through():

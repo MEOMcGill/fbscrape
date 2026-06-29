@@ -2,14 +2,12 @@
 
 Search results are noisier than timelines (FB filters less stable, rate
 limits hit harder) — we assert the call returns *some* data and that what
-comes back flattens through the UserTimeline flattener (Search records share
-the Story shape).
+comes back flattens through the Search flattener.
 """
 
-from __future__ import annotations
 
 import pytest
-
+import fbscrape
 from fbscrape.response import FacebookGraphQLParser
 
 
@@ -18,18 +16,19 @@ pytestmark = pytest.mark.integration
 
 async def test_search_returns_results(fb_scraper):
     result = await fb_scraper.search(
-        "mark zuckerberg", "2025-06-01", "2025-07-01",
+        "carney",
+        filters={
+            "recent_posts": {},
+            "creation_time": {"start": "2026-01-01", "end": "2026-12-31"},
+        },
     )
     assert result.result in {
         "success",
         "scraped until user-specified starting date was reached",
     }
-    assert len(result.data) > 0
+    assert result.num_records > 0
 
-    # Search posts share the PCTFRQ Story shape — flatten with UserTimeline.
     parser = FacebookGraphQLParser()
-    flattened = [parser.flatten(r, "UserTimeline") for r in result.data]
+    flattened = [parser.flatten(r, "Search") for r in result.iter_posts()]
     flattened = [r for r in flattened if r is not None]
-    # Don't pin a precise % — search results can be heterogeneous (some shapes
-    # the UserTimeline flattener won't recognize). Just require at least one.
-    assert len(flattened) > 0, "no search records flattened — shape may have drifted"
+    assert len(flattened) > 0, "no Search records flattened — shape may have drifted"

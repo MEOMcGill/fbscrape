@@ -9,7 +9,6 @@ dump artifacts land where they should without polluting the repo.
 matrix cells (chronological-by-default endpoints, GroupTimeline+CHRONO,
 GroupTimeline+non-CHRONO) produce the documented condition sets.
 """
-from __future__ import annotations
 
 import json
 import os
@@ -472,6 +471,23 @@ def test_assemble_consecutive_out_of_range_omitted_when_disabled():
         },
     )
     assert "ConsecutiveOutOfRange" not in _names(conds)
+
+
+def test_assemble_search_has_no_date_stops():
+    """Search results are not strictly chronological within the date-filtered
+    range, so both date-exit conditions are excluded. Only exhaustion/capacity
+    stops apply."""
+    conds = assemble_default_stop_conditions(
+        endpoint="Search", mode="hybrid", sorting_setting=None,
+        params={
+            "max_no_progress_streak": 5,
+            "max_paginations": -1,
+            "max_posts": -1,
+        },
+    )
+    names = _names(conds)
+    assert "OldestInBatchBelowStartDate" not in names
+    assert "CursorReset" not in names
 
 
 def test_assemble_default_set_universal_stops():

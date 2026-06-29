@@ -6,7 +6,6 @@ A change to the registry without updating these tests means a silent break
 in the public API.
 """
 
-from __future__ import annotations
 
 import json
 import pytest
@@ -18,7 +17,7 @@ from fbscrape.models import Query
 ALL_PAIRS = [
     ("UserTimeline", "manual",  {"handle": "zuck", "start_date": "2024-01-01", "end_date": "2024-02-01"}),
     ("UserTimeline", "hybrid",  {"handle": "zuck", "start_date": "2024-01-01", "end_date": "2024-02-01"}),
-    ("Search",       "hybrid",  {"query_text": "x", "start_date": "2024-01-01", "end_date": "2024-02-01"}),
+    ("Search",       "hybrid",  {"query_text": "x"}),
     ("PageTransparency",    "hybrid", {"page_id": "20531316728"}),
     ("ProfileAuthenticity", "hybrid", {"user_id": "100044331674441"}),
 ]
@@ -56,7 +55,7 @@ def test_search_has_no_manual_mode():
     with pytest.raises(ValueError, match="Unsupported mode"):
         Query(
             endpoint="Search", mode="manual",
-            query={"query_text": "x", "start_date": "2024-01-01", "end_date": "2024-02-01"},
+            query={"query_text": "x"},
             params={},
         )
 
@@ -168,14 +167,12 @@ def test_optional_dates_accepted(endpoint, mode, query):
         assert q.query[k] == v
 
 
-def test_search_still_requires_dates():
-    """Search keeps both date fields required — no-date URL form not yet supported."""
-    with pytest.raises(ValueError, match="missing required fields"):
-        Query(
-            endpoint="Search", mode="hybrid",
-            query={"query_text": "x"},  # no dates
-            params={},
-        )
+def test_search_does_not_require_dates():
+    """Search only requires query_text — filters (incl. dates) are optional."""
+    q = Query(endpoint="Search", mode="hybrid", query={"query_text": "x"}, params={})
+    assert q.query["query_text"] == "x"
+    assert "start_date" not in q.query
+    assert "end_date" not in q.query
 
 
 def test_endpoint_registry_top_level_keys_pinned():

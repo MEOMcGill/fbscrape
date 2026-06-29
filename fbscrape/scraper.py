@@ -427,32 +427,32 @@ class FacebookScraper:
     async def search(
         self,
         query_text: str,
-        start_date: str,
-        end_date: str,
+        filters: dict | None = None,
         mode: str = "hybrid",
         max_posts: int = -1,
         **params,
     ) -> ScrapingResult:
         """
-        Scrape Facebook search results for `query_text` between two dates.
+        Scrape Facebook search results for `query_text`.
 
-        Targets `SearchCometResultsPaginatedResultsQuery`. Date bounds are
-        applied via the search URL's filter blob (Latest posts +
-        creation_time), not as GraphQL variables.
+        Targets `SearchCometResultsPaginatedResultsQuery`. Filters are applied
+        via the search URL's &filters= blob. Pass None (default) for no filters
+        — FB returns results under its default ranking.
 
         Args:
             query_text: Free-form search term.
-            start_date: Start date (YYYY-MM-DD), inclusive.
-            end_date:   End date (YYYY-MM-DD), inclusive.
+            filters: Optional dict of search filters. Known keys:
+                - ``"recent_posts": {}`` — sort by latest.
+                - ``"creation_time": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}``
+                  — server-enforced date range; one-sided bounds supported.
+                Unknown keys are passed as raw blob entries:
+                ``{"city:0": {"name": "city", "args": "{...}"}}``.
             mode: Currently only "hybrid" is supported.
-            max_posts: Hard cap on the number of accumulated posts. `-1`
-                  (default) disables the cap. Enforced at batch boundaries
-                  inside `_hybrid_pagination_loop`, so the returned count can
-                  exceed by up to `pagination_count - 1`. When the cap fires,
-                  `result.result == "max_posts_reached"`.
-            **params: other mode-specific tuning knobs. Allowed keys and
-                  defaults live in Query.ENDPOINT_REGISTRY[("Search", mode)]["params"].
-                  Pass `None` (or omit) to use the registry default.
+            max_posts: Hard cap on accumulated posts (-1 = no cap). Enforced at
+                batch boundaries; actual count can exceed by up to
+                pagination_count - 1.
+            **params: Mode-specific tuning knobs from
+                Query.ENDPOINT_REGISTRY[("Search", mode)]["params"].
 
         Returns:
             ScrapingResult with outcome and collected records (one per post).
@@ -469,23 +469,19 @@ class FacebookScraper:
         query = Query(
             endpoint="Search",
             mode=mode,
-            query={
-                "query_text": query_text,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
+            query={"query_text": query_text, "filters": filters},
             params=cleaned_params,
         )
 
         logger.debug(
             f"Submitting Search task (mode={mode}) for query_text={query_text!r}, "
-            f"date_range={start_date} to {end_date}"
+            f"filters={filters!r}"
         )
         future = await self.worker_pool.submit_task(query)
         result = await future
         logger.info(
             f"Completed Search (mode={mode}) for query_text={query_text!r}: "
-            f"{result.result} ({len(result.data)} posts, {result.time_taken})"
+            f"{result.result} ({result.num_records} posts, {result.time_taken})"
         )
         return result
 

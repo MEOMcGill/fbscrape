@@ -9,6 +9,7 @@ fbscrape/cli.py
 fbscrape/db.py
 fbscrape/downloaders.py
 fbscrape/exceptions.py
+fbscrape/jsonl_store.py
 fbscrape/logger.py
 fbscrape/login.py
 fbscrape/models.py
