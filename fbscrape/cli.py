@@ -2226,6 +2226,111 @@ def scrape_page_transparency(
     run_async(_scrape())
 
 
+@scrape.command(name='post-detail')
+@click.argument('pairs', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read (handle, post_id) rows from a CSV, Parquet, YAML, '
+                   'or JSON/JSONL file. Both columns are required. '
+                   'Mutually exclusive with positional args.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/post_detail/)')
+@click.option('--group/--no-group', 'is_group', default=False,
+              help='Group posts live at /groups/<handle>/posts/<post_id>/; '
+                   'pass --group for those. Default (--no-group) is a page / '
+                   'user post at /<handle>/posts/<post_id>/.')
+@click.option('--max-sessions', default=2, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the permalink (default 3)')
+@click.option('--document-wait-seconds', type=float, default=None,
+              help='extra settle time before reading the rendered document, '
+                   'so the server-rendered Story blob is present (default 4)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_post_detail(
+    ctx, pairs, input_file, output_dir, is_group, max_sessions,
+    scroll_threshold, headless, mobile, log_level, post_nav_sleep_seconds,
+    document_wait_seconds, operation_timeout_seconds, wait_for_account,
+):
+    """Fetch a single post's content by its permalink (hybrid mode only).
+
+    \b
+    Single-shot — no pagination, no date range. Each target needs both a
+    handle (drives the navigation URL) and a post_id (numeric form OR pfbid
+    form). FB server-renders the post's Story into the permalink document, so
+    there is no GraphQL replay — the Story is read from the rendered page.
+
+    \b
+    Examples:
+      fbscrape scrape post-detail albertansunitedtostoptheucp:27209929835285847 --group
+      fbscrape scrape post-detail zuck:10115311901107991 --headless
+      fbscrape scrape post-detail --input-file posts.csv --group
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    required `handle` and `post_id` columns:
+      fbscrape scrape post-detail --input-file posts.csv --group
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_handle_pair_targets(pairs, input_file, paired_key='post_id')
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "post_detail")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "document_wait_seconds": document_wait_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.post_detail(
+                    handle=t['handle'],
+                    post_id=t['post_id'],
+                    is_group=is_group,
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+                post_id = data.query.query.get('post_id')
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = (
+                    f"{handle.replace('.', '_')}_{post_id}_postdetail_{ts}.jsonl"
+                )
+                data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
 @scrape.command(name='profile-authenticity')
 @click.argument('user_ids', nargs=-1)
 @click.option('--input-file', default=None, type=click.Path(exists=True),

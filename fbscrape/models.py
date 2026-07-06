@@ -179,6 +179,33 @@ class Query:
                 },
             },
         },
+        "PostDetail": {
+            # Caller supplies the parent `handle` (vanity handle / numeric id
+            # of the group, page, or user that owns the post — drives the
+            # navigation URL) and `post_id` (numeric form OR pfbid-form; both
+            # resolve via the permalink redirect). Unlike PageTransparency /
+            # ProfileAuthenticity, there is NO GraphQL replay: FB server-renders
+            # the post's Story into the permalink document's embedded JSON
+            # (RelayPrefetchedStreamCache), so the scrape reads the document and
+            # extracts the Story directly. Single-shot, no pagination.
+            "query_required": ["handle", "post_id"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        # Group posts live at /groups/<handle>/posts/<post_id>/;
+                        # page / user posts at /<handle>/posts/<post_id>/. FB
+                        # doesn't cross-resolve the two, so the caller declares
+                        # which surface the post lives on.
+                        "is_group": False,
+                        "post_nav_sleep_seconds": 3.0,
+                        # Max seconds to wait for the permalink document's
+                        # server-rendered Story blob to be present after nav.
+                        "document_wait_seconds": 4.0,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
         "CommentsList": {
             # Caller supplies the parent post's `handle` (vanity handle of the
             # author / page that owns the post — needed for the navigation URL)

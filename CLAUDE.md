@@ -38,6 +38,9 @@ caller
 | `CommentsList` | `hybrid` | `handle`, `post_id` | CLCPQ | none |
 | `PageTransparency` | `hybrid` | `page_id` (handle optional) | single-shot POST | none |
 | `ProfileAuthenticity` | `hybrid` | `user_id` | single-shot POST | none |
+| `PostDetail` | `hybrid` | `handle`, `post_id` (+`is_group`) | single-shot **document** scrape | none |
+
+`PostDetail` is the odd one out: FB **server-renders** a post's Comet Story into the permalink document's embedded Relay JSON (`RelayPrefetchedStreamCache`) instead of firing a GraphQL XHR, so `post_detail_hybrid` reads `page.content()` and pulls the Story via `FacebookGraphQLParser.extract_permalink_story` — no template capture, no replay, no pagination. It reuses the timeline flattener (the Story shape is identical), so a permalink post flattens to the same schema as a GroupTimeline post. A permalink page embeds neighbour posts too, so the extractor prefers an exact numeric `post_id` match and falls back to the Story under the permalink root key (`node_v2`/`node`) — which is how it resolves pfbid inputs (the rendered Story always carries the numeric id).
 
 Adding a new endpoint: one dict entry in `Query.ENDPOINT_REGISTRY`, per-mode methods on `BrowserSession`, row in `Worker.ENDPOINT_MODE_METHODS`, flattener + `ENDPOINT_FLATTENERS` entry, high-level wrapper on `FacebookScraper`, CLI subcommand, plus full test additions. Full playbook: [`docs/adding_endpoints.md`](docs/adding_endpoints.md). Per-endpoint strategy deep dives: [`docs/architecture/endpoints.md`](docs/architecture/endpoints.md).
 
@@ -50,6 +53,7 @@ FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
     "CommentsList":        "_flatten_commentslist_comment",
     "PageTransparency":    "_flatten_pagetransparency_record",
     "ProfileAuthenticity": "_flatten_profile_authenticity_record",
+    "PostDetail":          "_flatten_postdetail_record",
 }
 ```
 
@@ -148,6 +152,7 @@ fbscrape scrape search 'mark carney' --filter recent_posts --filter creation_tim
 fbscrape scrape comments-list zuck:10115311901107991 --max-results 200
 fbscrape scrape page-transparency 899800046546098
 fbscrape scrape profile-authenticity 100044331674441
+fbscrape scrape post-detail albertansunitedtostoptheucp:27209929835285847 --group
 
 # Post-process
 fbscrape flatten data/posts/ --format parquet

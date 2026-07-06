@@ -4,7 +4,7 @@ A Python library for scraping Facebook using Camoufox with account pooling, rota
 
 ## Features
 
-- **Five endpoints** - `UserTimeline`, `Search`, `GroupTimeline`, `PageTransparency`, `ProfileAuthenticity`
+- **Seven endpoints** - `UserTimeline`, `Search`, `GroupTimeline`, `CommentsList`, `PageTransparency`, `ProfileAuthenticity`, `PostDetail`
 - **High-level API** - Simple `FacebookScraper` class handles all complexity
 - **Concurrent scraping** - WorkerPool manages multiple browser sessions
 - **Account management** - SQLite-backed pool with automatic rotation
@@ -108,16 +108,18 @@ construct a `Query` yourself and call `ScrapingResult.from_outcome(query, outcom
 
 ## Endpoints
 
-`fbscrape` supports five endpoints, all registered in `Query.ENDPOINT_REGISTRY`.
-Two are paginated post streams; two are single-shot record fetches.
+`fbscrape` supports seven endpoints, all registered in `Query.ENDPOINT_REGISTRY`.
+Three are paginated post/comment streams; the rest are single-shot record fetches.
 
 | Endpoint | Required `query` | Mode(s) | Output shape |
 |---|---|---|---|
 | `UserTimeline` | `handle`, `start_date`, `end_date` | `manual`, `hybrid` *(default)* | `data: list[dict]` — one element per post |
 | `Search` | `query_text` (filters optional) | `hybrid` | `data: list[dict]` — one element per search-result post |
 | `GroupTimeline` | `handle`, `start_date`, `end_date` | `hybrid` | `data: list[dict]` — one element per group post (date filter is client-side; default sort `TOP_POSTS`) |
+| `CommentsList` | `handle`, `post_id` | `hybrid` | `data: list[dict]` — one element per top-level comment |
 | `PageTransparency` | `page_id` (handle optional) | `hybrid` | `data: [transparency_dict]` — single-element list |
 | `ProfileAuthenticity` | `user_id` | `hybrid` | `data: [authenticity_dict]` — single-element list |
+| `PostDetail` | `handle`, `post_id` | `hybrid` | `data: [{node: story}]` — single post, same schema as a timeline post |
 
 ### `user_id` vs `page_id` — the distinction that bites
 
@@ -356,6 +358,16 @@ fbscrape scrape page-transparency --input-file pages.csv --headless
 fbscrape scrape profile-authenticity 100044331674441
 fbscrape scrape profile-authenticity --input-file users.csv --headless
 
+# PostDetail — single-shot; fetch ONE post's content by its permalink.
+# handle + post_id (numeric OR pfbid). Pass --group for group posts
+# (/groups/<handle>/posts/<post_id>/); default is a page/user post
+# (/<handle>/posts/<post_id>/). No GraphQL replay — the post's Story is read
+# from the permalink's server-rendered document, then flattened to the same
+# schema as a timeline post.
+fbscrape scrape post-detail albertansunitedtostoptheucp:27209929835285847 --group
+fbscrape scrape post-detail zuck:10115311901107991 --headless
+fbscrape scrape post-detail --input-file posts.csv --group
+
 # Post-processing — flatten raw JSON into csv/jsonl/parquet (accepts .json or .json.gz).
 # Saved scrape files are named `<handle>_<endpoint>_<mode>.json{,.gz}` —
 # no date segment. The actual scrape parameters live in the file's
@@ -377,8 +389,9 @@ fbscrape utils parse-curl "curl 'https://www.facebook.com/api/graphql/' -X POST 
 `--input-file` accepts CSV / Parquet / YAML / JSON / JSONL. Recognized columns
 depend on the subcommand: `handle` + optional `start_date` / `end_date` for
 `user-timeline` and `group-timeline`; `query_text` for `search` (filters via `--filter`, not file columns);
-`handle` + `post_id` (both required) for `comments-list`; `page_id` (required) +
-`handle` (optional) for `page-transparency`; `user_id` for `profile-authenticity`.
+`handle` + `post_id` (both required) for `comments-list` and `post-detail`;
+`page_id` (required) + `handle` (optional) for `page-transparency`; `user_id`
+for `profile-authenticity`.
 
 ### Account Management
 

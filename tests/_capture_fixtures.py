@@ -83,6 +83,13 @@ TARGETS = {
         # Bounded so the capture doesn't spin forever on a viral post.
         "max_results": 30,
     },
+    "post_detail": {
+        # A public Alberta-politics group post (cited by Google's AI Overview).
+        # Substitute if it goes dark. Group posts need is_group=True.
+        "handle": "albertansunitedtostoptheucp",
+        "post_id": "27209929835285847",
+        "is_group": True,
+    },
 }
 
 
@@ -118,6 +125,12 @@ async def _capture_comments_list(scraper: FacebookScraper, spec: dict):
     )
 
 
+async def _capture_post_detail(scraper: FacebookScraper, spec: dict):
+    return await scraper.post_detail(
+        spec["handle"], spec["post_id"], is_group=spec.get("is_group", False),
+    )
+
+
 CAPTURERS = {
     "user_timeline_hybrid":  lambda s: _capture_user_timeline(s, "hybrid", TARGETS["user_timeline_hybrid"]),
     "user_timeline_manual":  lambda s: _capture_user_timeline(s, "manual", TARGETS["user_timeline_manual"]),
@@ -126,6 +139,7 @@ CAPTURERS = {
     "page_transparency":     lambda s: _capture_page_transparency(s, TARGETS["page_transparency"]),
     "profile_authenticity":  lambda s: _capture_profile_authenticity(s, TARGETS["profile_authenticity"]),
     "comments_list_hybrid":  lambda s: _capture_comments_list(s, TARGETS["comments_list_hybrid"]),
+    "post_detail":           lambda s: _capture_post_detail(s, TARGETS["post_detail"]),
 }
 
 

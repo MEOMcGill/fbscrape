@@ -49,6 +49,7 @@ class Worker:
         ("CommentsList", "hybrid"): "comments_list_hybrid",
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
+        ("PostDetail", "hybrid"): "post_detail_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
     }
 
