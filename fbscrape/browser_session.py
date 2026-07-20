@@ -42,6 +42,16 @@ GRAPHQL_API_URL = "https://www.facebook.com/api/graphql/"
 HYBRID_HEADER_DROP = frozenset({
     "host", "content-length", "connection", "accept-encoding", "cookie",
 })
+# Headers we set to a fixed value on replay rather than forwarding verbatim.
+# Accept-Encoding is dropped above (any captured casing) and pinned here:
+# a page.request.post with no Accept-Encoding makes Playwright's
+# APIRequestContext inject its own default `gzip, deflate, br`, and the driver
+# intermittently fails to decompress Facebook's Brotli responses
+# (`failed to decompress 'br' encoding`), aborting a pagination mid-group.
+# Requesting only gzip/deflate keeps the driver off its flaky brotli path.
+# (The browser-request equivalent is set_extra_http_headers() in initialize();
+# that does not apply to the separate page.request API context.)
+HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": "gzip, deflate"}
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
@@ -2260,18 +2270,12 @@ class BrowserSession:
 
     @staticmethod
     def _hybrid_clean_headers(raw: dict[str, str]) -> dict[str, str]:
-        """Drop HTTP/2 pseudo-headers and headers managed by Playwright (cookie, host, content-length, etc.).
-
-        Then pin ``Accept-Encoding`` to ``gzip, deflate``. ``accept-encoding``
-        is in HYBRID_HEADER_DROP, so the captured value is stripped — but a
-        ``page.request.post`` sent with no Accept-Encoding makes Playwright's
-        APIRequestContext inject its OWN default, ``gzip, deflate, br``. The
-        driver then intermittently fails on Facebook's Brotli responses with
-        ``failed to decompress 'br' encoding``, which aborts a pagination
-        mid-group (observed capping a 10k pull at ~7.4k). Requesting only
-        gzip/deflate keeps the driver off its flaky brotli path. This mirrors
-        the browser-request pin at initialize() (set_extra_http_headers), which
-        does not apply to the separate page.request API context."""
+        """Build replay headers from a captured template: drop HTTP/2
+        pseudo-headers and Playwright-managed headers (HYBRID_HEADER_DROP:
+        cookie, host, content-length, accept-encoding, …), then apply
+        HYBRID_HEADER_OVERRIDE (pins Accept-Encoding to gzip/deflate — see its
+        definition for why). Dropping first means the override wins regardless
+        of the captured header's casing, with no duplicate."""
         out = {}
         for k, v in raw.items():
             if k.startswith(":"):
@@ -2279,7 +2283,7 @@ class BrowserSession:
             if k.lower() in HYBRID_HEADER_DROP:
                 continue
             out[k] = v
-        out["Accept-Encoding"] = "gzip, deflate"
+        out.update(HYBRID_HEADER_OVERRIDE)
         return out
 
     def _hybrid_build_body(
