@@ -2260,7 +2260,18 @@ class BrowserSession:
 
     @staticmethod
     def _hybrid_clean_headers(raw: dict[str, str]) -> dict[str, str]:
-        """Drop HTTP/2 pseudo-headers and headers managed by Playwright (cookie, host, content-length, etc.)."""
+        """Drop HTTP/2 pseudo-headers and headers managed by Playwright (cookie, host, content-length, etc.).
+
+        Then pin ``Accept-Encoding`` to ``gzip, deflate``. ``accept-encoding``
+        is in HYBRID_HEADER_DROP, so the captured value is stripped — but a
+        ``page.request.post`` sent with no Accept-Encoding makes Playwright's
+        APIRequestContext inject its OWN default, ``gzip, deflate, br``. The
+        driver then intermittently fails on Facebook's Brotli responses with
+        ``failed to decompress 'br' encoding``, which aborts a pagination
+        mid-group (observed capping a 10k pull at ~7.4k). Requesting only
+        gzip/deflate keeps the driver off its flaky brotli path. This mirrors
+        the browser-request pin at initialize() (set_extra_http_headers), which
+        does not apply to the separate page.request API context."""
         out = {}
         for k, v in raw.items():
             if k.startswith(":"):
@@ -2268,6 +2279,7 @@ class BrowserSession:
             if k.lower() in HYBRID_HEADER_DROP:
                 continue
             out[k] = v
+        out["Accept-Encoding"] = "gzip, deflate"
         return out
 
     def _hybrid_build_body(
