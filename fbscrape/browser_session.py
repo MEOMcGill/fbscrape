@@ -42,16 +42,20 @@ GRAPHQL_API_URL = "https://www.facebook.com/api/graphql/"
 HYBRID_HEADER_DROP = frozenset({
     "host", "content-length", "connection", "accept-encoding", "cookie",
 })
+# camoufox/Playwright's bundled driver has broken br/zstd decompression
+# (camoufox issue #473): responses in those encodings intermittently fail with
+# `failed to decompress 'br' encoding`. Restrict Accept-Encoding to encodings
+# the driver decodes reliably. Single source of truth for BOTH request paths —
+# browser-issued requests (set_extra_http_headers in initialize()) and the
+# hybrid replay POSTs sent via the separate page.request API context.
+ALLOWED_ACCEPT_ENCODING = "gzip, deflate"
+
 # Headers we set to a fixed value on replay rather than forwarding verbatim.
-# Accept-Encoding is dropped above (any captured casing) and pinned here:
-# a page.request.post with no Accept-Encoding makes Playwright's
-# APIRequestContext inject its own default `gzip, deflate, br`, and the driver
-# intermittently fails to decompress Facebook's Brotli responses
-# (`failed to decompress 'br' encoding`), aborting a pagination mid-group.
-# Requesting only gzip/deflate keeps the driver off its flaky brotli path.
-# (The browser-request equivalent is set_extra_http_headers() in initialize();
-# that does not apply to the separate page.request API context.)
-HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": "gzip, deflate"}
+# Accept-Encoding is dropped above (any captured casing) then pinned here — a
+# page.request.post with no Accept-Encoding makes Playwright's APIRequestContext
+# inject its own default (which includes br), and set_extra_http_headers() from
+# initialize() does NOT apply to this separate API context.
+HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING}
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
@@ -229,7 +233,8 @@ class BrowserSession:
             self.page = await self._context.new_page()
 
             # Workaround for camoufox issue #473: br/zstd decompression broken.
-            await self.page.set_extra_http_headers({"Accept-Encoding": "gzip, deflate"})
+            await self.page.set_extra_http_headers(
+                {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING})
 
             self.response_interceptor = ResponseInterceptor()
             self.response_interceptor.setup_interception(self.page)
