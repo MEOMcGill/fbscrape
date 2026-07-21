@@ -846,6 +846,8 @@ class BrowserSession:
         max_no_progress_streak: int = 5,
         max_consecutive_out_of_range: int = 20,
         operation_timeout_seconds: float = 900,
+        stream_to_path: str | None = None,
+        stream_compress: bool = False,
     ) -> ScrapeOutcome:
         """Scrape a group's feed by replaying GroupsCometFeedRegularStoriesPaginationQuery.
 
@@ -966,6 +968,26 @@ class BrowserSession:
                 f"{self._hybrid_cursor_fp(initial_cursor)}"
             )
 
+        # Write-on-parse streaming: when stream_to_path is set, route each deduped
+        # post straight to a JSONL file (via the interceptor's post_sink) instead
+        # of accumulating in RAM. The JsonlPostWriter autoflushes each line, so if
+        # the scrape is cancelled or killed mid-run — e.g. an outer wall-clock
+        # guard fires after hours — every post parsed so far is already durably on
+        # disk (RAM accumulation would be lost). Must be set AFTER flush() (which
+        # clears post_sink). On the happy path the final return finalizes the
+        # writer and returns a spill-shaped outcome (empty inline data +
+        # post_count + spill_path); the rare early-error returns below leave 0
+        # posts, so they keep the plain (empty) outcome and the file is harmless.
+        writer = None
+        if stream_to_path:
+            from .jsonl_store import JsonlPostWriter
+            stream_query = {"endpoint": "GroupTimeline", "mode": "hybrid",
+                            "handle": handle, "sorting_setting": sorting_setting}
+            writer = JsonlPostWriter(stream_to_path, stream_query, scrape_start_time,
+                                     append=False, compress=stream_compress,
+                                     autoflush=True)
+            self.response_interceptor.post_sink = writer.write_post
+
         # Phase 1 — navigate
         error = await self._hybrid_navigate(
             target_url=target_url,
@@ -1030,11 +1052,25 @@ class BrowserSession:
             },
             initial_cursor=initial_cursor or None,
         )
+        tt = datetime.now(timezone.utc) - scrape_start_time
+        if writer is not None:
+            # write-on-parse: posts already streamed to disk; finalize stamps the
+            # terminal status and closes the file. Inline data is empty.
+            writer.finalize(result_str, tt, next_cursor)
+            return ScrapeOutcome(
+                result=result_str,
+                data=[],
+                post_count=writer.count,
+                spill_path=stream_to_path,
+                time_started=scrape_start_time,
+                time_taken=tt,
+                last_cursor=next_cursor,
+            )
         return ScrapeOutcome(
             result=result_str,
             data=self.response_interceptor.get_posts(),
             time_started=scrape_start_time,
-            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            time_taken=tt,
             last_cursor=next_cursor,
         )
 
