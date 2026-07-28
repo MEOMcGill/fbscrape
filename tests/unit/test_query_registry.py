@@ -20,6 +20,7 @@ ALL_PAIRS = [
     ("Search",       "hybrid",  {"query_text": "x"}),
     ("PageTransparency",    "hybrid", {"page_id": "20531316728"}),
     ("ProfileAuthenticity", "hybrid", {"user_id": "100044331674441"}),
+    ("PostDetail",          "hybrid", {"handle": "albertansunitedtostoptheucp", "post_id": "27209929835285847"}),
 ]
 
 
@@ -185,4 +186,5 @@ def test_endpoint_registry_top_level_keys_pinned():
         "CommentsList",
         "PageTransparency",
         "ProfileAuthenticity",
+        "PostDetail",
     }

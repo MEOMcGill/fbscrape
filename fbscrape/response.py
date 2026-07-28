@@ -5,6 +5,7 @@ Response interception and Facebook GraphQL parsing
 import base64
 import json
 import os
+import re
 import traceback
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
@@ -137,6 +138,7 @@ class FacebookGraphQLParser:
         "PageTransparency": "_flatten_pagetransparency_record",
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
         "CommentsList": "_flatten_commentslist_comment",
+        "PostDetail": "_flatten_postdetail_record",
     }
 
     # FB's canonical reaction ids — stable per reaction type, used as edge
@@ -392,6 +394,101 @@ class FacebookGraphQLParser:
             logger.error(f"Failed to parse post node: {e}")
             return None
 
+    # `<script type="application/json" data-sjs>…</script>` blobs carry FB's
+    # server-rendered Relay payloads (RelayPrefetchedStreamCache). A post
+    # permalink server-renders its Story into one of these rather than firing a
+    # GraphQL XHR, so PostDetail reads the document instead of a response body.
+    _SJS_SCRIPT_RE = re.compile(
+        r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', re.S
+    )
+
+    # Relay keys under which a permalink query delivers its *subject* Story.
+    # A permalink page also embeds neighbour posts (other stories by the same
+    # author / "related" units), so the subject must be distinguished from
+    # those — it's the Story sitting directly under one of these root keys.
+    _PERMALINK_ROOT_KEYS = ("node_v2", "node")
+
+    def _iter_story_nodes(self, obj, parent_key=None):
+        """Yield `(story, parent_key)` for every Comet `Story` node in `obj`.
+
+        `parent_key` is the dict key the Story hangs off — used to spot the
+        permalink's *subject* Story (parent in `_PERMALINK_ROOT_KEYS`) vs.
+        neighbour posts also embedded in the document.
+        """
+        if isinstance(obj, dict):
+            if obj.get("__typename") == "Story":
+                yield obj, parent_key
+            for k, v in obj.items():
+                yield from self._iter_story_nodes(v, k)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from self._iter_story_nodes(v, parent_key)
+
+    def extract_permalink_story(self, html: str, post_id: str) -> dict | None:
+        """Extract a post's Story from a permalink page's server-rendered HTML.
+
+        FB embeds the post as a Comet `Story` node inside a
+        `<script type="application/json">` Relay payload (the subject sits at
+        `data.node_v2` / `data.node`). Returns it wrapped as `{"node": story}`
+        — the same Shape-B entry `parse_timeline_response` produces — so the
+        existing flatteners consume it unchanged.
+
+        Selection handles two wrinkles:
+          - A permalink document embeds *several* Story nodes: the subject plus
+            neighbour posts and nested `comet_sections.content.story` fragments.
+          - `post_id` may be the pfbid form, while the rendered Story always
+            carries the *numeric* id — so an exact id match can't be required.
+
+        Strategy: prefer a Story whose numeric `post_id` matches exactly; else
+        fall back to the Story sitting under a permalink root key (`node_v2` /
+        `node`) — that's the page's subject regardless of id form. Ties broken
+        by richness (most top-level keys = the fully-hydrated node).
+
+        Returns `{"node": story}`, or `None` if no subject Story is found (post
+        deleted, not visible to the account, or shape drift).
+        """
+        target = str(post_id)
+        candidates: list[tuple[dict, bool, int]] = []  # (story, is_root, nkeys)
+        seen_ids: set[int] = set()
+        for blob in self._SJS_SCRIPT_RE.findall(html):
+            if '"__typename":"Story"' not in blob.replace(" ", ""):
+                continue
+            try:
+                payload = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for story, parent_key in self._iter_story_nodes(payload):
+                if "comet_sections" not in story or not story.get("post_id"):
+                    continue
+                if id(story) in seen_ids:
+                    continue
+                seen_ids.add(id(story))
+                candidates.append(
+                    (story, parent_key in self._PERMALINK_ROOT_KEYS, len(story))
+                )
+
+        def _richest(cands: list[tuple[dict, bool, int]]) -> dict:
+            return max(cands, key=lambda c: c[2])[0]
+
+        exact = [c for c in candidates if str(c[0]["post_id"]) == target]
+        if exact:
+            return {"node": _richest(exact)}
+
+        roots = [c for c in candidates if c[1]]
+        if roots:
+            logger.debug(
+                f"[PARSER] permalink post_id={post_id}: no exact id match "
+                f"(pfbid or redirect); using root Story "
+                f"post_id={_richest(roots).get('post_id')}"
+            )
+            return {"node": _richest(roots)}
+
+        logger.warning(
+            f"[PARSER] No subject Story for post_id={post_id} in permalink "
+            f"document ({len(html)} bytes)"
+        )
+        return None
+
     # ----- public flatten API -----
 
     def flatten(
@@ -467,6 +564,17 @@ class FacebookGraphQLParser:
         so future GroupTimeline-only fields (poster's role in the group,
         group_id resolution, etc.) can be added here without polluting the
         UserTimeline flattener.
+        """
+        return self._flatten_pctfrq_post(post)
+
+    def _flatten_postdetail_record(self, post: dict) -> dict | None:
+        """Orchestrator for PostDetail (a single permalink Story).
+
+        `extract_permalink_story` returns the Story wrapped as `{"node": story}`
+        — the same shape `parse_timeline_response` emits for a Shape-B feed
+        entry — so a permalink post flattens identically to a feed post. Kept
+        distinct so PostDetail-only fields can diverge later without touching
+        the timeline flatteners.
         """
         return self._flatten_pctfrq_post(post)
 

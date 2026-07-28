@@ -760,6 +760,71 @@ class FacebookScraper:
         )
         return result
 
+    async def post_detail(
+        self,
+        handle: str,
+        post_id: str,
+        is_group: bool = False,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a single post's content by its permalink (single-shot).
+
+        FB server-renders a post's Comet Story into the permalink document's
+        embedded JSON rather than firing a GraphQL XHR, so this navigates to
+        the permalink and extracts the Story from the rendered document. No
+        pagination, no date filter. Returns a `ScrapingResult` whose `data` is
+        a 1-element list `[{"node": story}]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="PostDetail")` — the
+        same schema as a GroupTimeline / UserTimeline post.
+
+        Args:
+            handle: Vanity handle / numeric id of the group, page, or user that
+                owns the post (drives the navigation URL).
+            post_id: Numeric post id (e.g. `"27209929835285847"`) OR pfbid-form;
+                both resolve via the permalink redirect.
+            is_group: True for group posts (`/groups/<handle>/posts/<post_id>/`);
+                False for page / user posts (`/<handle>/posts/<post_id>/`). FB
+                does not cross-resolve the two surfaces.
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["PostDetail"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[{"node": story}]` on success or `[]`
+            on failure (with `result` carrying the reason, e.g. `parse_error`
+            when the post is deleted / not visible to the account).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+        cleaned_params["is_group"] = is_group
+
+        query = Query(
+            endpoint="PostDetail",
+            mode=mode,
+            query={"handle": handle, "post_id": post_id},
+            params=cleaned_params,
+        )
+
+        logger.debug(
+            f"Submitting PostDetail task (mode={mode}) for "
+            f"{handle}/{post_id} (is_group={is_group})"
+        )
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed PostDetail (mode={mode}) for {handle}/{post_id}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
     async def profile_authenticity(
         self,
         user_id: str,
