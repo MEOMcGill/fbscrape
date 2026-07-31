@@ -39,6 +39,31 @@ def _g(obj, *keys, default=None):
     return obj if obj is not None else default
 
 
+_ABBREVIATED_COUNT_RE = re.compile(
+    r"^([\d,]+(?:\.\d+)?)\s*([KMB]?)", re.IGNORECASE
+)
+_ABBREVIATED_COUNT_MULTIPLIERS = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+
+
+def _parse_abbreviated_count(text) -> int | None:
+    """Parse FB's abbreviated count strings (e.g. "121M followers", "22K",
+    "1 following") into an approximate integer, stripping the trailing
+    word. Returns `None` if `text` doesn't start with a recognizable count.
+
+    FB only ever ships these pre-rounded to 1-3 significant digits — this
+    recovers the order of magnitude for sorting/comparison, not the exact
+    live count (e.g. "121M" becomes exactly 121_000_000, not whatever the
+    real figure is)."""
+    if not isinstance(text, str):
+        return None
+    m = _ABBREVIATED_COUNT_RE.match(text.strip())
+    if not m:
+        return None
+    number = float(m.group(1).replace(",", ""))
+    multiplier = _ABBREVIATED_COUNT_MULTIPLIERS[m.group(2).upper()]
+    return int(round(number * multiplier))
+
+
 def _resolve_story(post: dict) -> dict | None:
     """Walk a raw post dict to its canonical Story node.
 
@@ -892,11 +917,12 @@ class FacebookGraphQLParser:
         Comet profile-header shape, shared by User and Page surfaces. Returns
         a single-row dict; None on shape mismatch (no `id` field).
 
-        Follower count (`profile_social_context`) only ships as an
-        FB-formatted abbreviated string (e.g. "121M followers") — FB doesn't
-        expose an exact integer on this surface, so `follower_count_text` is
-        the raw string; parsing it into a number is left to downstream
-        consumers.
+        Follower/following counts (`profile_social_context`) only ship as
+        FB-formatted abbreviated strings (e.g. "121M followers") — FB
+        doesn't expose an exact integer on this surface, so `follower_count`
+        / `following_count` are parsed via `_parse_abbreviated_count` into
+        an approximate integer (e.g. "121M" -> 121_000_000) for sorting/
+        comparison; treat as order-of-magnitude, not exact.
 
         Intro-card fields (`profile_intro_card.context_items`) are dispatched
         by `profile_field_type`, mirroring
@@ -967,9 +993,9 @@ class FacebookGraphQLParser:
             "is_verified": bool(record.get("show_verified_badge_on_profile")),
             "is_viewer_friend": record.get("is_viewer_friend"),
             "is_memorialized": bool(record.get("is_visibly_memorialized")),
-            "follower_count_text": follower_text,
+            "follower_count": _parse_abbreviated_count(follower_text),
             "followers_url": follower_uri,
-            "following_count_text": following_text,
+            "following_count": _parse_abbreviated_count(following_text),
             "bio": bio,
             "category": _g(category, "short_title", "text"),
             "intro_card_fields": intro_card_fields,

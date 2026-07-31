@@ -16,7 +16,7 @@ FIXTURE_NAME = "profile_about"
 EXPECTED_KEYS = {
     "profile_id", "name", "url", "gender", "username_for_profile",
     "is_verified", "is_viewer_friend", "is_memorialized",
-    "follower_count_text", "followers_url", "following_count_text", "bio",
+    "follower_count", "followers_url", "following_count", "bio",
     "category", "intro_card_fields",
     "cover_photo_url", "profile_picture_url",
     "phone", "email", "messenger_url",
@@ -52,7 +52,8 @@ def test_includes_profile_info_fields(record):
     flat = PARSER.flatten(record, "ProfileAbout")
     assert flat["profile_id"]
     assert flat["name"]
-    assert flat["follower_count_text"]
+    assert flat["follower_count"] == 22_000
+    assert flat["following_count"] == 1
 
 
 def test_contact_info_dispatched(record):

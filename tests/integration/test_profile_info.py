@@ -18,4 +18,4 @@ async def test_profile_info_zuck(fb_scraper):
     flat = parser.flatten(result.data[0], "ProfileInfo")
     assert flat is not None
     assert flat["name"]
-    assert flat["follower_count_text"]
+    assert flat["follower_count"]

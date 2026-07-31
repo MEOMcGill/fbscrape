@@ -14,7 +14,7 @@ FIXTURE_NAME = "profile_info"
 EXPECTED_KEYS = {
     "profile_id", "name", "url", "gender", "username_for_profile",
     "is_verified", "is_viewer_friend", "is_memorialized",
-    "follower_count_text", "followers_url", "following_count_text", "bio",
+    "follower_count", "followers_url", "following_count", "bio",
     "category", "intro_card_fields",
     "cover_photo_url", "profile_picture_url",
 }
@@ -50,12 +50,12 @@ def test_name_populated(record):
     assert flat["name"], "zuck's profile should have a name field"
 
 
-def test_follower_count_text_populated(record):
+def test_follower_count_populated(record):
     """Follower count only ships as an FB-formatted abbreviated string
-    (e.g. '121M followers') — never an exact integer on this surface."""
+    (e.g. '121M followers') — parsed into an approximate int for
+    sorting/comparison, never an exact integer on this surface."""
     flat = PARSER.flatten(record, "ProfileInfo")
-    assert flat["follower_count_text"]
-    assert "follower" in flat["follower_count_text"].lower()
+    assert flat["follower_count"] == 121_000_000
 
 
 def test_bio_populated(record):
@@ -92,9 +92,9 @@ def test_missing_social_context_does_not_crash(record):
 
     flat = PARSER.flatten(stripped, "ProfileInfo")
     assert flat is not None
-    assert flat["follower_count_text"] is None
+    assert flat["follower_count"] is None
     assert flat["followers_url"] is None
-    assert flat["following_count_text"] is None
+    assert flat["following_count"] is None
 
 
 def test_intro_card_fields_is_list(record):
