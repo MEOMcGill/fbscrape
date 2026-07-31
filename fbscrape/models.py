@@ -206,6 +206,70 @@ class Query:
                 },
             },
         },
+        "ProfileInfo": {
+            # Caller supplies the profile's vanity `handle` (or numeric id;
+            # both resolve via /<handle>/). Like PostDetail, there is NO
+            # GraphQL replay: FB server-renders the profile header (name,
+            # follower count, cover photo, verified badge, intro-card
+            # fields) into the document's embedded JSON
+            # (`profile_header_renderer.user`), so the scrape reads the
+            # document directly. Single-shot, no pagination.
+            "query_required": ["handle"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        "post_nav_sleep_seconds": 3.0,
+                        # Max seconds to wait after navigation for the
+                        # server-rendered profile header blob to settle
+                        # before reading the document.
+                        "document_wait_seconds": 4.0,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
+        "ProfileAbout": {
+            # Caller supplies the profile's vanity `handle` (or numeric id).
+            # Like ProfileInfo, there is NO GraphQL replay — FB server-renders
+            # everything into embedded JSON — but unlike ProfileInfo this is
+            # NOT single-navigation: only the profile's header (name,
+            # follower count, bio, category — same fields ProfileInfo
+            # returns, folded into this record too since navigating to the
+            # About landing page already renders them for free) plus a
+            # directory of About sub-tab URLs come from one navigation
+            # (`/<handle>/about/`); each requested sub-tab's actual fields
+            # (contact info, address/hours, links, ...) only populate when
+            # THAT specific sub-tab is navigated to directly — FB doesn't
+            # server-render them all together. So this endpoint does one
+            # landing navigation + one navigation per requested section.
+            #
+            # Section availability varies a lot by account: pages typically
+            # expose contact_info/basic_info/links; personal profiles more
+            # often expose personal_details/work/education instead. A
+            # requested section absent from the discovered directory is
+            # skipped, not an error.
+            "query_required": ["handle"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        # Sub-tab keys to fetch, matched against the
+                        # directory discovered on the About landing page
+                        # (`all_collections`). Default picks the 3
+                        # empirically highest-value Page sections; override
+                        # per call for personal-profile-shaped accounts
+                        # (e.g. "directory_work", "directory_education").
+                        "sections": (
+                            "directory_contact_info",
+                            "directory_basic_info",
+                            "directory_links",
+                        ),
+                        "post_nav_sleep_seconds": 3.0,
+                        "document_wait_seconds": 4.0,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
         "CommentsList": {
             # Caller supplies the parent post's `handle` (vanity handle of the
             # author / page that owns the post — needed for the navigation URL)

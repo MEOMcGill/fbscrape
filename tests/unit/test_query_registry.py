@@ -21,6 +21,8 @@ ALL_PAIRS = [
     ("PageTransparency",    "hybrid", {"page_id": "20531316728"}),
     ("ProfileAuthenticity", "hybrid", {"user_id": "100044331674441"}),
     ("PostDetail",          "hybrid", {"handle": "albertansunitedtostoptheucp", "post_id": "27209929835285847"}),
+    ("ProfileInfo",         "hybrid", {"handle": "zuck"}),
+    ("ProfileAbout",        "hybrid", {"handle": "61582991935083"}),
 ]
 
 
@@ -187,4 +189,6 @@ def test_endpoint_registry_top_level_keys_pinned():
         "PageTransparency",
         "ProfileAuthenticity",
         "PostDetail",
+        "ProfileInfo",
+        "ProfileAbout",
     }

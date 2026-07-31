@@ -1660,6 +1660,41 @@ def _resolve_profile_authenticity_targets(
     return targets
 
 
+def _resolve_handle_targets(
+    handles: tuple[str, ...], input_file: str | None,
+) -> list[dict]:
+    """Resolve handle targets from CLI flags or --input-file.
+
+    Positional args are accepted as bare handles (vanity or numeric id). The
+    file form expects a `handle` column and is mutually exclusive with
+    positional args. Shared by any endpoint whose only target key is a
+    profile handle (ProfileInfo, ProfileAbout).
+    """
+    if handles and input_file:
+        raise click.UsageError(
+            "Cannot use both positional handle args and --input-file."
+        )
+    if not handles and not input_file:
+        raise click.UsageError(
+            "Must provide either positional handle args or --input-file."
+        )
+
+    if input_file:
+        return _load_scrape_targets(
+            input_file,
+            key_field='handle',
+            extra_keys=(),
+        )
+
+    targets = []
+    for s in handles:
+        s = s.strip()
+        if not s:
+            raise click.UsageError("Empty handle positional arg.")
+        targets.append({'handle': s})
+    return targets
+
+
 def _resolve_handle_pair_targets(
     pairs: tuple[str, ...], input_file: str | None, paired_key: str,
 ) -> list[dict]:
@@ -2433,6 +2468,209 @@ def scrape_profile_authenticity(
 
                 ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
                 filename = f"{user_id}_profileauthenticity_{ts}.jsonl"
+                data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
+@scrape.command(name='profile-info')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read handle rows from a CSV, Parquet, YAML, or '
+                   'JSON/JSONL file with a `handle` column.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/profile_info/)')
+@click.option('--max-sessions', default=5, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the profile (default 3)')
+@click.option('--document-wait-seconds', type=float, default=None,
+              help='extra settle time before reading the rendered document, '
+                   'so the server-rendered header blob is present (default 4)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_profile_info(
+    ctx, handles, input_file, output_dir, max_sessions, scroll_threshold,
+    headless, mobile, log_level, post_nav_sleep_seconds,
+    document_wait_seconds, operation_timeout_seconds, wait_for_account,
+):
+    """Fetch a profile's header info (hybrid mode only).
+
+    \b
+    Single-shot — no pagination, no date range. Each target is a vanity
+    handle or numeric id. FB server-renders the profile header (name,
+    follower count, cover photo, verified badge, intro-card fields) into
+    the profile page's embedded JSON, so there is no GraphQL replay — the
+    header is read from the rendered page.
+
+    \b
+    Examples:
+      fbscrape scrape profile-info zuck
+      fbscrape scrape profile-info zuck 100044331674441 --headless
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    a `handle` column:
+      fbscrape scrape profile-info --input-file profiles.csv
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_handle_targets(handles, input_file)
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "profile_info")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "document_wait_seconds": document_wait_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.profile_info(
+                    handle=t['handle'],
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = f"{handle}_profileinfo_{ts}.jsonl"
+                data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
+@scrape.command(name='profile-about')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read handle rows from a CSV, Parquet, YAML, or '
+                   'JSON/JSONL file with a `handle` column.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/profile_about/)')
+@click.option('--section', 'sections', multiple=True, default=None,
+              help='About sub-tab key to fetch (repeatable). A key absent '
+                   "from the account's own directory is skipped, not an "
+                   'error. Default: directory_contact_info, '
+                   'directory_basic_info, directory_links. Other observed '
+                   'keys: directory_intro, directory_category, '
+                   'directory_personal_details, directory_work, '
+                   'directory_education, directory_privacy_and_legal_info.')
+@click.option('--max-sessions', default=5, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after each navigation, landing + per-section (default 3)')
+@click.option('--document-wait-seconds', type=float, default=None,
+              help='extra settle time before reading each rendered document '
+                   '(default 4)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_profile_about(
+    ctx, handles, input_file, output_dir, sections, max_sessions,
+    scroll_threshold, headless, mobile, log_level, post_nav_sleep_seconds,
+    document_wait_seconds, operation_timeout_seconds, wait_for_account,
+):
+    """Fetch a profile's About page — header plus requested About sections
+    (hybrid mode only).
+
+    \b
+    Not single-navigation like profile-info: FB only server-renders a
+    sub-tab's fields when that sub-tab is navigated to directly, so this
+    does one landing navigation (which also renders the profile header for
+    free) plus one navigation per requested section. Coverage varies a lot
+    by account — Pages typically expose contact/basic-info/links; personal
+    profiles more often expose work/education/personal-details instead.
+
+    \b
+    Examples:
+      fbscrape scrape profile-about 61582991935083 --headless
+      fbscrape scrape profile-about zuck --section directory_work --section directory_education
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    a `handle` column:
+      fbscrape scrape profile-about --input-file profiles.csv
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_handle_targets(handles, input_file)
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "profile_about")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "sections": tuple(sections) if sections else None,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "document_wait_seconds": document_wait_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.profile_about(
+                    handle=t['handle'],
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = f"{handle}_profileabout_{ts}.jsonl"
                 data.save(os.path.join(output_dir, filename))
 
     run_async(_scrape())

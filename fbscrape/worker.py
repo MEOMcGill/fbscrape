@@ -50,6 +50,8 @@ class Worker:
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
         ("PostDetail", "hybrid"): "post_detail_hybrid",
+        ("ProfileInfo", "hybrid"): "profile_info_hybrid",
+        ("ProfileAbout", "hybrid"): "profile_about_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
     }
 
