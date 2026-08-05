@@ -1,0 +1,2195 @@
+{
+  "query": {
+    "endpoint": "GroupAbout",
+    "mode": "hybrid",
+    "query": {
+      "handle": "albertaseparatism"
+    },
+    "params": {
+      "post_nav_sleep_seconds": 3.0,
+      "document_wait_seconds": 4.0,
+      "operation_timeout_seconds": 120
+    }
+  },
+  "result": "success",
+  "data": [
+    {
+      "group": {
+        "id": "787909081545196",
+        "has_membership_questions": false,
+        "featurable_title": {
+          "delight_ranges": [],
+          "image_ranges": [],
+          "inline_style_ranges": [],
+          "aggregated_ranges": [],
+          "ranges": [
+            {
+              "entity": {
+                "__typename": "Group",
+                "__isEntity": "Group",
+                "__isActor": "Group",
+                "id": "787909081545196",
+                "url": "https://www.facebook.com/groups/albertaseparatism/",
+                "profile_url": "https://www.facebook.com/groups/albertaseparatism/",
+                "work_foreign_entity_info": null,
+                "is_multi_company_group": false,
+                "work_official_status": "UNOFFICIAL",
+                "mobileUrl": "https://m.facebook.com/groups/albertaseparatism/",
+                "__isNode": "Group"
+              },
+              "entity_is_weak_reference": false,
+              "length": 20,
+              "offset": 0
+            }
+          ],
+          "color_ranges": [],
+          "text": "Alberta Independence"
+        },
+        "group_content_views": {
+          "edges": [
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "About",
+                "content_view_type": "ABOUT",
+                "content_view_uri": "/groups/albertaseparatism/about/",
+                "is_default_selected_content_view": false
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "Discussion",
+                "content_view_type": "POSTS",
+                "content_view_uri": null,
+                "is_default_selected_content_view": true
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "Featured",
+                "content_view_type": "ANNOUNCEMENTS",
+                "content_view_uri": "/groups/albertaseparatism/announcements/",
+                "is_default_selected_content_view": false
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "People",
+                "content_view_type": "INFO",
+                "content_view_uri": "/groups/albertaseparatism/members/",
+                "is_default_selected_content_view": false
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "Events",
+                "content_view_type": "EVENTS",
+                "content_view_uri": "/groups/albertaseparatism/events/",
+                "is_default_selected_content_view": false
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "Media",
+                "content_view_type": "PHOTOS",
+                "content_view_uri": "/groups/albertaseparatism/media/",
+                "is_default_selected_content_view": false
+              }
+            },
+            {
+              "__typename": "GroupContentViewsEdge",
+              "node": {
+                "content_view_title": "Files",
+                "content_view_type": "FILES",
+                "content_view_uri": "/groups/albertaseparatism/files/files/",
+                "is_default_selected_content_view": false
+              }
+            }
+          ]
+        },
+        "if_viewer_can_see_expanded_color": {
+          "group_theme_color": {
+            "hexcolor": "FF1877F2"
+          },
+          "group_secondary_theme_color": {
+            "hexcolor": "FFE8EAFD"
+          },
+          "group_wash_theme_color": {
+            "hexcolor": "FFE9EAF4"
+          },
+          "__module_operation_GroupsCometColorWrapper_group_canSeeExpandedColor": {
+            "__dr": "GroupsCometColorExpandedWrapper_group$normalization.graphql"
+          },
+          "__module_component_GroupsCometColorWrapper_group_canSeeExpandedColor": {
+            "__dr": "GroupsCometColorExpandedWrapper.react"
+          },
+          "id": "787909081545196"
+        },
+        "if_viewer_cannot_see_expanded_color": null,
+        "cover_renderer": {
+          "__typename": "GroupsCometCoverPhotoRenderer",
+          "cover_photo_content": {
+            "focus": {
+              "x": 0.5,
+              "y": 0.39122486288848
+            },
+            "photo": {
+              "viewer_image": {
+                "height": 1024,
+                "width": 1536
+              },
+              "image": {
+                "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-6/621349362_122141250092969788_8941822914494104051_n.jpg?stp=dst-jpg_tt6&cstp=mx1536x1024&ctp=s720x720&_nc_cat=107&ccb=1-7&_nc_sid=2285d6&_nc_ohc=BmIAbszik1YQ7kNvwF3uUDM&_nc_oc=AdpSle02P1vSuQNTVz4vnpWOUylTynGM8cIywMa7WAA0l1A9b_mXPIHmbQcs8nxsKUs&_nc_zt=23&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQFjCXYuOFB5lk_u7aV4bvZ2cMT0_AB04yIrU6Tag41W5g&oe=6A79064D",
+                "width": 720,
+                "height": 480
+              },
+              "owner": {
+                "__typename": "User",
+                "id": "61579093640614"
+              },
+              "blurred_image": {
+                "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-6/621349362_122141250092969788_8941822914494104051_n.jpg?stp=dst-jpg_fb50_s320x320_tt6&_nc_cat=107&ccb=1-7&_nc_sid=2285d6&_nc_ohc=BmIAbszik1YQ7kNvwF3uUDM&_nc_oc=AdpSle02P1vSuQNTVz4vnpWOUylTynGM8cIywMa7WAA0l1A9b_mXPIHmbQcs8nxsKUs&_nc_zt=23&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQHPWf51rc2BbRd5-KH8XimUrGuhWvtsy3IZrY8KaDoRVA&oe=6A79064D",
+                "width": 320,
+                "height": 213
+              },
+              "url": "https://www.facebook.com/photo/?fbid=122141250086969788&set=p.122141250086969788",
+              "id": "122141250086969788"
+            }
+          },
+          "should_use_compressed_default_cover_photo": false,
+          "__module_operation_GroupsCometCover_group": {
+            "__dr": "GroupsCometCoverPhotoRenderer_coverRenderer$normalization.graphql"
+          },
+          "__module_component_GroupsCometCover_group": {
+            "__dr": "GroupsCometCoverPhotoRenderer.react"
+          }
+        },
+        "if_viewer_can_change_cover_photo": null,
+        "if_viewer_can_see_affiliation": null,
+        "photo_uploader": null,
+        "join_restriction_reason": null,
+        "privacy_info": {
+          "icon_name": "globe-americas",
+          "title": {
+            "delight_ranges": [],
+            "image_ranges": [],
+            "inline_style_ranges": [],
+            "aggregated_ranges": [],
+            "ranges": [],
+            "color_ranges": [],
+            "text": "Public group"
+          }
+        },
+        "group_member_profiles": {
+          "formatted_count_text": "120.4K members"
+        },
+        "if_viewer_can_see_group_streaks": null,
+        "if_viewer_can_see_wayfinding_topics": null,
+        "group_pending_action_card_renderer": null,
+        "__isProfile": "Group",
+        "name": "Alberta Independence",
+        "profile_picture_for_sticky_bar": {
+          "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-6/621349362_122141250092969788_8941822914494104051_n.jpg?stp=c256.0.1024.1024a_cp0_dst-jpg_tt6&cstp=mx1024x1024&ctp=s50x50&_nc_cat=107&ccb=1-7&_nc_sid=33e84f&_nc_ohc=BmIAbszik1YQ7kNvwF3uUDM&_nc_oc=AdpSle02P1vSuQNTVz4vnpWOUylTynGM8cIywMa7WAA0l1A9b_mXPIHmbQcs8nxsKUs&_nc_zt=23&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQHfkGnN-PC7T8GDdGXizuUXELbbgVACAI4rD9jRTW787A&oe=6A79064D"
+        },
+        "__isEntity": "Group",
+        "__typename": "Group",
+        "url": "https://www.facebook.com/groups/albertaseparatism/",
+        "if_viewer_can_see_friends_participation_requests_entry_point": null,
+        "if_viewer_can_see_warning_received": null,
+        "group_type_name_for_content": "GROUP",
+        "if_viewer_can_see_viewer_content": {
+          "if_viewer_can_see_viewer_content": {
+            "id": "787909081545196",
+            "viewer_content": {
+              "default_content_type": "PENDING"
+            },
+            "if_viewer_can_see_warning_received": null,
+            "__module_operation_GroupsCometYourContentMenuItem_group": {
+              "__dr": "GroupsCometYourContentMenuItemItem_group$normalization.graphql"
+            },
+            "__module_component_GroupsCometYourContentMenuItem_group": {
+              "__dr": "GroupsCometYourContentMenuItemItem.react"
+            }
+          },
+          "__module_operation_useGroupsCometMoreActionMenu_group__if_viewer_can_see_viewer_content": {
+            "__dr": "GroupsCometYourContentMenuItem_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometMoreActionMenu_group__if_viewer_can_see_viewer_content": {
+            "__dr": "GroupsCometYourContentMenuItem.react"
+          },
+          "id": "787909081545196"
+        },
+        "if_viewer_can_freeze": null,
+        "if_viewer_can_pin_group": null,
+        "if_viewer_can_see_report_group_frx": {
+          "id": "787909081545196",
+          "legal_reporting_cta_type": null,
+          "legal_reporting_uri": null,
+          "__module_operation_useGroupsCometMoreActionMenu_group__if_viewer_can_see_report_group_frx": {
+            "__dr": "GroupsCometReportActionMenuItem_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometMoreActionMenu_group__if_viewer_can_see_report_group_frx": {
+            "__dr": "GroupsCometReportActionMenuItem.react"
+          }
+        },
+        "if_viewer_cannot_approve_posts": {
+          "id": "787909081545196",
+          "if_viewer_cannot_see_viewer_content": null,
+          "__module_operation_useGroupsCometMoreActionMenu_group__if_viewer_cannot_approve_posts": {
+            "__dr": "GroupsCometMemberPendingPostsMenuItem_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometMoreActionMenu_group__if_viewer_cannot_approve_posts": {
+            "__dr": "GroupsCometMemberPendingPostsMenuItem.react"
+          }
+        },
+        "if_can_share_group": {
+          "id": "787909081545196",
+          "group_type_name_for_content": "GROUP",
+          "__isEntity": "Group",
+          "url": "https://www.facebook.com/groups/albertaseparatism/",
+          "__isNode": "Group",
+          "feature_intervention": null,
+          "__module_operation_useGroupsCometMoreActionMenu_group__if_can_share_group": {
+            "__dr": "GroupsCometShareGroupMenuItem_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometMoreActionMenu_group__if_can_share_group": {
+            "__dr": "GroupsCometShareGroupMenuItem.react"
+          },
+          "__module_operation_useGroupsCometShareGroupMenuItem_group__if_can_share_group": {
+            "__dr": "GroupCometHeaderShareGroupButtonMenu_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometShareGroupMenuItem_group__if_can_share_group": {
+            "__dr": "GroupCometHeaderShareGroupButtonMenu.react"
+          }
+        },
+        "if_viewer_cannot_see_persistent_joined_status": {
+          "__typename": "Group",
+          "id": "787909081545196"
+        },
+        "cancel_join_request_action": null,
+        "leave_action": null,
+        "if_viewer_can_manage_notifications": null,
+        "if_viewer_can_change_follow_setting": null,
+        "if_viewer_can_see_share_invite_link": null,
+        "if_viewer_can_approve_members": null,
+        "if_viewer_can_see_promote_group_entrypoint_comet": null,
+        "entity_status_entrypoint": {
+          "if_viewer_can_see_group_status_persistent_entrypoints": null
+        },
+        "viewer_join_state": "CAN_JOIN",
+        "if_viewer_can_search_content": {
+          "id": "787909081545196",
+          "__module_operation_useGroupsCometSearchControl_group__if_viewer_can_search_content": {
+            "__dr": "GroupsCometActionControlSearch_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometSearchControl_group__if_viewer_can_search_content": {
+            "__dr": "GroupsCometActionControlSearch.react"
+          }
+        },
+        "if_viewer_can_see_members_facepile_in_entity_header": null,
+        "should_show_comet_share_button": true,
+        "feature_intervention": null,
+        "invite_button_action": null,
+        "default_actor": {
+          "__typename": "User",
+          "id": "61554390988822"
+        },
+        "if_viewer_can_see_sticky_composer": null,
+        "if_viewer_can_see_persistent_joined_status": null,
+        "viewer_forum_join_state": "CAN_JOIN",
+        "viewer_invite_to_group": null,
+        "invite_link": null,
+        "join_action": {
+          "__typename": "GroupJoinForumAction",
+          "group": {
+            "id": "787909081545196",
+            "name": "Alberta Independence",
+            "action_intervention_view_model": null,
+            "feature_intervention": null,
+            "if_viewer_can_request_to_participate_on_join_in_forum": {
+              "__typename": "Group",
+              "id": "787909081545196"
+            },
+            "if_viewer_can_see_join_with_blocked_admin_interstitial": {
+              "has_viewer_blocked_admin": false,
+              "id": "787909081545196"
+            }
+          },
+          "__module_operation_useGroupsCometJoinActionButton_group_join_action": {
+            "__dr": "GroupsCometJoinForumButton_action$normalization.graphql"
+          },
+          "__module_component_useGroupsCometJoinActionButton_group_join_action": {
+            "__dr": "GroupsCometJoinForumButton.react"
+          }
+        },
+        "group_address": "albertaseparatism",
+        "if_viewer_should_see_auto_open_recommendations_unit": null,
+        "if_viewer_can_see_rec_affordance_control": null,
+        "if_viewer_cannot_change_cover_photo": {
+          "profile_picture_120": {
+            "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-6/621349362_122141250092969788_8941822914494104051_n.jpg?stp=c256.0.1024.1024a_dst-jpg_tt6&cstp=mx1024x1024&ctp=s168x128&_nc_cat=107&ccb=1-7&_nc_sid=33e84f&_nc_ohc=BmIAbszik1YQ7kNvwF3uUDM&_nc_oc=AdpSle02P1vSuQNTVz4vnpWOUylTynGM8cIywMa7WAA0l1A9b_mXPIHmbQcs8nxsKUs&_nc_zt=23&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQFEc2u7BD0LLlnwpuhkd3e6c0ptl2PxPV31TC9eGLGwIA&oe=6A79064D"
+          },
+          "cover_photo": {
+            "photo": {
+              "image": {
+                "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-6/621349362_122141250092969788_8941822914494104051_n.jpg?stp=dst-jpg_tt6&cstp=mx1536x1024&ctp=s960x960&_nc_cat=107&ccb=1-7&_nc_sid=2285d6&_nc_ohc=BmIAbszik1YQ7kNvwF3uUDM&_nc_oc=AdpSle02P1vSuQNTVz4vnpWOUylTynGM8cIywMa7WAA0l1A9b_mXPIHmbQcs8nxsKUs&_nc_zt=23&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQFjCXYuOFB5lk_u7aV4bvZ2cMT0_AB04yIrU6Tag41W5g&oe=6A79064D"
+              },
+              "url": "https://www.facebook.com/photo/?fbid=122141250086969788&set=p.122141250086969788",
+              "viewer_image": {
+                "height": 1024,
+                "width": 1536
+              },
+              "id": "122141250086969788"
+            }
+          },
+          "__module_operation_useGroupsCometSmallCoverPhoto_group__if_viewer_cannot_change_cover_photo": {
+            "__dr": "GroupsCometHeaderSmallNonEditableCoverPhoto_group$normalization.graphql"
+          },
+          "__module_component_useGroupsCometSmallCoverPhoto_group__if_viewer_cannot_change_cover_photo": {
+            "__dr": "GroupsCometHeaderSmallNonEditableCoverPhoto.react"
+          },
+          "id": "787909081545196"
+        },
+        "leaders_engagement_logging_settings": {
+          "comet_surface_mappings": [
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MALL",
+              "trace_policy": "comet.group"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "REPORTED_CONTENT",
+              "trace_policy": "comet.group.member_reported_content"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "PENDING_MEMBERS",
+              "trace_policy": "comet.group.member_requests"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "PENDING_PARTICIPANTS",
+              "trace_policy": "comet.group.participant_requests"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_MAIN",
+              "trace_policy": "comet.group.members"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_ADMIN",
+              "trace_policy": "comet.group.members.admins"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_BLOCKED",
+              "trace_policy": "comet.group.members.blocked"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_FRIEND_SUB",
+              "trace_policy": "comet.group.members.friends"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_INVITED",
+              "trace_policy": "comet.group.members.invited"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "ADMIN_ACITIVITIES",
+              "trace_policy": "comet.groups.admin_activities"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "DRAFT_POSTS",
+              "trace_policy": "comet.groups.draft_posts"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+              "trace_policy": "comet.groups.insights.engagement"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_MEMBER",
+              "trace_policy": "comet.groups.insights.membership"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+              "trace_policy": "comet.groups.insights.growth"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_ADMINS",
+              "trace_policy": "comet.groups.insights.admins"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_EXPERTS",
+              "trace_policy": "comet.groups.insights.experts"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_INSIGHTS_LEARNING",
+              "trace_policy": "comet.groups.insights.learning"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "KEYWORD_ALERT",
+              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_PREAPPROVED",
+              "trace_policy": "comet.groups.members.preapproved"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MEMBER_LIST_UNAVAILABLE",
+              "trace_policy": "comet.groups.members.unavailable"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_QUESTIONS_EDIT",
+              "trace_policy": "comet.groups.membership-questions"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "FORUM_QUESTIONS_EDIT",
+              "trace_policy": "comet.groups.participation-questions"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "PENDING_POSTS",
+              "trace_policy": "comet.groups.pending_posts"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_RULES_EDIT",
+              "trace_policy": "comet.groups.rules"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "SCHEDULED_POSTS",
+              "trace_policy": "comet.groups.scheduled_posts"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_SETTINGS",
+              "trace_policy": "comet.groups.settings"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "MODMIN_REVIEW_FOLDER",
+              "trace_policy": "comet.group.spam"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "GROUP_OVERVIEW",
+              "trace_policy": "comet.groups.overview"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+              "surface": "ROLES_MANAGEMENT",
+              "trace_policy": "comet.groups.roles_management"
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+              "surface": "CONTENT_TEMPLATES",
+              "prefixes": [
+                "comet.groups.automated_template"
+              ]
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+              "surface": "GROUP_UNKNOWN",
+              "prefixes": [
+                "comet.group"
+              ]
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+              "surface": "PROFILE",
+              "prefixes": [
+                "comet.profile"
+              ]
+            },
+            {
+              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+              "surface": "NOTIFICATION",
+              "prefixes": [
+                "comet.app",
+                "comet.notifications"
+              ]
+            }
+          ]
+        }
+      },
+      "cards": [
+        {
+          "__typename": "GroupsAboutFeedAboutCardUnit",
+          "group": {
+            "description_with_entities": {
+              "text": "Alberta Independence is a movement that advocates the secession of the province of Alberta from Canada by forming an independent and sovereign country .  https://albertaprosperityproject.com"
+            },
+            "about_info_items": [
+              {
+                "__typename": "XFBPrivacyGroupsAboutInfoItem",
+                "group": {
+                  "privacy_info": {
+                    "label": {
+                      "delight_ranges": [],
+                      "image_ranges": [],
+                      "inline_style_ranges": [],
+                      "aggregated_ranges": [],
+                      "ranges": [],
+                      "color_ranges": [],
+                      "text": "Public"
+                    },
+                    "description": {
+                      "delight_ranges": [],
+                      "image_ranges": [],
+                      "inline_style_ranges": [],
+                      "aggregated_ranges": [],
+                      "ranges": [],
+                      "color_ranges": [],
+                      "text": "Anyone can see who's in the group and what they post."
+                    },
+                    "icon_name": "globe-americas"
+                  },
+                  "id": "787909081545196"
+                },
+                "__module_operation_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometPrivacyAboutInfoItem_aboutInfoItem$normalization.graphql"
+                },
+                "__module_component_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometPrivacyAboutInfoItem.react"
+                }
+              },
+              {
+                "__typename": "XFBDiscoverabilityGroupsAboutInfoItem",
+                "group": {
+                  "discoverability_info": {
+                    "label": {
+                      "delight_ranges": [],
+                      "image_ranges": [],
+                      "inline_style_ranges": [],
+                      "aggregated_ranges": [],
+                      "ranges": [],
+                      "color_ranges": [],
+                      "text": "Visible"
+                    },
+                    "description": {
+                      "delight_ranges": [],
+                      "image_ranges": [],
+                      "inline_style_ranges": [],
+                      "aggregated_ranges": [],
+                      "ranges": [],
+                      "color_ranges": [],
+                      "text": "Anyone can find this group."
+                    },
+                    "icon_name": "eye"
+                  },
+                  "id": "787909081545196"
+                },
+                "__module_operation_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometDiscoverabilityAboutInfoItem_aboutInfoItem$normalization.graphql"
+                },
+                "__module_component_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometDiscoverabilityAboutInfoItem.react"
+                }
+              },
+              {
+                "__typename": "XFBHistoryGroupsAboutInfoItem",
+                "title": {
+                  "delight_ranges": [],
+                  "image_ranges": [],
+                  "inline_style_ranges": [],
+                  "aggregated_ranges": [],
+                  "ranges": [],
+                  "color_ranges": [],
+                  "text": "History"
+                },
+                "group": {
+                  "id": "787909081545196",
+                  "group_history": {
+                    "create_time": 1544366840,
+                    "group_history_summary": {
+                      "text": "Group created on 9 December 2018. Name last changed on 16 December 2022."
+                    }
+                  }
+                },
+                "__module_operation_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometHistoryAboutInfoItem_aboutInfoItem$normalization.graphql"
+                },
+                "__module_component_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometHistoryAboutInfoItem.react"
+                }
+              },
+              {
+                "__typename": "XFBLocationGroupsAboutInfoItem",
+                "group": {
+                  "group_locations": [
+                    {
+                      "id": "111983945494775",
+                      "name": "Calgary, Alberta"
+                    }
+                  ],
+                  "id": "787909081545196"
+                },
+                "__module_operation_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometLocationAboutInfoItem_aboutInfoItem$normalization.graphql"
+                },
+                "__module_component_GroupsCometAboutInfoItems_group": {
+                  "__dr": "GroupsCometLocationAboutInfoItem.react"
+                }
+              }
+            ],
+            "if_viewer_can_view_description": {
+              "description_with_entities": {
+                "delight_ranges": [],
+                "image_ranges": [],
+                "inline_style_ranges": [],
+                "aggregated_ranges": [],
+                "ranges": [
+                  {
+                    "entity": {
+                      "__typename": "ExternalUrl",
+                      "__isEntity": "ExternalUrl",
+                      "url": "https://l.facebook.com/l.php?u=https%3A%2F%2Falbertaprosperityproject.com%2F&h=AUA3IB5tPOKEQexv1nntTPWeWq_3r_EhaxqVr0T3PYFcBW3yG2an0uYyPpgP-PQ0OYdd2Br9cbm74fVr5ySg8FSqTCMfUZdzjPGSfNml-jJ8m5dSNRLW1JINhVBL&s=1",
+                      "external_url": "https://albertaprosperityproject.com/",
+                      "__isWebLinkable": "ExternalUrl",
+                      "web_link": {
+                        "__typename": "ExternalWebLink",
+                        "url": "https://albertaprosperityproject.com/",
+                        "fbclid": "IwZXh0bgNhZW0CMTEAYnJpZBExUk9LRXVoUWJJclBab0tJT3NydGMGYXBwX2lkEDIyMjAzOTE3ODgyMDA4OTIAAR6Gv01vDONnpzcc7WGu8bH5SH87GWWMPCWOC5o6GLswNoevFrTAYjnPTibf1w_aem_aNcs9Ip7PqECMZosGEBnfw",
+                        "lynx_mode": "ASYNCLAZY"
+                      },
+                      "mobileUrl": "https://lm.facebook.com/l.php?u=https%3A%2F%2Falbertaprosperityproject.com%2F&h=AUAbJKP7TD8mi7dGeb7kbdy83YWj9WpM0laNPxQe8MR7yAuefwFs-mv-2E76SkwNA9NKMYLwyEOjAjh6c9jhsCN1kNkLLewo4H4VIbq1L69WXwsyVN6Uz_mU318S&s=1",
+                      "__isNode": "ExternalUrl",
+                      "id": "NjQyMTgzOTU5MjA4MTA3Omh0dHBzXGEvL2FsYmVydGFwcm9zcGVyaXR5cHJvamVjdC5jb20vOjo6Ojo6"
+                    },
+                    "entity_is_weak_reference": false,
+                    "length": 36,
+                    "offset": 154
+                  }
+                ],
+                "color_ranges": [],
+                "text": "Alberta Independence is a movement that advocates the secession of the province of Alberta from Canada by forming an independent and sovereign country .  https://albertaprosperityproject.com"
+              },
+              "id": "787909081545196"
+            },
+            "__isProfile": "Group",
+            "transparency_inform": null,
+            "id": "787909081545196"
+          },
+          "__module_operation_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedAboutCardUnit_unit$normalization.graphql"
+          },
+          "__module_component_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedAboutCardUnit.react"
+          }
+        },
+        {
+          "__typename": "GroupsAboutFeedMembersCardUnit",
+          "group": {
+            "group_member_profiles": {
+              "formatted_count_text": "120.4K"
+            },
+            "id": "787909081545196",
+            "if_viewer_can_see_content": {
+              "id": "787909081545196"
+            },
+            "if_viewer_cannot_see_content": null,
+            "group_friend_members": {
+              "count": 0
+            },
+            "facepile_member_profiles": {
+              "edges": []
+            },
+            "friends_social_sentence": {
+              "delight_ranges": [],
+              "image_ranges": [],
+              "inline_style_ranges": [],
+              "aggregated_ranges": [],
+              "ranges": [],
+              "color_ranges": [],
+              "text": ""
+            },
+            "facepile_admin_profiles": {
+              "count": 4,
+              "edges": [
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "100031849522886",
+                    "name": "Zuzana Janosova-Den Boer",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t1.6435-1/71842354_161849081553408_2189729307100708864_n.jpg?stp=cp0_dst-jpg_tt6&cstp=mx399x399&ctp=s32x32&_nc_cat=111&ccb=1-7&_nc_sid=1d2534&_nc_ohc=SqSWuBOuNRsQ7kNvwHzaMdW&_nc_oc=AdqyrUx1-IC8kIkuy3gscBh58WyWVrpYj7r7lSBqRSmEbKPzSVFabjd0OdaE10qVYTs&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQGR4Qe6Kcysq6oMGkBqsrWIxk--DdZi0tvz1gKO46I12A&oe=6A9A80E7"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/zuzana.janosovadenboer",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "422763178795329"
+                    }
+                  }
+                },
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "100002130489775",
+                    "name": "Pete Fudgie Garnhum",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/491756137_9631399250274329_5440512706240370500_n.jpg?stp=cp0_dst-jpg_tt6&cstp=mx960x960&ctp=s32x32&_nc_cat=108&ccb=1-7&_nc_sid=1d2534&_nc_ohc=1tnQvb8yu9YQ7kNvwHJ6GgR&_nc_oc=AdpP3AFH_Tn9r39jW6uFj2oCVPXoAhpptlZXOiQsVcOpXQBNkdA-7LSrK4bTXP_6Djs&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQGwXn3dgqb-yuHxkoBbrzOiFmUiIB2sIFQkwQwKF-t3Pg&oe=6A78FDF8"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/pete.garnhum",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "2007077219373275"
+                    }
+                  }
+                },
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "100000806537260",
+                    "name": "Kathy Flett",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/539368114_24290505363893010_7078673272689922562_n.jpg?stp=cp0_dst-jpg_tt6&cstp=mx1134x1136&ctp=s32x32&_nc_cat=105&ccb=1-7&_nc_sid=e99d92&_nc_ohc=twyiUCYcZmwQ7kNvwFx3PS-&_nc_oc=Adoz1J0JMD9SlRS41EsOkvYQddwunDaOjBiD9oHGzNhio9MaRcx5277bd4qqZyvUIaE&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQE7Chqfa-se8dFnRcNxdBfMic3NgH25VMOfiTuc1ZlGSA&oe=6A79102A"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/kathy.flett.7",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "2765502803486577"
+                    }
+                  }
+                },
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "61579093640614",
+                    "name": "Mister Alberta",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/524986189_10172244551750083_5144790752052591544_n.jpg?stp=c0.0.1024.1024a_cp0_dst-jpg_tt6&cstp=mx1024x1024&ctp=s32x32&_nc_cat=101&ccb=1-7&_nc_sid=2d3e12&_nc_ohc=Zl5brLGvF5cQ7kNvwHIxpVj&_nc_oc=Adq8-38F7zsAhxkgW8BAYXd72neHiwhdRmFTbEniWNEmE8Y-zVZnKsfjDcFs3Y1B96M&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQGXkrrCf_zkN6M3qlwg_AEwyhqp8zH-CyNqO-6hidvUtQ&oe=6A7916B9"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/misteralberta",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "122093330408969788"
+                    }
+                  }
+                }
+              ]
+            },
+            "facepile_moderator_profiles": {
+              "count": 2,
+              "edges": [
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "61573595517333",
+                    "name": "Brandon Borhen",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/555748503_122171758250786517_2457794146908929774_n.jpg?stp=cp0_dst-jpg_tt6&cstp=mx944x960&ctp=s32x32&_nc_cat=104&ccb=1-7&_nc_sid=e99d92&_nc_ohc=I6Eo2PmFGFYQ7kNvwH5BGrr&_nc_oc=AdqI6aA9bOxTXc4r4MTDAH3XoHgbVkS0ttpduiUOZt3iubfv8PxzKWPqOSoa4a3MVc4&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQGlQN0FwrEhWE7add2bTTttvGC2NXujaXSWj8akeTMWFw&oe=6A78F7F1"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/brandon.borhen.2025",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "122130940580786517"
+                    }
+                  }
+                },
+                {
+                  "node": {
+                    "__typename": "User",
+                    "__isProfile": "User",
+                    "id": "524620162",
+                    "name": "Vicky Farr",
+                    "profile_picture": {
+                      "uri": "https://scontent.fyhu1-1.fna.fbcdn.net/v/t39.30808-1/581020567_10161491928460163_7091703160418363366_n.jpg?stp=cp0_dst-jpg_tt6&cstp=mx960x946&ctp=s32x32&_nc_cat=102&ccb=1-7&_nc_sid=1d2534&_nc_ohc=BYpqXnErWPMQ7kNvwG7cpf-&_nc_oc=Adqj8Frf2W3z-5_JpqEL-FBISaO73hdTcjpI0uM1yEqCVw7eM4ON1RCUQm5UmPXUtcU&_nc_zt=24&_nc_ht=scontent.fyhu1-1.fna&_nc_gid=lJ-o7IQgT0KJA4FbVdo7yw&_nc_ss=7b2a8&oh=00_AQHxuZ9auQv2bXQzr3WK_nWMU7Q_UuLzRJuCdHGhEYjIQA&oe=6A790123"
+                    },
+                    "__isEntity": "User",
+                    "url": "https://www.facebook.com/vicky.picardfarr",
+                    "__isGroupMember": "User",
+                    "group_membership": {
+                      "has_member_feed": true,
+                      "associated_group": {
+                        "__typename": "Group",
+                        "id": "787909081545196",
+                        "leaders_engagement_logging_settings": {
+                          "comet_surface_mappings": [
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MALL",
+                              "trace_policy": "comet.group"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "REPORTED_CONTENT",
+                              "trace_policy": "comet.group.member_reported_content"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_MEMBERS",
+                              "trace_policy": "comet.group.member_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_PARTICIPANTS",
+                              "trace_policy": "comet.group.participant_requests"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_MAIN",
+                              "trace_policy": "comet.group.members"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_ADMIN",
+                              "trace_policy": "comet.group.members.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_BLOCKED",
+                              "trace_policy": "comet.group.members.blocked"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_FRIEND_SUB",
+                              "trace_policy": "comet.group.members.friends"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_INVITED",
+                              "trace_policy": "comet.group.members.invited"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ADMIN_ACITIVITIES",
+                              "trace_policy": "comet.groups.admin_activities"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "DRAFT_POSTS",
+                              "trace_policy": "comet.groups.draft_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ENGAGEMENT",
+                              "trace_policy": "comet.groups.insights.engagement"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_MEMBER",
+                              "trace_policy": "comet.groups.insights.membership"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_CONTRIBUTOR",
+                              "trace_policy": "comet.groups.insights.growth"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_ADMINS",
+                              "trace_policy": "comet.groups.insights.admins"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_EXPERTS",
+                              "trace_policy": "comet.groups.insights.experts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_INSIGHTS_LEARNING",
+                              "trace_policy": "comet.groups.insights.learning"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "KEYWORD_ALERT",
+                              "trace_policy": "comet.groups.keyword_alerted_content_v3"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_PREAPPROVED",
+                              "trace_policy": "comet.groups.members.preapproved"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MEMBER_LIST_UNAVAILABLE",
+                              "trace_policy": "comet.groups.members.unavailable"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.membership-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "FORUM_QUESTIONS_EDIT",
+                              "trace_policy": "comet.groups.participation-questions"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "PENDING_POSTS",
+                              "trace_policy": "comet.groups.pending_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_RULES_EDIT",
+                              "trace_policy": "comet.groups.rules"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "SCHEDULED_POSTS",
+                              "trace_policy": "comet.groups.scheduled_posts"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_SETTINGS",
+                              "trace_policy": "comet.groups.settings"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "MODMIN_REVIEW_FOLDER",
+                              "trace_policy": "comet.group.spam"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "GROUP_OVERVIEW",
+                              "trace_policy": "comet.groups.overview"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingExactCometSurfaceMapping",
+                              "surface": "ROLES_MANAGEMENT",
+                              "trace_policy": "comet.groups.roles_management"
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "CONTENT_TEMPLATES",
+                              "prefixes": [
+                                "comet.groups.automated_template"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "GROUP_UNKNOWN",
+                              "prefixes": [
+                                "comet.group"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "PROFILE",
+                              "prefixes": [
+                                "comet.profile"
+                              ]
+                            },
+                            {
+                              "__typename": "GroupLeadersEngagementLoggingPrefixCometSurfaceMapping",
+                              "surface": "NOTIFICATION",
+                              "prefixes": [
+                                "comet.app",
+                                "comet.notifications"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "id": "10160561741125163"
+                    }
+                  }
+                }
+              ]
+            },
+            "admin_and_moderator_social_sentence": {
+              "delight_ranges": [],
+              "image_ranges": [],
+              "inline_style_ranges": [],
+              "aggregated_ranges": [],
+              "ranges": [
+                {
+                  "entity": {
+                    "__typename": "User",
+                    "__isEntity": "User",
+                    "__isActor": "User",
+                    "id": "61579093640614",
+                    "url": "https://www.facebook.com/misteralberta",
+                    "profile_url": "https://www.facebook.com/misteralberta",
+                    "short_name": "Mister Alberta",
+                    "work_info": null,
+                    "__module_operation_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink_user$normalization.graphql"
+                    },
+                    "__module_component_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink.react"
+                    },
+                    "work_foreign_entity_info": null,
+                    "is_verified": false,
+                    "mobileUrl": "https://m.facebook.com/misteralberta/",
+                    "__isNode": "User"
+                  },
+                  "entity_is_weak_reference": false,
+                  "length": 14,
+                  "offset": 0
+                },
+                {
+                  "entity": {
+                    "__typename": "User",
+                    "__isEntity": "User",
+                    "__isActor": "User",
+                    "id": "524620162",
+                    "url": "https://www.facebook.com/vicky.picardfarr",
+                    "profile_url": "https://www.facebook.com/vicky.picardfarr",
+                    "short_name": "Vicky",
+                    "work_info": null,
+                    "__module_operation_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink_user$normalization.graphql"
+                    },
+                    "__module_component_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink.react"
+                    },
+                    "work_foreign_entity_info": null,
+                    "is_verified": false,
+                    "mobileUrl": "https://m.facebook.com/vicky.picardfarr/",
+                    "__isNode": "User"
+                  },
+                  "entity_is_weak_reference": false,
+                  "length": 5,
+                  "offset": 47
+                },
+                {
+                  "entity": {
+                    "__typename": "User",
+                    "__isEntity": "User",
+                    "__isActor": "User",
+                    "id": "61573595517333",
+                    "url": "https://www.facebook.com/brandon.borhen.2025",
+                    "profile_url": "https://www.facebook.com/brandon.borhen.2025",
+                    "short_name": "Brandon",
+                    "work_info": null,
+                    "__module_operation_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink_user$normalization.graphql"
+                    },
+                    "__module_component_CometTextWithEntitiesRelay_textWithEntities": {
+                      "__dr": "ProfileGeminiWeakReferenceLink.react"
+                    },
+                    "work_foreign_entity_info": null,
+                    "is_verified": false,
+                    "mobileUrl": "https://m.facebook.com/brandon.borhen.2025/",
+                    "__isNode": "User"
+                  },
+                  "entity_is_weak_reference": false,
+                  "length": 7,
+                  "offset": 57
+                }
+              ],
+              "color_ranges": [],
+              "text": "Mister Alberta and 3 other members are admins. Vicky and Brandon are moderators."
+            }
+          },
+          "__module_operation_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedMembersCardUnit_unit$normalization.graphql"
+          },
+          "__module_component_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedMembersCardUnit.react"
+          }
+        },
+        {
+          "__typename": "GroupsAboutFeedActivityCardUnit",
+          "group": {
+            "number_of_posts_in_last_day": 22,
+            "number_of_posts_in_last_month": 503,
+            "group_total_members_info_text": "120,444 total members",
+            "group_new_members_info_text": "+ 347 in the last week",
+            "created_time": 1544366840,
+            "group_analytics_ent_metrics": null,
+            "id": "787909081545196"
+          },
+          "__module_operation_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedActivityCardUnit_unit$normalization.graphql"
+          },
+          "__module_component_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedActivityCardUnit.react"
+          }
+        },
+        {
+          "__typename": "GroupsAboutFeedRulesCardUnit",
+          "group": {
+            "id": "787909081545196",
+            "group_admin_profiles": {
+              "count": 6
+            },
+            "group_rules": {
+              "nodes": [
+                {
+                  "id": "787911368211634",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "We are here to discuss and connect together, lets create a welcoming environment where debate can be found. Trolls will be kicked. Degrading comments on race, religion, culture, and sex will not be tolerated.\n\nIt's one thing to disparage Polticans, but don't go around insulting fellow group members."
+                  },
+                  "description": "We are here to discuss and connect together, lets create a welcoming environment where debate can be found. Trolls will be kicked. Degrading comments on race, religion, culture, and sex will not be tolerated.\n\nIt's one thing to disparage Polticans, but don't go around insulting fellow group members.",
+                  "rule_title": "Be Kind and Courteous"
+                },
+                {
+                  "id": "787911801544924",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "This group is for the discussion about Alberta Independence and what will come from it. Posts pertaining to federal or international issues will only be approved if they DIRECTLY relate to Alberta or Independence."
+                  },
+                  "description": "This group is for the discussion about Alberta Independence and what will come from it. Posts pertaining to federal or international issues will only be approved if they DIRECTLY relate to Alberta or Independence.",
+                  "rule_title": "Posts must be related to Alberta or Independence"
+                },
+                {
+                  "id": "993678864301549",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "Preference will be given to Albertans in all situations. Non-Albertans are welcome to the discussion, and can participate as long as they align with the discussion topics, but will be removed for any rule violations without warning."
+                  },
+                  "description": "Preference will be given to Albertans in all situations. Non-Albertans are welcome to the discussion, and can participate as long as they align with the discussion topics, but will be removed for any rule violations without warning.",
+                  "rule_title": "This group is for Albertans but others are allowed"
+                },
+                {
+                  "id": "993678867634882",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "Give more than you take to this group. Self-promotion, spam and irrelevant links aren't allowed. Copy-Paste responses will be treated as Spam."
+                  },
+                  "description": "Give more than you take to this group. Self-promotion, spam and irrelevant links aren't allowed. Copy-Paste responses will be treated as Spam.",
+                  "rule_title": "No Promotions or Spam"
+                },
+                {
+                  "id": "993678860968216",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "When you share a post from another source, or just an image, you must add your own comments at the top. Posts and images shared to the group without sufficient comments from you will be auto-declined."
+                  },
+                  "description": "When you share a post from another source, or just an image, you must add your own comments at the top. Posts and images shared to the group without sufficient comments from you will be auto-declined.",
+                  "rule_title": "Reshared/image Posts require comments at the top"
+                },
+                {
+                  "id": "2525648714437882",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "While we allow discussions on the topic of Alberta and the USA, we ask members to refrain from making comments blatantly promoting Alberta becoming the 51 state."
+                  },
+                  "description": "While we allow discussions on the topic of Alberta and the USA, we ask members to refrain from making comments blatantly promoting Alberta becoming the 51 state.",
+                  "rule_title": "No promoting Alberta 51st State"
+                },
+                {
+                  "id": "2594393994230020",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "If you don't answer all the questions you may not be approved. Note that this is a public group, but you must join the group before your comments will be posted. \nFailure to answer the questions will probably result in us assuming you are a bot and blocking you."
+                  },
+                  "description": "If you don't answer all the questions you may not be approved. Note that this is a public group, but you must join the group before your comments will be posted. \nFailure to answer the questions will probably result in us assuming you are a bot and blocking you.",
+                  "rule_title": "Please answer all participation questions"
+                },
+                {
+                  "id": "2594432754226144",
+                  "can_viewer_report": true,
+                  "description_with_entities": {
+                    "delight_ranges": [],
+                    "image_ranges": [],
+                    "inline_style_ranges": [],
+                    "aggregated_ranges": [],
+                    "ranges": [],
+                    "color_ranges": [],
+                    "text": "We love all the submissions! We get dozens a day! Not all will get approved, feel free to submit them! Original content is valued over all."
+                  },
+                  "description": "We love all the submissions! We get dozens a day! Not all will get approved, feel free to submit them! Original content is valued over all.",
+                  "rule_title": "We value Quality posts over Quantity of posts."
+                }
+              ]
+            },
+            "if_viewer_can_see_pin_highlight_units_button": null
+          },
+          "__module_operation_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedRulesCardUnit_unit$normalization.graphql"
+          },
+          "__module_component_GroupsCometAboutFeedColumn_group": {
+            "__dr": "GroupsCometAboutFeedRulesCardUnit.react"
+          }
+        }
+      ]
+    }
+  ],
+  "time_started": "2026-08-05 12:22:51.717224+00:00",
+  "time_taken": "0:00:18.987748",
+  "last_cursor": null
+}

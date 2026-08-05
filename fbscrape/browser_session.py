@@ -1759,6 +1759,7 @@ class BrowserSession:
 
         self.response_interceptor.flush()
         self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
 
         # Phase 1 — navigate to the profile (server-renders the header).
         error = await self._hybrid_navigate(
@@ -1851,6 +1852,7 @@ class BrowserSession:
 
         self.response_interceptor.flush()
         self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
 
         # Phase 1 — navigate to the About landing page (server-renders the
         # header, same as ProfileInfo, plus the sub-tab directory).
@@ -1928,6 +1930,158 @@ class BrowserSession:
             all_sections.extend(parser.extract_profile_about_sections(section_html))
 
         record = {"profile": profile, "sections": all_sections}
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def group_info_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a group's header info (single-shot).
+
+        Like `profile_info_hybrid`, this does NOT replay a GraphQL query: FB
+        server-renders the group header (name, privacy setting, member
+        count, cover photo, content-view directory) into the group page's
+        embedded JSON, so we navigate, read the rendered document, and pull
+        the node out with `FacebookGraphQLParser.extract_group_info`.
+
+        Args:
+            handle: Vanity handle or numeric id of the group — drives the
+                navigation URL.
+            document_wait_seconds: Extra settle time after navigation before
+                reading the document, so the server-rendered header blob is
+                present.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list `[group_dict]` on
+            success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "GroupInfo"
+        target_url = f"https://www.facebook.com/groups/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] group info for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        record = self.response_interceptor.parser.extract_group_info(html, handle)
+        if record is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def group_about_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a group's About page (header + description, activity,
+        rules, admin facepile).
+
+        Unlike `profile_about_hybrid`, this IS single-navigation: FB renders
+        the group's description, privacy/discoverability/history/location
+        info items, activity stats, rules, and admin facepile all together
+        on the one About page (`/groups/<handle>/about/`) — no per-sub-tab
+        navigation needed.
+
+        Args:
+            handle: Vanity handle or numeric id of the group.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list
+            `[{"group": group_dict, "cards": [card_dict, ...]}]` on success,
+            or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "GroupAbout"
+        target_url = f"https://www.facebook.com/groups/{handle}/about/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] group about for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        parser = self.response_interceptor.parser
+        group = parser.extract_group_info(html, handle)
+        if group is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        cards = parser.extract_group_about_cards(html)
+
+        record = {"group": group, "cards": cards}
         return ScrapeOutcome(
             result='success',
             data=[record],

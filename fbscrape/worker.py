@@ -52,12 +52,16 @@ class Worker:
         ("PostDetail", "hybrid"): "post_detail_hybrid",
         ("ProfileInfo", "hybrid"): "profile_info_hybrid",
         ("ProfileAbout", "hybrid"): "profile_about_hybrid",
+        ("GroupInfo", "hybrid"): "group_info_hybrid",
+        ("GroupAbout", "hybrid"): "group_about_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
     }
 
     # These endpoints never scroll, so scroll_count-based rotation below never
     # fires for them — rotate unconditionally after every task instead.
-    ALWAYS_ROTATE_ENDPOINTS = frozenset({"ProfileInfo", "ProfileAbout"})
+    ALWAYS_ROTATE_ENDPOINTS = frozenset({
+        "ProfileInfo", "ProfileAbout", "GroupInfo", "GroupAbout",
+    })
 
     # Default account selection (scroll_count_overall_24h ASC) is meaningless
     # for the endpoints above; least-recently-used first, with scroll count

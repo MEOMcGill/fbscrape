@@ -103,6 +103,15 @@ TARGETS = {
         # see docstring on Query.ENDPOINT_REGISTRY["ProfileAbout"].
         "handle": "61582991935083",
     },
+    "group_info": {
+        # Same stable public group used by group_timeline_hybrid.
+        "handle": "albertaseparatism",
+    },
+    "group_about": {
+        # Same group — has a populated description, rules, and admin
+        # facepile. Substitute if it goes dark.
+        "handle": "albertaseparatism",
+    },
 }
 
 
@@ -152,6 +161,14 @@ async def _capture_profile_about(scraper: FacebookScraper, spec: dict):
     return await scraper.profile_about(spec["handle"])
 
 
+async def _capture_group_info(scraper: FacebookScraper, spec: dict):
+    return await scraper.group_info(spec["handle"])
+
+
+async def _capture_group_about(scraper: FacebookScraper, spec: dict):
+    return await scraper.group_about(spec["handle"])
+
+
 CAPTURERS = {
     "user_timeline_hybrid":  lambda s: _capture_user_timeline(s, "hybrid", TARGETS["user_timeline_hybrid"]),
     "user_timeline_manual":  lambda s: _capture_user_timeline(s, "manual", TARGETS["user_timeline_manual"]),
@@ -163,6 +180,8 @@ CAPTURERS = {
     "post_detail":           lambda s: _capture_post_detail(s, TARGETS["post_detail"]),
     "profile_info":          lambda s: _capture_profile_info(s, TARGETS["profile_info"]),
     "profile_about":         lambda s: _capture_profile_about(s, TARGETS["profile_about"]),
+    "group_info":            lambda s: _capture_group_info(s, TARGETS["group_info"]),
+    "group_about":           lambda s: _capture_group_about(s, TARGETS["group_about"]),
 }
 
 

@@ -2673,6 +2673,199 @@ def scrape_profile_about(
                 filename = f"{handle}_profileabout_{ts}.jsonl"
                 data.save(os.path.join(output_dir, filename))
 
+
+@scrape.command(name='group-info')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read handle rows from a CSV, Parquet, YAML, or '
+                   'JSON/JSONL file with a `handle` column.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/group_info/)')
+@click.option('--max-sessions', default=5, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the group (default 3)')
+@click.option('--document-wait-seconds', type=float, default=None,
+              help='extra settle time before reading the rendered document, '
+                   'so the server-rendered header blob is present (default 4)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_group_info(
+    ctx, handles, input_file, output_dir, max_sessions, scroll_threshold,
+    headless, mobile, log_level, post_nav_sleep_seconds,
+    document_wait_seconds, operation_timeout_seconds, wait_for_account,
+):
+    """Fetch a group's header info (hybrid mode only).
+
+    \b
+    Single-shot — no pagination, no date range. Each target is a vanity
+    handle or numeric id. FB server-renders the group header (name,
+    privacy setting, member count, cover photo, content-view directory)
+    into the group page's embedded JSON, so there is no GraphQL replay —
+    the header is read from the rendered page.
+
+    \b
+    Examples:
+      fbscrape scrape group-info albertaseparatism
+      fbscrape scrape group-info albertaseparatism --headless
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    a `handle` column:
+      fbscrape scrape group-info --input-file groups.csv
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_handle_targets(handles, input_file)
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "group_info")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "document_wait_seconds": document_wait_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.group_info(
+                    handle=t['handle'],
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = f"{handle}_groupinfo_{ts}.jsonl"
+                data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
+@scrape.command(name='group-about')
+@click.argument('handles', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read handle rows from a CSV, Parquet, YAML, or '
+                   'JSON/JSONL file with a `handle` column.')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/group_about/)')
+@click.option('--max-sessions', default=5, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after navigating to the group About page (default 3)')
+@click.option('--document-wait-seconds', type=float, default=None,
+              help='extra settle time before reading the rendered document '
+                   '(default 4)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 120)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@click.pass_context
+def scrape_group_about(
+    ctx, handles, input_file, output_dir, max_sessions, scroll_threshold,
+    headless, mobile, log_level, post_nav_sleep_seconds,
+    document_wait_seconds, operation_timeout_seconds, wait_for_account,
+):
+    """Fetch a group's About page — header, description, activity stats,
+    rules, and admin facepile (hybrid mode only).
+
+    \b
+    Unlike profile-about, this is single-navigation: FB renders every
+    About card together on the one page (`/groups/<handle>/about/`), so
+    there's no per-section navigation. Admin/moderator data is best-effort
+    (a UI facepile FB may truncate) — the returned count is exact, but the
+    named roster may be shorter than that count for groups with many
+    admins/moderators.
+
+    \b
+    Examples:
+      fbscrape scrape group-about albertaseparatism --headless
+
+    \b
+    Read targets from a file (CSV / Parquet / YAML / JSON / JSONL) with
+    a `handle` column:
+      fbscrape scrape group-about --input-file groups.csv
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    targets = _resolve_handle_targets(handles, input_file)
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "group_about")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "document_wait_seconds": document_wait_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.group_about(
+                    handle=t['handle'],
+                    **mode_params,
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                handle = data.query.query.get('handle')
+
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                filename = f"{handle}_groupabout_{ts}.jsonl"
+                data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
     run_async(_scrape())
 
 
