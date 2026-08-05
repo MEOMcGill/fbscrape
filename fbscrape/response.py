@@ -40,7 +40,7 @@ def _g(obj, *keys, default=None):
 
 
 _ABBREVIATED_COUNT_RE = re.compile(
-    r"^([\d,]+(?:\.\d+)?)\s*([KMB]?)", re.IGNORECASE
+    r"^([\d,]+(?:\.\d+)?)([KMB]?)", re.IGNORECASE
 )
 _ABBREVIATED_COUNT_MULTIPLIERS = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
@@ -53,7 +53,15 @@ def _parse_abbreviated_count(text) -> int | None:
     FB only ever ships these pre-rounded to 1-3 significant digits — this
     recovers the order of magnitude for sorting/comparison, not the exact
     live count (e.g. "121M" becomes exactly 121_000_000, not whatever the
-    real figure is)."""
+    real figure is).
+
+    The suffix letter must be glued directly to the digits with no space —
+    real abbreviations are always formatted that way ("121M", "43K"). This
+    matters because FB ships *exact*, unabbreviated counts for small
+    numbers as a plain "<digits> <word>" string (e.g. "827 members"); if
+    the regex allowed whitespace before the suffix, it would greedily
+    match the leading letter of that trailing word (the "m" in "members")
+    as if it meant "million", inflating 827 into 827,000,000."""
     if not isinstance(text, str):
         return None
     m = _ABBREVIATED_COUNT_RE.match(text.strip())
