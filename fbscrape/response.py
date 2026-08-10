@@ -8,7 +8,7 @@ import os
 import re
 import traceback
 from datetime import datetime, timezone
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from playwright.async_api import Page, Response, Error as PlaywrightError
 from fbscrape.utils import parse_json_or_jsonl
 from .logger import logger
@@ -37,6 +37,31 @@ def _g(obj, *keys, default=None):
         else:
             return default
     return obj if obj is not None else default
+
+
+_ABBREVIATED_COUNT_RE = re.compile(
+    r"^([\d,]+(?:\.\d+)?)\s*([KMB]?)", re.IGNORECASE
+)
+_ABBREVIATED_COUNT_MULTIPLIERS = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+
+
+def _parse_abbreviated_count(text) -> int | None:
+    """Parse FB's abbreviated count strings (e.g. "121M followers", "22K",
+    "1 following") into an approximate integer, stripping the trailing
+    word. Returns `None` if `text` doesn't start with a recognizable count.
+
+    FB only ever ships these pre-rounded to 1-3 significant digits — this
+    recovers the order of magnitude for sorting/comparison, not the exact
+    live count (e.g. "121M" becomes exactly 121_000_000, not whatever the
+    real figure is)."""
+    if not isinstance(text, str):
+        return None
+    m = _ABBREVIATED_COUNT_RE.match(text.strip())
+    if not m:
+        return None
+    number = float(m.group(1).replace(",", ""))
+    multiplier = _ABBREVIATED_COUNT_MULTIPLIERS[m.group(2).upper()]
+    return int(round(number * multiplier))
 
 
 def _resolve_story(post: dict) -> dict | None:
@@ -139,6 +164,8 @@ class FacebookGraphQLParser:
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
         "CommentsList": "_flatten_commentslist_comment",
         "PostDetail": "_flatten_postdetail_record",
+        "ProfileInfo": "_flatten_profile_info_record",
+        "ProfileAbout": "_flatten_profile_about_record",
     }
 
     # FB's canonical reaction ids — stable per reaction type, used as edge
@@ -489,6 +516,156 @@ class FacebookGraphQLParser:
         )
         return None
 
+    def _iter_profile_nodes(self, obj):
+        """Yield every dict in `obj` that looks like a rendered profile-header
+        node (User or Page) — identified by carrying `profile_social_context`
+        alongside an `id`, the shape FB emits for both surfaces under
+        `profile_header_renderer.user` in the bootstrap payload."""
+        if isinstance(obj, dict):
+            if obj.get("id") is not None and "profile_social_context" in obj:
+                yield obj
+            for v in obj.values():
+                yield from self._iter_profile_nodes(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from self._iter_profile_nodes(v)
+
+    def extract_profile_info(self, html: str, handle: str | None = None) -> dict | None:
+        """Extract a profile's header info from a profile page's server-rendered HTML.
+
+        Like PostDetail, FB renders this directly into a `<script
+        type="application/json">` BigPipe bootstrap payload
+        (`profile_header_renderer.user`) rather than firing a dedicated
+        GraphQL XHR — no replay needed, just parse the document.
+
+        A profile page can embed more than one profile-shaped node (e.g.
+        "People you may know" sidebar suggestions also carry
+        `profile_social_context`), so the subject is selected by preferring a
+        node whose `url` contains the navigated `handle`, falling back to the
+        most fully-hydrated (most keys) candidate — same tie-break principle
+        as `extract_permalink_story`.
+
+        Returns the selected node, or `None` if none found (private profile,
+        logged out, or shape drift).
+        """
+        candidates: list[dict] = []
+        seen_ids: set[int] = set()
+        for blob in self._SJS_SCRIPT_RE.findall(html):
+            if "profile_social_context" not in blob:
+                continue
+            try:
+                payload = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for node in self._iter_profile_nodes(payload):
+                if id(node) in seen_ids:
+                    continue
+                seen_ids.add(id(node))
+                candidates.append(node)
+
+        if not candidates:
+            logger.warning(
+                f"[PARSER] No profile node found for handle={handle!r} "
+                f"in document ({len(html)} bytes)"
+            )
+            return None
+
+        if handle:
+            needle = f"/{handle.strip('/').lower()}"
+            url_matches = [
+                c for c in candidates
+                if isinstance(c.get("url"), str) and needle in c["url"].lower()
+            ]
+            if url_matches:
+                return max(url_matches, key=len)
+
+        return max(candidates, key=len)
+
+    def _iter_about_app_sections(self, obj):
+        """Yield each About app-section entry
+        (`{name, section_type, all_collections, activeCollections}`) found
+        anywhere in `obj` — identified by carrying both `all_collections`
+        (the sub-tab directory) and `activeCollections` (whichever sub-tab
+        is populated in the current document) side by side."""
+        if isinstance(obj, dict):
+            if "all_collections" in obj and "activeCollections" in obj:
+                yield obj
+            for v in obj.values():
+                yield from self._iter_about_app_sections(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from self._iter_about_app_sections(v)
+
+    @staticmethod
+    def _tab_key_from_url(url) -> str | None:
+        """Normalize an About sub-tab URL to its `tab_key`, regardless of
+        whether FB rendered it query-style (`?...&sk=directory_contact_info`
+        — observed for numeric-id profiles) or path-style
+        (`/<handle>/directory_contact_info` — observed for vanity handles);
+        both forms occur for the same tab_key depending on account type."""
+        if not isinstance(url, str):
+            return None
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "sk" in qs:
+            return qs["sk"][0]
+        segments = [s for s in parsed.path.split("/") if s]
+        return segments[-1] if segments else None
+
+    def extract_profile_about_collections(self, html: str) -> dict:
+        """Extract the About sub-tab directory (`{tab_key: absolute_url}`)
+        from an About-family page — the landing page or any sub-tab; the
+        directory is embedded on all of them via `all_collections`.
+
+        Returns `{}` if not found (account has no About tabs, or shape drift).
+        """
+        directory: dict = {}
+        for blob in self._SJS_SCRIPT_RE.findall(html):
+            if "all_collections" not in blob or "activeCollections" not in blob:
+                continue
+            try:
+                payload = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for section in self._iter_about_app_sections(payload):
+                for node in (_g(section, "all_collections", "nodes", default=[]) or []):
+                    if not isinstance(node, dict):
+                        continue
+                    tab_key = self._tab_key_from_url(node.get("url"))
+                    if tab_key:
+                        directory[tab_key] = node["url"]
+            if directory:
+                break
+        return directory
+
+    def extract_profile_about_sections(self, html: str) -> list:
+        """Extract the populated `profile_field_sections` for whichever
+        About sub-tab is active in this document (`activeCollections`) — the
+        fields FB actually rendered for that tab (e.g. phone/email for
+        Contact info, address/hours for Details). A sub-tab's fields only
+        populate when that sub-tab itself was navigated to directly — FB
+        doesn't server-render every section together.
+
+        Returns `[]` if none found.
+        """
+        sections: list = []
+        seen_ids: set = set()
+        for blob in self._SJS_SCRIPT_RE.findall(html):
+            if "profile_field_sections" not in blob:
+                continue
+            try:
+                payload = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for section_group in self._iter_about_app_sections(payload):
+                for coll in (_g(section_group, "activeCollections", "nodes", default=[]) or []):
+                    for sec in (_g(coll, "style_renderer", "profile_field_sections", default=[]) or []):
+                        if not isinstance(sec, dict) or id(sec) in seen_ids:
+                            continue
+                        seen_ids.add(id(sec))
+                        sections.append(sec)
+        return sections
+
     # ----- public flatten API -----
 
     def flatten(
@@ -732,6 +909,168 @@ class FacebookGraphQLParser:
             "section_token": modal.get("section_token"),
             "collection_token": modal.get("collection_token"),
         }
+
+    def _flatten_profile_info_record(self, record: dict) -> dict | None:
+        """Orchestrator for the server-rendered profile header block (ProfileInfo).
+
+        `record` is the profile node returned by `extract_profile_info` — FB's
+        Comet profile-header shape, shared by User and Page surfaces. Returns
+        a single-row dict; None on shape mismatch (no `id` field).
+
+        Follower/following counts (`profile_social_context`) only ship as
+        FB-formatted abbreviated strings (e.g. "121M followers") — FB
+        doesn't expose an exact integer on this surface, so `follower_count`
+        / `following_count` are parsed via `_parse_abbreviated_count` into
+        an approximate integer (e.g. "121M" -> 121_000_000) for sorting/
+        comparison; treat as order-of-magnitude, not exact.
+
+        Intro-card fields (`profile_intro_card.context_items`) are dispatched
+        by `profile_field_type`, mirroring
+        `_flatten_profile_authenticity_record`'s `header_fields` dispatch —
+        `category` (e.g. "Public figure") is the one consistently present
+        across profiles; everything else observed there is also preserved
+        generically in `intro_card_fields` since coverage varies by account
+        (work / education / location / relationship status, ...).
+
+        `profile_social_context.content` is a list — one entry for followers,
+        one for following when FB renders both (personal profiles only show
+        followers). Entries are matched by their `uri` (`.../followers...` /
+        `.../following...`) rather than position, since the URI format itself
+        varies (path-style `/<handle>/followers/` vs query-style
+        `?...&sk=followers`) and ordering isn't guaranteed either way.
+        """
+        if not isinstance(record, dict) or not record.get("id"):
+            return None
+
+        social_context = record.get("profile_social_context") or {}
+        context_content = social_context.get("content") or []
+
+        follower_text = follower_uri = following_text = None
+        for item in context_content:
+            if not isinstance(item, dict):
+                continue
+            uri = item.get("uri") or ""
+            text = _g(item, "text", "text")
+            if "following" in uri:
+                following_text = text
+            elif "followers" in uri:
+                follower_text, follower_uri = text, uri
+
+        bio = _g(
+            record, "header_top_row", "profile_user", "profile_status",
+            "profile_status_text", "text",
+        )
+
+        intro_card = _g(
+            record, "header_top_row", "profile_user", "profile_intro_card",
+            default={},
+        ) or {}
+        edges = _g(intro_card, "context_items", "edges", default=[]) or []
+
+        by_type: dict[str, dict] = {}
+        intro_card_fields = []
+        for edge in edges:
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict):
+                continue
+            field_type = node.get("profile_field_type")
+            short_title = _g(node, "short_title", "text")
+            if isinstance(field_type, str):
+                by_type[field_type] = node
+            intro_card_fields.append({
+                "profile_field_type": field_type,
+                "text": short_title,
+            })
+
+        category = by_type.get("category") or {}
+
+        return {
+            "profile_id": record.get("id"),
+            "name": record.get("name"),
+            "url": record.get("url"),
+            "gender": record.get("gender"),
+            "username_for_profile": record.get("username_for_profile"),
+            "is_verified": bool(record.get("show_verified_badge_on_profile")),
+            "is_viewer_friend": record.get("is_viewer_friend"),
+            "is_memorialized": bool(record.get("is_visibly_memorialized")),
+            "follower_count": _parse_abbreviated_count(follower_text),
+            "followers_url": follower_uri,
+            "following_count": _parse_abbreviated_count(following_text),
+            "bio": bio,
+            "category": _g(category, "short_title", "text"),
+            "intro_card_fields": intro_card_fields,
+            "cover_photo_url": _g(record, "cover_photo", "photo", "image", "uri"),
+            "profile_picture_url": _g(record, "profilePicLarge", "uri"),
+        }
+
+    def _flatten_profile_about_record(self, record: dict) -> dict | None:
+        """Orchestrator for the profile About page (ProfileAbout).
+
+        `record` is `{"profile": <profile_header_node>, "sections":
+        [<profile_field_section>, ...]}` assembled by `profile_about_hybrid`
+        from one About-landing navigation (header + sub-tab directory) plus
+        one navigation per requested section (that section's populated
+        fields). Reuses `_flatten_profile_info_record` for the header
+        fields (name, follower count, bio, category, ...) — the About
+        landing page already renders the header for free, so a
+        ProfileAbout row is a superset of what ProfileInfo returns rather
+        than requiring a separate call.
+
+        About fields are dispatched into named convenience keys for the
+        highest-value, most consistently-present field types observed
+        (phone, email, messenger, address, hours, rating, website), with
+        every field — dispatched or not — also preserved in the generic
+        `about_fields` list, since section coverage varies enormously by
+        account (Pages typically expose contact/basic-info/links; personal
+        profiles more often expose work/education/personal-details instead).
+        """
+        if not isinstance(record, dict):
+            return None
+        profile = record.get("profile")
+        flat = self._flatten_profile_info_record(profile) if isinstance(profile, dict) else None
+        if flat is None:
+            return None
+
+        by_field_type: dict = {}
+        about_fields = []
+        for section in record.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            section_type = section.get("field_section_type")
+            for f in (_g(section, "profile_fields", "nodes", default=[]) or []):
+                if not isinstance(f, dict):
+                    continue
+                field_type = f.get("field_type")
+                text = _g(f, "title", "text")
+                link = f.get("link_url")
+                if isinstance(field_type, str):
+                    by_field_type[field_type] = {"text": text, "link_url": link}
+                about_fields.append({
+                    "field_section_type": section_type,
+                    "field_type": field_type,
+                    "text": text,
+                    "link_url": link,
+                })
+
+        def _val(field_type):
+            return (by_field_type.get(field_type) or {}).get("text")
+
+        def _link(field_type):
+            return (by_field_type.get(field_type) or {}).get("link_url")
+
+        flat.update({
+            "phone": _val("profile_phone"),
+            "email": _val("profile_email"),
+            "messenger_url": _link("business_messenger"),
+            "address": _val("address"),
+            "address_map_url": _link("address"),
+            "hours": _val("business_hours"),
+            "rating_text": _val("ratings"),
+            "website": _val("website"),
+            "website_url": _link("website"),
+            "about_fields": about_fields,
+        })
+        return flat
 
     def _flatten_commentslist_comment(self, record: dict) -> dict | None:
         """Orchestrator for CommentsListComponentsPaginationQuery (CommentsList).

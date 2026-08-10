@@ -1,6 +1,6 @@
 # Project Context
 
-**Last Updated:** 2026-06-29
+**Last Updated:** 2026-07-31
 
 `fbscrape` is a Facebook timeline scraper built on Camoufox (stealth Firefox) with persistent SQLite-backed account rotation, parallel browser sessions, and two pluggable scrape strategies per endpoint.
 
@@ -39,8 +39,14 @@ caller
 | `PageTransparency` | `hybrid` | `page_id` (handle optional) | single-shot POST | none |
 | `ProfileAuthenticity` | `hybrid` | `user_id` | single-shot POST | none |
 | `PostDetail` | `hybrid` | `handle`, `post_id` (+`is_group`) | single-shot **document** scrape | none |
+| `ProfileInfo` | `hybrid` | `handle` | single-shot **document** scrape | none |
+| `ProfileAbout` | `hybrid` | `handle` | multi-navigation **document** scrape | none |
 
 `PostDetail` is the odd one out: FB **server-renders** a post's Comet Story into the permalink document's embedded Relay JSON (`RelayPrefetchedStreamCache`) instead of firing a GraphQL XHR, so `post_detail_hybrid` reads `page.content()` and pulls the Story via `FacebookGraphQLParser.extract_permalink_story` — no template capture, no replay, no pagination. It reuses the timeline flattener (the Story shape is identical), so a permalink post flattens to the same schema as a GroupTimeline post. A permalink page embeds neighbour posts too, so the extractor prefers an exact numeric `post_id` match and falls back to the Story under the permalink root key (`node_v2`/`node`) — which is how it resolves pfbid inputs (the rendered Story always carries the numeric id).
+
+`ProfileInfo` follows the same document-scrape pattern as `PostDetail`, not the PageTransparency/ProfileAuthenticity replay pattern: FB server-renders the profile header (name, follower/following count as abbreviated strings, bio, cover photo, verified badge, intro-card fields like category/work/education/location) directly into a `<script type="application/json">` BigPipe bootstrap payload on the profile page (`profile_header_renderer.user`, reached via a `require[...].{__bbox}` chain, not `RelayPrefetchedStreamCache`), so `profile_info_hybrid` reads `page.content()` and pulls the node via `FacebookGraphQLParser.extract_profile_info` — no template capture, no doc_id, no replay. A profile page also embeds other profile-shaped nodes (e.g. "People you may know" sidebar suggestions), so the extractor prefers a node whose `url` contains the navigated handle and falls back to the most fully-hydrated candidate. Follower/following counts are only available as FB's abbreviated display strings (e.g. `"121M followers"`) — there is no exact integer on this surface.
+
+`ProfileAbout` is the one endpoint here that is NOT single-navigation. It reuses the same document-parse mechanism (no doc_id, no replay) but FB only server-renders a given About sub-tab's fields (contact info, address/hours, links, ...) when that sub-tab is navigated to directly — the About landing page (`/<handle>/about/`) renders the profile header (same fields as `ProfileInfo`, folded into the row for free) plus a directory of sub-tab URLs (`extract_profile_about_collections`), but each requested section's actual fields only populate after `profile_about_hybrid` navigates to that section's own URL and parses it (`extract_profile_about_sections`). Sub-tab URLs are **not** constructed — they're read from FB's own rendered directory, since the URL format differs by account type (query-style `?...&sk=directory_contact_info` for numeric-id profiles vs. path-style `/<handle>/directory_contact_info` for vanity handles). A requested section absent from an account's directory is skipped, not an error — coverage varies a lot (Pages typically expose contact/basic-info/links; personal profiles more often expose work/education/personal-details).
 
 Adding a new endpoint: one dict entry in `Query.ENDPOINT_REGISTRY`, per-mode methods on `BrowserSession`, row in `Worker.ENDPOINT_MODE_METHODS`, flattener + `ENDPOINT_FLATTENERS` entry, high-level wrapper on `FacebookScraper`, CLI subcommand, plus full test additions. Full playbook: [`docs/adding_endpoints.md`](docs/adding_endpoints.md). Per-endpoint strategy deep dives: [`docs/architecture/endpoints.md`](docs/architecture/endpoints.md).
 
@@ -54,6 +60,8 @@ FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
     "PageTransparency":    "_flatten_pagetransparency_record",
     "ProfileAuthenticity": "_flatten_profile_authenticity_record",
     "PostDetail":          "_flatten_postdetail_record",
+    "ProfileInfo":         "_flatten_profile_info_record",
+    "ProfileAbout":        "_flatten_profile_about_record",
 }
 ```
 
@@ -153,6 +161,8 @@ fbscrape scrape comments-list zuck:10115311901107991 --max-results 200
 fbscrape scrape page-transparency 899800046546098
 fbscrape scrape profile-authenticity 100044331674441
 fbscrape scrape post-detail albertansunitedtostoptheucp:27209929835285847 --group
+fbscrape scrape profile-info zuck
+fbscrape scrape profile-about 61582991935083
 
 # Post-process
 fbscrape flatten data/posts/ --format parquet

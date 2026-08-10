@@ -312,8 +312,14 @@ class AccountsPool:
 
         return Account.from_rs(rs) if rs else None
 
-    async def get_available(self) -> Account | None:
-        """Get an available account (active, not in use, not locked)"""
+    async def get_available(self, order_by: str | None = None) -> Account | None:
+        """Get an available account (active, not in use, not locked).
+
+        `order_by` overrides the default `scroll_count_overall_24h ASC`
+        priority — e.g. callers whose endpoint doesn't accumulate scroll
+        count (so that default never actually spreads load for them) can
+        pass `last_used ASC` instead to prioritize least-recently-used.
+        """
         logger.debug("get_available() searching for active, not in-use, not locked account")
         q = f"""
         SELECT COALESCE(email, phone_number) FROM accounts
@@ -324,7 +330,7 @@ class AccountsPool:
                 OR json_extract(locks, '$.locked_until') IS NULL
                 OR json_extract(locks, '$.locked_until') < datetime('now')
             )
-        ORDER BY {self._order_by}
+        ORDER BY {order_by or self._order_by}
         LIMIT 1
         """
         account = await self._get_and_mark_in_use(q)
@@ -335,15 +341,18 @@ class AccountsPool:
         """Alias for get_available() - queue parameter is ignored (backward compatibility)"""
         return await self.get_available()
 
-    async def get_available_or_wait(self) -> Account | None:
-        """Get an available account, or wait until one is available"""
+    async def get_available_or_wait(self, order_by: str | None = None) -> Account | None:
+        """Get an available account, or wait until one is available.
+
+        `order_by` — see `get_available`.
+        """
         msg_shown = False
         while True:
             # 1. probe to see if there's even an account that could pick from -
             # query: active=True & in_use=False.
             #       0 -> "excess worker, quit"
             #       1 -> "log unlock ETA" but continue looping every 5s
-            account = await self.get_available()
+            account = await self.get_available(order_by=order_by)
             if not account:
                 if self._raise_when_no_account or get_env_bool("FB_RAISE_WHEN_NO_ACCOUNT"):
                     raise NoAccountError("No account available")

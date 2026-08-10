@@ -1726,6 +1726,215 @@ class BrowserSession:
             time_taken=datetime.now(timezone.utc) - scrape_start_time,
         )
 
+    async def profile_info_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a profile's header info (single-shot).
+
+        Like `post_detail_hybrid`, this does NOT replay a GraphQL query: FB
+        server-renders the profile header (name, follower count, cover photo,
+        verified badge, intro-card fields) into the profile page's embedded
+        JSON, so we navigate, read the rendered document, and pull the node
+        out with `FacebookGraphQLParser.extract_profile_info`.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile (user or page)
+                — drives the navigation URL.
+            document_wait_seconds: Extra settle time after navigation before
+                reading the document, so the server-rendered header blob is
+                present.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list `[profile_dict]`
+            on success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "ProfileInfo"
+        target_url = f"https://www.facebook.com/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] profile info for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+
+        # Phase 1 — navigate to the profile (server-renders the header).
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 2 — let the document settle, then read the rendered HTML.
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        # Phase 3 — extract the profile node from the document's embedded JSON.
+        record = self.response_interceptor.parser.extract_profile_info(
+            html, handle
+        )
+        if record is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def profile_about_hybrid(
+        self,
+        handle: str,
+        sections: tuple = (
+            "directory_contact_info",
+            "directory_basic_info",
+            "directory_links",
+        ),
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a profile's About page (header + requested About sections).
+
+        Unlike `profile_info_hybrid`, this is NOT single-navigation: FB only
+        server-renders a sub-tab's fields (contact info, address/hours,
+        links, ...) when that specific sub-tab is navigated to directly, so
+        this does one landing navigation (`/<handle>/about/` — which also
+        renders the profile header for free, same fields
+        `profile_info_hybrid` returns) followed by one navigation per
+        requested section, using the sub-tab directory FB itself renders on
+        the landing page (`extract_profile_about_collections`) rather than
+        constructing sub-tab URLs — they're query-style for numeric-id
+        profiles (`?...&sk=directory_contact_info`) but path-style for
+        vanity handles (`/<handle>/directory_contact_info`), so only FB's
+        own rendered URLs are reliable.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile.
+            sections: Sub-tab keys to fetch, matched against the discovered
+                directory. A requested key absent from the directory is
+                skipped (not an error) — coverage varies a lot by account
+                (Pages vs. personal profiles expose different section sets).
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list
+            `[{"profile": profile_dict, "sections": [section_dict, ...]}]`
+            on success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "ProfileAbout"
+        target_url = f"https://www.facebook.com/{handle}/about/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] profile about for {target_url} (sections={sections})")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+
+        # Phase 1 — navigate to the About landing page (server-renders the
+        # header, same as ProfileInfo, plus the sub-tab directory).
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        parser = self.response_interceptor.parser
+        profile = parser.extract_profile_info(html, handle)
+        if profile is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        directory = parser.extract_profile_about_collections(html)
+        all_sections = list(parser.extract_profile_about_sections(html))
+
+        # Phase 2 — one navigation per requested section that this account
+        # actually has (per the discovered directory).
+        for tab_key in sections:
+            url = directory.get(tab_key)
+            if not url:
+                logger.info(
+                    f"[hybrid] profile about for {handle}: section "
+                    f"{tab_key!r} not present in this account's directory — skipping"
+                )
+                continue
+
+            error = await self._hybrid_navigate(
+                target_url=url,
+                post_nav_sleep_seconds=post_nav_sleep_seconds,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+            if error:
+                logger.warning(
+                    f"[hybrid] profile about for {handle}: navigation to "
+                    f"section {tab_key!r} failed ({error}) — skipping"
+                )
+                continue
+
+            if document_wait_seconds and document_wait_seconds > 0:
+                await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+            try:
+                section_html = await asyncio.wait_for(
+                    self.page.content(), timeout=operation_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                raise RendererHangError(
+                    f"page.content() timed out after {operation_timeout_seconds}s "
+                    f"(section={tab_key!r})"
+                )
+            all_sections.extend(parser.extract_profile_about_sections(section_html))
+
+        record = {"profile": profile, "sections": all_sections}
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
     # ---------------- Hybrid mode phases ----------------
 
     async def _hybrid_navigate(
