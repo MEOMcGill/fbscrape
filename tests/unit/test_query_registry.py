@@ -23,6 +23,8 @@ ALL_PAIRS = [
     ("PostDetail",          "hybrid", {"handle": "albertansunitedtostoptheucp", "post_id": "27209929835285847"}),
     ("ProfileInfo",         "hybrid", {"handle": "zuck"}),
     ("ProfileAbout",        "hybrid", {"handle": "61582991935083"}),
+    ("GroupInfo",           "hybrid", {"handle": "albertaseparatism"}),
+    ("GroupAbout",          "hybrid", {"handle": "albertaseparatism"}),
 ]
 
 
@@ -191,4 +193,6 @@ def test_endpoint_registry_top_level_keys_pinned():
         "PostDetail",
         "ProfileInfo",
         "ProfileAbout",
+        "GroupInfo",
+        "GroupAbout",
     }

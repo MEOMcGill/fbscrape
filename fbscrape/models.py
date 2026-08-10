@@ -270,6 +270,53 @@ class Query:
                 },
             },
         },
+        "GroupInfo": {
+            # Caller supplies the group's vanity `handle` (or numeric id;
+            # both resolve via /groups/<handle>/). Like ProfileInfo, there is
+            # NO GraphQL replay: FB server-renders the group header (name,
+            # privacy setting, member count, cover photo, content-view
+            # directory) into the document's embedded JSON — a `Group`-typed
+            # node carrying `viewer_join_state` — so the scrape reads the
+            # document directly. Single-shot, no pagination.
+            "query_required": ["handle"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        "post_nav_sleep_seconds": 3.0,
+                        # Max seconds to wait after navigation for the
+                        # server-rendered group header blob to settle before
+                        # reading the document.
+                        "document_wait_seconds": 4.0,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
+        "GroupAbout": {
+            # Caller supplies the group's vanity `handle` (or numeric id).
+            # Like GroupInfo, there is NO GraphQL replay. Unlike
+            # ProfileAbout, this IS single-navigation: FB renders the
+            # description, privacy/discoverability/history/location info
+            # items, activity stats, rules, and admin facepile all together
+            # on the one About page (`/groups/<handle>/about/`) — no
+            # per-sub-tab navigation needed.
+            #
+            # Admin/moderator data is best-effort: `admin_profiles` comes
+            # from a UI "facepile" that FB may truncate for groups with many
+            # admins/moderators, while `admin_and_moderator_count` (from the
+            # Rules card) is the exact combined count — so the roster can
+            # undercount relative to that number for large admin teams.
+            "query_required": ["handle"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        "post_nav_sleep_seconds": 3.0,
+                        "document_wait_seconds": 4.0,
+                        "operation_timeout_seconds": 120,
+                    },
+                },
+            },
+        },
         "CommentsList": {
             # Caller supplies the parent post's `handle` (vanity handle of the
             # author / page that owns the post — needed for the navigation URL)

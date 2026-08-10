@@ -938,6 +938,117 @@ class FacebookScraper:
         )
         return result
 
+    async def group_info(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a group's header info (single-shot).
+
+        FB server-renders the group header (name, privacy setting, member
+        count, cover photo, content-view directory) into the group page's
+        embedded JSON rather than firing a GraphQL XHR, so this navigates to
+        the group and extracts the header node from the rendered document.
+        No pagination, no date filter. Returns a `ScrapingResult` whose
+        `data` is a 1-element list `[group_dict]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="GroupInfo")`.
+
+        Args:
+            handle: Vanity handle or numeric id of the group — drives the
+                navigation URL (`https://www.facebook.com/groups/<handle>/`).
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["GroupInfo"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[group_dict]` on success or `[]`
+            on failure (with `result` carrying the reason, e.g. `parse_error`
+            when the group is private / not visible to the account).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="GroupInfo",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting GroupInfo task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed GroupInfo (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
+    async def group_about(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a group's About page (header + description, activity, rules,
+        admin facepile).
+
+        Unlike ProfileAbout, this IS single-navigation: FB renders every
+        About card together on the one page (`/groups/<handle>/about/`).
+        Returns a `ScrapingResult` whose `data` is a 1-element list
+        `[{"group": group_dict, "cards": [...]}]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="GroupAbout")` — the
+        flattened row is a superset of what `group_info` returns.
+
+        Admin/moderator data is best-effort: the admin roster comes from a
+        UI "facepile" FB may truncate for groups with many admins/
+        moderators, while the returned count is exact — see
+        `_flatten_group_about_record`'s docstring.
+
+        Args:
+            handle: Vanity handle or numeric id of the group.
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["GroupAbout"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[{"group": ..., "cards": ...}]`
+            on success or `[]` on failure (with `result` carrying the reason).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="GroupAbout",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting GroupAbout task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed GroupAbout (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
     async def profile_authenticity(
         self,
         user_id: str,
