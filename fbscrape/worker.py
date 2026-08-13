@@ -276,7 +276,15 @@ class Worker:
                     # `task` here so the rebuild that used to happen inside
                     # BrowserSession is gone — the Query is constructed exactly
                     # once, in scraper.user_timeline.
-                    outcome = await method(**task.query, **task.params)
+                    #
+                    # `runtime_options` carries the non-serializable per-call
+                    # extras (streaming media sinks / on_new_posts callback);
+                    # they spread as kwargs like params but never reach the
+                    # saved Query. On a retry the fresh session re-installs
+                    # them, so a rotated account keeps streaming media.
+                    outcome = await method(
+                        **task.query, **task.params, **(task.runtime_options or {})
+                    )
 
                     # Accumulate scrolls performed by THIS session (a fresh
                     # BrowserSession is created per task, so `scrolls_recorded`

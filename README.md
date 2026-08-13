@@ -379,6 +379,13 @@ fbscrape flatten data/posts/ --output data/merged.parquet --concat
 # Download media (within ~3 days of scrape — fbcdn URLs expire ~4-5 days out)
 fbscrape download-media data/posts/zuck_UserTimeline_hybrid.json --include-thumbnails
 
+# ...or collect media DURING the scrape, so signatures are never stale.
+# Immediately (pagination waits on each batch's downloads):
+fbscrape scrape user-timeline zuck --download-media
+# Handed off to another process (near-zero cost to the scrape):
+fbscrape scrape user-timeline zuck --media-manifest data/media_queue.jsonl
+fbscrape download-media data/media_queue.jsonl --from-manifest --out-dir data/media/
+
 # Inspect a cURL copied from DevTools — prints a structured GraphQL summary
 # (friendly_name, doc_id, decoded `variables` JSON, key headers). Cookie /
 # fb_dtsg / lsd / jazoest are redacted by default; pass --raw to disable
@@ -392,6 +399,74 @@ depend on the subcommand: `handle` + optional `start_date` / `end_date` for
 `handle` + `post_id` (both required) for `comments-list` and `post-detail`;
 `page_id` (required) + `handle` (optional) for `page-transparency`; `user_id`
 for `profile-authenticity`.
+
+### Media: during the scrape, or after it
+
+fbcdn URLs are self-signed (`oh=` signature, `oe=` expiry) and go stale in about
+4–5 days — after that they answer HTTP 403 `Bad URL hash`. So there are three
+ways to get the pixels, and the right one depends on how much you trust the gap
+between scraping and downloading:
+
+| Path | How | Cost | Use when |
+| --- | --- | --- | --- |
+| Post-hoc | `fbscrape download-media <file>` | none to the scrape | you'll download within a couple of days |
+| Immediate | `--download-media` during the scrape | pagination waits on each batch's fetches | the scrape is long, or the media matters more than speed |
+| Handoff | `--media-manifest <path.jsonl>` during the scrape | ~nothing (one appended line per item) | you want fresh URLs *and* a fast scrape |
+
+The two in-scrape flags work on every post-bearing endpoint — `user-timeline`,
+`group-timeline`, `search`, `comments-list`, `post-detail` — and can be combined
+(download now, keep the manifest as a record of what was queued):
+
+```bash
+# Immediate: media lands in <output-dir>/media/<target>/ as each batch is parsed
+fbscrape scrape group-timeline albertaseparatism --download-media
+fbscrape scrape group-timeline albertaseparatism --media-dir /data/media   # implies --download-media
+
+# Handoff: append one line per media item; drain it from any other process
+fbscrape scrape user-timeline zuck meta --media-manifest data/media_queue.jsonl
+fbscrape download-media data/media_queue.jsonl --from-manifest --out-dir data/media/
+
+# Both, plus thumbnails and a tighter fetch pool
+fbscrape scrape search 'mark carney' --download-media --media-manifest q.jsonl \
+  --include-thumbnails --media-concurrency 4
+```
+
+Manifest lines are plain JSONL (`.jsonl.gz` also works — pass a `.gz` path), one
+per media item, and are safe to append to from several concurrent sessions:
+
+```json
+{"post_id": "1234", "kind": "image", "idx": 0, "url": "https://scontent...", "ext": "jpg",
+ "filename": "1234_img_00.jpg", "queued_at": "2026-08-13T18:20:04+00:00",
+ "endpoint": "GroupTimeline", "label": "albertaseparatism"}
+```
+
+`filename` is the same name the immediate path writes (`<post_id>_img_00.jpg`,
+`_vid_00.mp4`, `_thumb_00.jpg`), so a drain into the same directory skips what's
+already there. `queued_at` tells a consumer how much signature runway is left.
+Comment attachments are named after the comment id.
+
+From the Python API the same options are keyword arguments on every
+post-bearing scraper method, plus `on_new_posts` for your own sink:
+
+```python
+async with FacebookScraper(db="db/accounts.db") as scraper:
+    async def index_batch(posts):           # sync or async, both work
+        await my_queue.put(posts)           # raw (unflattened) records
+
+    result = await scraper.group_timeline(
+        "albertaseparatism",
+        start_date="2025-01-01",
+        download_media=True,                # requires media_dir
+        media_dir="data/media/albertaseparatism",
+        media_manifest="data/media_queue.jsonl",
+        include_thumbnails=True,
+        on_new_posts=index_batch,
+    )
+```
+
+A sink that raises is logged and skipped — a CDN hiccup or a bug in your callback
+can't kill the scrape. See [`docs/media_streaming.md`](docs/media_streaming.md)
+for the mechanism.
 
 ### Account Management
 

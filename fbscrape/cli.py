@@ -1031,6 +1031,85 @@ def _existing_output_for_stem(output_dir: str, stem: str) -> str | None:
     return None
 
 
+# ============== In-scrape media options (shared by scrape subcommands) ==============
+
+def media_stream_options(f):
+    """Stack the in-scrape media flags onto a scrape subcommand.
+
+    Two ways to get media out of a scrape, matching
+    `BrowserSession._install_stream_hook`:
+      - immediately: `--download-media` (+ optional `--media-dir`) fetches each
+        batch's photos/videos as the scrape parses it;
+      - handed off: `--media-manifest` appends one JSONL line per media item for
+        another process to drain (`fbscrape download-media --from-manifest`).
+    Both can be on at once. Neither on = no media work, no added cost.
+
+    Decorators apply bottom-up, so these are listed in reverse display order.
+    Every decorated command must accept the five names as parameters and pass
+    them to `_media_runtime_kwargs`.
+    """
+    for decorator in reversed([
+        click.option('--download-media', is_flag=True,
+                     help='Download each batch of posts\' photos/videos DURING the scrape '
+                          '(fbcdn URLs are signed and expire ~4-5 days out, so this '
+                          'guarantees fresh signatures). Slows the scrape: pagination '
+                          'waits on each batch\'s downloads. Implied by --media-dir.'),
+        click.option('--media-dir', default=None,
+                     help='Base directory for in-scrape media; each target gets its own '
+                          'subdirectory (<media-dir>/<target>/). Implies --download-media. '
+                          'Default: <output-dir>/media/<target>/.'),
+        click.option('--media-manifest', default=None,
+                     help='Append one JSON line per media item (url, target filename, '
+                          'queued_at) to this .jsonl / .jsonl.gz file instead of — or '
+                          'alongside — downloading, for a separate process to drain with '
+                          '`fbscrape download-media --from-manifest`. Near-zero cost to '
+                          'the scrape. All targets in the run append to the one file; '
+                          'each line records its endpoint + target label.'),
+        click.option('--media-concurrency', default=8, type=int,
+                     help='Concurrent media fetches per batch when --download-media is on '
+                          '(default 8).'),
+        click.option('--include-thumbnails', is_flag=True,
+                     help='Also download / queue video thumbnail images.'),
+    ]):
+        f = decorator(f)
+    return f
+
+
+def _media_runtime_kwargs(
+    output_dir: str,
+    label: str,
+    download_media: bool,
+    media_dir: str | None,
+    media_manifest: str | None,
+    media_concurrency: int,
+    include_thumbnails: bool,
+) -> dict:
+    """Translate the shared media flags into `FacebookScraper.*` kwargs for one
+    target. Returns `{}` when no media sink is enabled, so a plain scrape call is
+    untouched.
+
+    `--media-dir` implies `--download-media` (asking where to put the files is
+    asking for the files). Media lands in a per-target subdirectory, matching the
+    `media/<handle>/` layout the post-hoc `download-media` command writes.
+    """
+    download_media = download_media or media_dir is not None
+    if not (download_media or media_manifest):
+        return {}
+
+    target_dir = None
+    if download_media:
+        base = media_dir or os.path.join(output_dir, 'media')
+        target_dir = os.path.join(base, label)
+
+    return {
+        "download_media": download_media,
+        "media_dir": target_dir,
+        "media_manifest": media_manifest,
+        "media_concurrency": media_concurrency,
+        "include_thumbnails": include_thumbnails,
+    }
+
+
 @cli.group()
 def scrape():
     """Run scraping jobs"""
@@ -1113,6 +1192,7 @@ def scrape():
                    'to start fresh with adjusted end_date. Mutually exclusive '
                    'with --skip-existing. Errors when combined with '
                    '--mode manual (no cursor concept).')
+@media_stream_options
 @click.pass_context
 def scrape_user_timeline(
     ctx, handles, input_file, start_date, end_date, output_dir, max_sessions,
@@ -1122,6 +1202,7 @@ def scrape_user_timeline(
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
     skip_existing, continue_,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
 ):
     """Scrape a user's timeline between two dates.
 
@@ -1139,6 +1220,11 @@ def scrape_user_timeline(
     Force the scroll-driven path:
       fbscrape scrape user-timeline zuck --start-date 2024-01-01 --end-date 2025-01-01 \\
         --mode manual
+
+    \b
+    Grab media as you scrape (fbcdn URLs expire ~4-5 days after the scrape):
+      fbscrape scrape user-timeline zuck --download-media
+      fbscrape scrape user-timeline zuck --media-manifest data/media_queue.jsonl
     """
     from .scraper import FacebookScraper
     from .logger import set_log_level, logger
@@ -1243,6 +1329,10 @@ def scrape_user_timeline(
                     end_date=t['end_date'],
                     mode=mode,
                     resume_from=_existing_output_path(t) if continue_ else None,
+                    **_media_runtime_kwargs(
+                        output_dir, t['handle'], download_media, media_dir,
+                        media_manifest, media_concurrency, include_thumbnails,
+                    ),
                     **mode_params,
                 )
                 for t in targets
@@ -1345,6 +1435,7 @@ def scrape_user_timeline(
                    '(server-side state), so a stale cursor may yield empty '
                    'results or trip the cursor-reset detector — partial data '
                    'is still preserved in either case.')
+@media_stream_options
 @click.pass_context
 def scrape_group_timeline(
     ctx, handles, input_file, start_date, end_date, output_dir, max_sessions,
@@ -1354,6 +1445,7 @@ def scrape_group_timeline(
     pagination_sleep_std, template_capture_timeout, post_nav_sleep_seconds,
     request_timeout_ms, max_no_progress_streak, max_consecutive_out_of_range,
     operation_timeout_seconds, wait_for_account, skip_existing, continue_,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
 ):
     """Scrape a group's feed between two dates (hybrid mode only).
 
@@ -1464,6 +1556,10 @@ def scrape_group_timeline(
                     start_date=t['start_date'],
                     end_date=t['end_date'],
                     resume_from=_existing_output_path(t) if continue_ else None,
+                    **_media_runtime_kwargs(
+                        output_dir, t['handle'], download_media, media_dir,
+                        media_manifest, media_concurrency, include_thumbnails,
+                    ),
                     **mode_params,
                 )
                 for t in targets
@@ -1795,6 +1891,7 @@ def _parse_filter_options(
                    'raising NoAccountError when the pool is empty/locked.')
 @click.option('--skip-existing', is_flag=True,
               help='Skip queries whose output JSON file already exists in --output-dir.')
+@media_stream_options
 @click.pass_context
 def scrape_search(
     ctx, queries, input_file, filter_opts, raw_filter_opts, output_dir, max_sessions,
@@ -1804,6 +1901,7 @@ def scrape_search(
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
     skip_existing,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
 ):
     """Scrape Facebook search results.
 
@@ -1903,6 +2001,12 @@ def scrape_search(
                     query_text=t['query_text'],
                     filters=t['filters'],
                     mode=mode,
+                    **_media_runtime_kwargs(
+                        output_dir,
+                        _sanitize_query_for_filename(t['query_text']),
+                        download_media, media_dir, media_manifest,
+                        media_concurrency, include_thumbnails,
+                    ),
                     **mode_params,
                 )
                 for t in targets
@@ -1980,6 +2084,7 @@ def scrape_search(
               help='Resume each target from its prior saved file (matches on '
                    '<handle>_<post_id>_CommentsList_hybrid stem). '
                    'Mutually exclusive with --skip-existing.')
+@media_stream_options
 @click.pass_context
 def scrape_comments_list(
     ctx, pairs, input_file, output_dir, max_sessions, scroll_threshold,
@@ -1989,6 +2094,7 @@ def scrape_comments_list(
     template_capture_timeout, post_nav_sleep_seconds, request_timeout_ms,
     max_no_progress_streak, operation_timeout_seconds, wait_for_account,
     skip_existing, continue_,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
 ):
     """Scrape top-level comments on a post (hybrid mode only).
 
@@ -2104,6 +2210,10 @@ def scrape_comments_list(
                     post_id=t['post_id'],
                     max_results=max_results if max_results is not None else -1,
                     resume_from=_existing_output_path(t) if continue_ else None,
+                    **_media_runtime_kwargs(
+                        output_dir, _stem_for_target(t), download_media, media_dir,
+                        media_manifest, media_concurrency, include_thumbnails,
+                    ),
                     **mode_params,
                 )
                 for t in targets
@@ -2255,11 +2365,13 @@ def scrape_page_transparency(
               help='per-await safety timeout for hangs (default 120)')
 @click.option('--wait-for-account', is_flag=True,
               help='Block (polling every 5s) until an account frees up.')
+@media_stream_options
 @click.pass_context
 def scrape_post_detail(
     ctx, pairs, input_file, output_dir, is_group, max_sessions,
     scroll_threshold, headless, mobile, log_level, post_nav_sleep_seconds,
     document_wait_seconds, operation_timeout_seconds, wait_for_account,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
 ):
     """Fetch a single post's content by its permalink (hybrid mode only).
 
@@ -2315,6 +2427,13 @@ def scrape_post_detail(
                     handle=t['handle'],
                     post_id=t['post_id'],
                     is_group=is_group,
+                    **_media_runtime_kwargs(
+                        output_dir,
+                        f"{t['handle'].replace('.', '_')}_"
+                        f"{_commentslist_post_id_label(t['post_id'])}",
+                        download_media, media_dir, media_manifest,
+                        media_concurrency, include_thumbnails,
+                    ),
                     **mode_params,
                 )
                 for t in targets
@@ -2814,13 +2933,19 @@ def unstick_cursor(paths, rank, only_if_stuck, dry_run, log_level):
 
 @cli.command(name='download-media')
 @click.argument('input_path')
+@click.option('--from-manifest', is_flag=True,
+              help='Treat INPUT_PATH as a media manifest written during a scrape '
+                   '(`fbscrape scrape ... --media-manifest <path>`) rather than a '
+                   'scraped posts file: each line already carries the media URL and '
+                   'its target filename. Requires --out-dir.')
 @click.option('--out-dir', default=None, help='Directory to save media (default: <input_dir>/media/<handle>/)')
 @click.option('--include-thumbnails', is_flag=True, help='Also download video thumbnails')
 @click.option('--concurrency', default=8, type=int, help='Concurrent downloads (default 8)')
 @click.option('--no-skip-existing', is_flag=True, help='Re-download files that already exist')
 @click.option('--timeout', default=60, type=int, help='Per-request timeout in seconds (default 60)')
 @click.option('--log-level', default='INFO', help='Log level (DEBUG/INFO/WARNING/ERROR)')
-def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip_existing, timeout, log_level):
+def download_media(input_path, from_manifest, out_dir, include_thumbnails, concurrency,
+                   no_skip_existing, timeout, log_level):
     """Download media (images and videos) from a scraped posts JSON or directory.
 
     \b
@@ -2837,15 +2962,45 @@ def download_media(input_path, out_dir, include_thumbnails, concurrency, no_skip
       fbscrape download-media data/posts/foo.json
       fbscrape download-media data/posts/foo.json.gz
       fbscrape download-media data/posts/2025-06-01_2026-02-17/ --include-thumbnails
+
+    \b
+    Drain a manifest a running scrape is appending to (the handoff path):
+      fbscrape download-media data/media_queue.jsonl --from-manifest --out-dir data/media/
     """
     import json as _json
-    from .downloaders import download_media_from_posts
+    from .downloaders import download_media_from_manifest, download_media_from_posts
     from .logger import set_log_level
 
     set_log_level(log_level)
 
     if not os.path.exists(input_path):
         raise click.UsageError(f"Path not found: {input_path}")
+
+    if from_manifest:
+        if os.path.isdir(input_path):
+            raise click.UsageError("--from-manifest expects a manifest file, not a directory.")
+        if not out_dir:
+            raise click.UsageError(
+                "--from-manifest requires --out-dir (manifest lines carry filenames, "
+                "not a destination directory)."
+            )
+
+        async def _run_manifest():
+            click.echo(f"{input_path} -> {out_dir}")
+            summary = await download_media_from_manifest(
+                input_path,
+                out_dir,
+                concurrency=concurrency,
+                skip_existing=not no_skip_existing,
+                timeout_sec=timeout,
+            )
+            click.echo(
+                f"  total={summary['total']} saved={summary['saved']} "
+                f"skipped={summary['skipped']} failed={summary['failed']}"
+            )
+
+        run_async(_run_manifest())
+        return
 
     if os.path.isdir(input_path):
         files = sorted(

@@ -2,6 +2,7 @@
 from .accounts_pool import AccountsPool
 from .response import ResponseInterceptor, FacebookGraphQLParser
 from .account import Account
+from .downloaders import build_media_stream_hook, combine_post_hooks
 from .logger import logger
 from .models import ScrapeOutcome
 from .utils import (
@@ -31,9 +32,10 @@ import random
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs, quote, urlencode
+from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright, Browser
 from camoufox.async_api import AsyncNewBrowser
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 import re
 
 
@@ -302,6 +304,12 @@ class BrowserSession:
         max_no_new_posts_streak: int = 30,
         stall_timeout_seconds: float = 300,
         operation_timeout_seconds: float = 900,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Scrape a user's timeline by driving scroll and intercepting GraphQL responses.
 
@@ -311,6 +319,14 @@ class BrowserSession:
                 bound). When start_date is None, the "oldest post < start"
                 stop is disabled — the scrape relies on no_new_posts_streak
                 and the GraphQL-silence watchdog for termination.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: per-batch streaming
+                sinks — see `_install_stream_hook`. Here they fire from the
+                interceptor's auto-extract path (one batch per GraphQL
+                response), not from a pagination loop. Playwright dispatches
+                response handlers as tasks, so a sink never slows the scroll
+                loop — but an in-flight download can be cut short when the
+                session closes. Prefer `media_manifest` in manual mode.
 
         Returns:
             ScrapeOutcome.
@@ -337,6 +353,15 @@ class BrowserSession:
         logger.info(f"Scraping @{handle}'s homepage from {start_date} to {end_date}")
 
         self.response_interceptor.flush()
+        self._install_stream_hook(
+            label=handle,
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         while True:
             try:
@@ -541,6 +566,12 @@ class BrowserSession:
         request_timeout_ms: int = 30000,
         max_no_progress_streak: int = 5,
         operation_timeout_seconds: float = 900,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Scrape a user's timeline by replaying ProfileCometTimelineFeedRefetchQuery via page.request.post().
 
@@ -552,6 +583,9 @@ class BrowserSession:
                 directly is an opt-out). When start_date is None, the
                 date-bounded stops (`OldestInBatchBelowStartDate`,
                 `ConsecutiveOutOfRange`) no-op via their existing guards.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: per-batch streaming
+                sinks — see `_install_stream_hook`.
 
         Returns:
             ScrapeOutcome.
@@ -596,6 +630,15 @@ class BrowserSession:
         self.response_interceptor.flush()
         # All posts come from explicit replays; ignore natural PCTFRQ bodies which carry no date filters.
         self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=handle,
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Resume seed (mirrors group_timeline_hybrid). Must run AFTER flush()
         # (which clears seen_post_ids) and BEFORE the loop.
@@ -688,6 +731,12 @@ class BrowserSession:
         request_timeout_ms: int = 30000,
         max_no_progress_streak: int = 5,
         operation_timeout_seconds: float = 900,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Scrape Facebook search results for `query_text`.
 
@@ -706,6 +755,9 @@ class BrowserSession:
             filters: Optional dict of search filters. Known keys: "recent_posts",
                 "creation_time" (with "start"/"end" YYYY-MM-DD sub-keys).
                 Unknown keys are passed as raw blob entries. None = no filters.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: per-batch streaming
+                sinks — see `_install_stream_hook`.
 
         Returns:
             ScrapeOutcome.
@@ -751,6 +803,15 @@ class BrowserSession:
 
         self.response_interceptor.flush()
         self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=query_text,
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Phase 1 — navigate to filtered search URL
         error = await self._hybrid_navigate(
@@ -846,6 +907,12 @@ class BrowserSession:
         max_no_progress_streak: int = 5,
         max_consecutive_out_of_range: int = 20,
         operation_timeout_seconds: float = 900,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Scrape a group's feed by replaying GroupsCometFeedRegularStoriesPaginationQuery.
 
@@ -900,6 +967,9 @@ class BrowserSession:
                 loop starts. Prevents previously-collected posts from
                 being re-added when a resume run re-encounters them in
                 the bootstrap edge.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: per-batch streaming
+                sinks — see `_install_stream_hook`.
 
         Returns:
             ScrapeOutcome.
@@ -949,6 +1019,15 @@ class BrowserSession:
         # auto-populate self.posts would mix algorithmic ordering into the
         # output. Mirrors UserTimeline / Search hybrid.
         self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=handle,
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Resume seed: prime the interceptor's dedup set with IDs from a
         # prior run so bootstrap-edge highlights we already collected don't
@@ -1057,6 +1136,12 @@ class BrowserSession:
         request_timeout_ms: int = 30000,
         max_no_progress_streak: int = 5,
         operation_timeout_seconds: float = 900,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Scrape top-level comments on a post by replaying
         CommentsListComponentsPaginationQuery.
@@ -1092,6 +1177,11 @@ class BrowserSession:
             seen_comment_ids_to_skip: Optional iterable of comment_id strings
                 to seed `ResponseInterceptor.seen_post_ids` with (the same
                 set is reused for comment dedup across resume runs).
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: per-batch streaming
+                sinks — see `_install_stream_hook`. Media here means comment
+                attachments (photo / video / GIF replies), named after the
+                comment id rather than a post id.
 
         Returns:
             ScrapeOutcome with `data` = list of Comment-shaped records (one
@@ -1128,6 +1218,15 @@ class BrowserSession:
         # would have no effect either way — we collect manually inside the
         # loop. Turn it off for clarity / symmetry with other hybrid paths.
         self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=f"{handle}/{post_id}",
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Resume seed: comments dedup uses the same `seen_post_ids` set
         # (it's name-only — the set is really "seen record ids" for whatever
@@ -1299,7 +1398,12 @@ class BrowserSession:
                 parsed = None
             comments = (parsed or {}).get("comments") or []
             if comments:
-                self.response_interceptor.add_posts(comments)
+                # Same streaming-sink contract as _hybrid_pagination_loop. Comment
+                # records carry the same `attachments` shape as Stories, so photo /
+                # video comments flow through the media path too.
+                await self.response_interceptor.fire_new_posts(
+                    self.response_interceptor.add_posts(comments)
+                )
             end_cursor = (parsed or {}).get("end_cursor")
             has_next_page = bool((parsed or {}).get("has_next_page"))
 
@@ -1647,6 +1751,12 @@ class BrowserSession:
         post_nav_sleep_seconds: float = 3.0,
         document_wait_seconds: float = 4.0,
         operation_timeout_seconds: float = 120,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
     ) -> ScrapeOutcome:
         """Fetch a single post's Story from its permalink (single-shot).
 
@@ -1667,6 +1777,10 @@ class BrowserSession:
             document_wait_seconds: Extra settle time after navigation before
                 reading the document, so the server-rendered Story blob is
                 present.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: streaming sinks — see
+                `_install_stream_hook`. Fired once, with the single extracted
+                record, before returning.
 
         Returns:
             ScrapeOutcome with `data` as a 1-element list `[{"node": story}]`
@@ -1680,6 +1794,15 @@ class BrowserSession:
 
         self.response_interceptor.flush()
         self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=f"{handle}/{post_id}",
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Phase 1 — navigate to the permalink (server-renders the Story).
         error = await self._hybrid_navigate(
@@ -1719,12 +1842,69 @@ class BrowserSession:
                 time_taken=datetime.now(timezone.utc) - scrape_start_time,
             )
 
+        # Single-record endpoint: no add_posts / dedup set involved, so fire the
+        # streaming sinks directly with the one record.
+        await self.response_interceptor.fire_new_posts([record])
+
         return ScrapeOutcome(
             result='success',
             data=[record],
             time_started=scrape_start_time,
             time_taken=datetime.now(timezone.utc) - scrape_start_time,
         )
+
+    # ---------------- Streaming sinks (media / caller hooks) ----------------
+
+    def _install_stream_hook(
+        self,
+        label: str,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
+    ) -> None:
+        """Compose the per-batch streaming sinks and arm the interceptor with them.
+
+        Called by each scrape method AFTER `response_interceptor.flush()` (which
+        clears the hook) and BEFORE any collection starts. From then on every
+        batch of newly-collected records is handed to the composed hook:
+          - manual mode: fired by `ResponseInterceptor.intercept_response` on the
+            auto-extract path;
+          - hybrid modes: fired by the pagination loops (and by
+            `post_detail_hybrid` for its single record) right after `add_posts`.
+
+        Sinks (any combination; None/False everywhere = no hook installed, zero
+        added cost):
+          - `download_media=True` + `media_dir`: fetch each batch's photos and
+            videos immediately, while the fbcdn signatures are certainly fresh.
+            Pagination waits on the download, so the scrape runs slower.
+          - `media_manifest=<path.jsonl>`: append one line per media item (URL,
+            target filename, `queued_at`) for a separate process to drain via
+            `fbscrape download-media --from-manifest`. Near-zero loop cost.
+          - `on_new_posts`: the caller's own sync/async callback, handed each
+            batch of raw (unflattened) records.
+
+        A raising sink is logged and skipped — never fatal to the scrape.
+        """
+        media_cb = build_media_stream_hook(
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+            context={"endpoint": self.endpoint, "label": label},
+        )
+        hook = combine_post_hooks([media_cb, on_new_posts])
+        self.response_interceptor.on_new_posts = hook
+        if hook is not None:
+            logger.info(
+                f"[media] {self.endpoint} {label}: streaming sinks armed "
+                f"(download={download_media}, dir={media_dir}, "
+                f"manifest={media_manifest}, thumbnails={include_thumbnails}, "
+                f"caller_hook={on_new_posts is not None})"
+            )
 
     # ---------------- Hybrid mode phases ----------------
 
@@ -1947,7 +2127,12 @@ class BrowserSession:
                 logger.warning(f"[hybrid] @{label}: parser raised: {e}")
                 parsed = None
             if parsed and parsed.get("posts"):
-                self.response_interceptor.add_posts(parsed["posts"])
+                # Streaming sinks (in-scrape media download / manifest handoff /
+                # caller hook) fire on the deduped batch, before the stop-condition
+                # walk — so a batch that terminates the loop still gets its media.
+                await self.response_interceptor.fire_new_posts(
+                    self.response_interceptor.add_posts(parsed["posts"])
+                )
 
             # Auth-ish errors → raise so Worker rotates the account.
             # In-body rate-limits → return 'rate_limit' so Worker locks 24h + rotates.

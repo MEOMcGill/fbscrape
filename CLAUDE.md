@@ -1,6 +1,6 @@
 # Project Context
 
-**Last Updated:** 2026-06-29
+**Last Updated:** 2026-08-13
 
 `fbscrape` is a Facebook timeline scraper built on Camoufox (stealth Firefox) with persistent SQLite-backed account rotation, parallel browser sessions, and two pluggable scrape strategies per endpoint.
 
@@ -59,9 +59,22 @@ FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
 
 ---
 
+## In-scrape media streaming
+
+Media can be collected *as* the scrape runs instead of afterwards (fbcdn signatures die in ~4-5 days). Two sinks, per batch of newly-parsed records, on every post-bearing endpoint (`UserTimeline` incl. manual, `Search`, `GroupTimeline`, `CommentsList`, `PostDetail`):
+
+- **immediate** — `download_media=True` + `media_dir` fetches the batch's media inline (pagination waits on it).
+- **handoff** — `media_manifest=<path.jsonl>` appends one line per media item (`url`, `filename`, `queued_at`, `endpoint`, `label`) for another process to drain (`fbscrape download-media --from-manifest`). Near-zero loop cost.
+
+Chain: CLI flags (`--download-media`/`--media-dir`/`--media-manifest`/`--media-concurrency`/`--include-thumbnails`) → `cli._media_runtime_kwargs` → scraper kwargs → `scraper._stream_runtime_options` → `Query.runtime_options` (excluded from `to_dict`/equality/repr — not part of the scrape spec) → `Worker` spreads it as kwargs → `BrowserSession._install_stream_hook` → `downloaders.build_media_stream_hook` + `combine_post_hooks` → `ResponseInterceptor.on_new_posts`.
+
+Firing points: `add_posts` returns the deduped batch; `ResponseInterceptor.fire_new_posts(batch)` runs the hook (awaits async, logs+swallows exceptions). Called from `intercept_response` (manual mode auto-extract), from both hybrid pagination loops right after `add_posts` (before the stop-condition walk), and once from `post_detail_hybrid`. Never double-fires: hybrid sets `extract_posts = False`. Install the hook AFTER `flush()` (which clears it). `on_new_posts` also accepts the caller's own sync/async callback. Deep dive: [`docs/media_streaming.md`](docs/media_streaming.md).
+
+---
+
 ## Key types (`models.py`)
 
-- `Query(endpoint, mode, query, params)` — scrape spec. Validated at construction; fills defaults from registry.
+- `Query(endpoint, mode, query, params, runtime_options=None)` — scrape spec. Validated at construction; fills defaults from registry. `runtime_options` holds non-serializable per-call streaming sinks (see above) and is excluded from serialization/equality.
 - `ScrapeOutcome(result, data, time_started, time_taken, last_cursor, post_count, spill_path)` — Query-agnostic outcome from `BrowserSession`. Records are inline in `data` (single-record endpoints; manual mode) or spilled to `spill_path` `.jsonl.gz` (write-on-parse paginated scrapes).
 - `ScrapingResult(query, result, data, ...)` — final result. `num_records` = `post_count` or `len(data)`; `iter_posts()` streams from spill or iterates inline. Saved as one-post-per-line JSONL (`<stem>.jsonl.gz`, KDD 24). `jsonl_store.load_scrape_file` reads both JSONL and legacy envelope formats.
 
@@ -91,7 +104,8 @@ In-body rate-limit (`errors[{code:1675004}]`) → `'rate_limit'` result, account
 ## `ResponseInterceptor` state (`response.py`)
 
 Per-`BrowserSession` page-event hook. Key fields:
-- `posts`, `add_posts()` — accumulator + dedup (by `post_id`).
+- `posts`, `add_posts()` — accumulator + dedup (by `post_id`); returns the newly-added batch.
+- `on_new_posts` / `fire_new_posts()` — per-batch streaming sink (in-scrape media download / manifest handoff / caller hook). Cleared by `flush()`.
 - `viewer_seen` — login-success marker (non-null `data.viewer` in any GraphQL response).
 - `latest_csr` / `latest_dyn` — freshest tokens for hybrid replay splicing.
 - `latest_pctfrq_request` / `latest_scrq_request` / `latest_gcfrspq_request` — template capture for paginated endpoints.
@@ -117,7 +131,7 @@ fbscrape/
 ├── browser_session.py   # Browser lifecycle, login, scrape methods (manual + hybrid)
 ├── cli.py               # Click-based CLI
 ├── db.py                # Database with migration system
-├── downloaders.py       # Async media downloader
+├── downloaders.py       # Media extraction/download + manifest handoff + streaming hooks
 ├── exceptions.py        # Custom exceptions
 ├── jsonl_store.py       # JSONL I/O: writer, dual-format readers, resume tail-read, converter
 ├── logger.py            # Loguru logging
@@ -154,9 +168,14 @@ fbscrape scrape page-transparency 899800046546098
 fbscrape scrape profile-authenticity 100044331674441
 fbscrape scrape post-detail albertansunitedtostoptheucp:27209929835285847 --group
 
+# Media during the scrape (fbcdn signatures expire ~4-5 days out)
+fbscrape scrape user-timeline zuck --download-media
+fbscrape scrape group-timeline albertaseparatism --media-manifest data/media_queue.jsonl
+
 # Post-process
 fbscrape flatten data/posts/ --format parquet
 fbscrape download-media data/posts/ --concurrency 12
+fbscrape download-media data/media_queue.jsonl --from-manifest --out-dir data/media/
 fbscrape utils convert-to-jsonl data/posts/ --dry-run
 ```
 
@@ -170,6 +189,7 @@ Full CLI reference (all flags, `--input-file`, `--continue`, `--skip-existing`):
 |---|---|
 | [`docs/architecture/endpoints.md`](docs/architecture/endpoints.md) | Per-endpoint strategy deep dives |
 | [`docs/search_filters.md`](docs/search_filters.md) | Search filter dict/CLI usage + how to add a new filter |
+| [`docs/media_streaming.md`](docs/media_streaming.md) | In-scrape media: immediate download vs. manifest handoff |
 | [`docs/design_decisions.md`](docs/design_decisions.md) | All 25 key design decisions |
 | [`docs/hybrid/overview.md`](docs/hybrid/overview.md) | Hybrid mode empirical evidence |
 | [`docs/architecture/account_management.md`](docs/architecture/account_management.md) | Account state machine + DB semantics |

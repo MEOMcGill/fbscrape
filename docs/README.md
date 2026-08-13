@@ -13,6 +13,10 @@ Reference for someone modifying the core scrape flow.
 - [`architecture/overview.md`](architecture/overview.md) — design goals, component breakdown (`FacebookScraper` → `WorkerPool` → `Worker` → `BrowserSession`), data flow, and why concurrency / lazy init / rotation work the way they do.
 - [`architecture/account_management.md`](architecture/account_management.md) — account state machine, lifecycle, and which exception → DB-write paths fire account rotation, marking inactive, locking for cooldown, etc.
 
+## Media
+
+- [`media_streaming.md`](media_streaming.md) — collecting media *during* a scrape instead of after it: the `runtime_options` → per-batch-hook chain, the immediate vs. manifest-handoff sinks, the manifest line format, filename authority, and the cost model. Read this before touching `downloaders.py` or the hook firing points.
+
 ## Hybrid mode
 
 Reverse-engineering of FB's request shapes. Useful only if you're touching the hybrid scrape path or debugging anti-bot behavior.

@@ -86,6 +86,35 @@ def _read_resume_state(path: str) -> tuple[str, list[str]]:
 MAX_CURSOR_RESET_RESUMES = 5
 
 
+def _stream_runtime_options(
+    on_new_posts=None,
+    download_media: bool = False,
+    media_dir=None,
+    media_manifest=None,
+    media_concurrency: int = 8,
+    include_thumbnails: bool = False,
+) -> dict | None:
+    """Bundle the per-call streaming sinks into `Query.runtime_options`, or None
+    when nothing is enabled (so a plain scrape carries no runtime options at all).
+
+    Validated here — at the API boundary — rather than deep in the browser
+    session, so a bad combination fails before an account is acquired.
+    See `BrowserSession._install_stream_hook` for what each option does.
+    """
+    if download_media and media_dir is None:
+        raise ValueError("download_media=True requires media_dir")
+    if not (download_media or media_manifest or on_new_posts):
+        return None
+    return {
+        "on_new_posts": on_new_posts,
+        "download_media": download_media,
+        "media_dir": media_dir,
+        "media_manifest": media_manifest,
+        "media_concurrency": media_concurrency,
+        "include_thumbnails": include_thumbnails,
+    }
+
+
 class FacebookScraper:
     """
     High-level API for scraping Facebook.
@@ -168,6 +197,12 @@ class FacebookScraper:
         mode: str = "hybrid",
         max_posts: int = -1,
         resume_from: str | None = None,
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
         # Other mode-specific tuning knobs (pagination_count, scroll_burst_every,
         # max_paginations, etc.) are accepted as kwargs; allowed keys live in
         # Query.ENDPOINT_REGISTRY. Anything left as None gets the registry default.
@@ -208,6 +243,25 @@ class FacebookScraper:
                   duplicate. Returned `data` contains only **new** posts
                   from this run — the CLI's `--continue` flag handles the
                   merge with the existing file.
+            on_new_posts: Optional sync/async callback handed each batch of
+                  newly-collected **raw** (unflattened) post dicts as the
+                  scrape parses them. Use it to pipe posts into your own
+                  process / queue while the scrape runs. Exceptions are
+                  logged, never fatal.
+            download_media: When True (requires `media_dir`), download each
+                  batch's photos and videos during the scrape. fbcdn URLs are
+                  signed and expire ~4-5 days after scraping, so this
+                  guarantees the media is fetched while the signature is
+                  fresh — at the cost of a slower scrape (pagination waits
+                  on the downloads).
+            media_dir: Destination directory for `download_media`.
+            media_manifest: Path to a `.jsonl` / `.jsonl.gz` manifest to append
+                  one line per media item to (URL, target filename,
+                  `queued_at`) instead of — or alongside — downloading. Lets a
+                  separate process do the fetching (`fbscrape download-media
+                  --from-manifest <path>`), keeping the scrape loop fast.
+            media_concurrency: Concurrent media fetches per batch (default 8).
+            include_thumbnails: Also fetch / queue video thumbnails.
             **params: other mode-specific tuning knobs. Allowed keys and
                   defaults live in Query.ENDPOINT_REGISTRY[("UserTimeline", mode)]["params"].
                   Pass `None` (or omit) to use the registry default.
@@ -220,6 +274,17 @@ class FacebookScraper:
             ValueError: If endpoint/mode/query/params validation fails
         """
         await self._ensure_initialized()
+
+        # Streaming sinks ride on every leg (each leg gets a fresh session, so
+        # each re-installs them) but never enter the saved Query.
+        runtime_options = _stream_runtime_options(
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
 
         # Drop None entries so registry defaults win in Query.__post_init__.
         cleaned_params = {k: v for k, v in params.items() if v is not None}
@@ -310,6 +375,7 @@ class FacebookScraper:
                     "end_date": current_end_date,
                 },
                 params=leg_params,
+                runtime_options=runtime_options,
             )
 
             logger.debug(
@@ -430,6 +496,12 @@ class FacebookScraper:
         filters: dict | None = None,
         mode: str = "hybrid",
         max_posts: int = -1,
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
         **params,
     ) -> ScrapingResult:
         """
@@ -451,6 +523,9 @@ class FacebookScraper:
             max_posts: Hard cap on accumulated posts (-1 = no cap). Enforced at
                 batch boundaries; actual count can exceed by up to
                 pagination_count - 1.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: in-scrape streaming
+                sinks — see `user_timeline` for the full description.
             **params: Mode-specific tuning knobs from
                 Query.ENDPOINT_REGISTRY[("Search", mode)]["params"].
 
@@ -471,6 +546,14 @@ class FacebookScraper:
             mode=mode,
             query={"query_text": query_text, "filters": filters},
             params=cleaned_params,
+            runtime_options=_stream_runtime_options(
+                on_new_posts=on_new_posts,
+                download_media=download_media,
+                media_dir=media_dir,
+                media_manifest=media_manifest,
+                media_concurrency=media_concurrency,
+                include_thumbnails=include_thumbnails,
+            ),
         )
 
         logger.debug(
@@ -493,6 +576,12 @@ class FacebookScraper:
         mode: str = "hybrid",
         max_posts: int = -1,
         resume_from: str | None = None,
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
         **params,
     ) -> ScrapingResult:
         """
@@ -538,6 +627,9 @@ class FacebookScraper:
                   with the existing file. If the saved `last_cursor` is
                   `None` (= prior scrape reached end of feed cleanly),
                   resume is a no-op and a fresh `cursor=null` scrape runs.
+            on_new_posts / download_media / media_dir / media_manifest /
+                  media_concurrency / include_thumbnails: in-scrape streaming
+                  sinks — see `user_timeline` for the full description.
             **params: other mode-specific tuning knobs. Allowed keys and
                   defaults live in Query.ENDPOINT_REGISTRY[("GroupTimeline", mode)]["params"].
                   Pass `None` (or omit) to use the registry default.
@@ -588,6 +680,14 @@ class FacebookScraper:
                 "end_date": end_date,
             },
             params=cleaned_params,
+            runtime_options=_stream_runtime_options(
+                on_new_posts=on_new_posts,
+                download_media=download_media,
+                media_dir=media_dir,
+                media_manifest=media_manifest,
+                media_concurrency=media_concurrency,
+                include_thumbnails=include_thumbnails,
+            ),
         )
 
         logger.debug(
@@ -609,6 +709,12 @@ class FacebookScraper:
         mode: str = "hybrid",
         max_results: int = -1,
         resume_from: str | None = None,
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
         **params,
     ) -> ScrapingResult:
         """
@@ -642,6 +748,11 @@ class FacebookScraper:
                 `ScrapingResult` from a partially-completed scrape. When
                 given, the loop starts from that file's `last_cursor` and
                 seeds the dedup set with saved comment_ids.
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: in-scrape streaming
+                sinks — see `user_timeline`. For comments, "media" means
+                comment attachments (photo / video / GIF replies), named
+                after the comment id.
             **params: mode-specific tuning knobs. Allowed keys and defaults
                 live in Query.ENDPOINT_REGISTRY[("CommentsList", mode)]["params"].
                 Pass `None` (or omit) to use the registry default.
@@ -678,6 +789,14 @@ class FacebookScraper:
                 "post_id": post_id,
             },
             params=cleaned_params,
+            runtime_options=_stream_runtime_options(
+                on_new_posts=on_new_posts,
+                download_media=download_media,
+                media_dir=media_dir,
+                media_manifest=media_manifest,
+                media_concurrency=media_concurrency,
+                include_thumbnails=include_thumbnails,
+            ),
         )
 
         logger.debug(
@@ -766,6 +885,12 @@ class FacebookScraper:
         post_id: str,
         is_group: bool = False,
         mode: str = "hybrid",
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
         **params,
     ) -> ScrapingResult:
         """
@@ -788,6 +913,9 @@ class FacebookScraper:
                 False for page / user posts (`/<handle>/posts/<post_id>/`). FB
                 does not cross-resolve the two surfaces.
             mode: Currently only "hybrid" is supported.
+            on_new_posts / download_media / media_dir / media_manifest /
+                  media_concurrency / include_thumbnails: streaming sinks —
+                  see `user_timeline`. Fired once, with the single record.
             **params: mode-specific knobs. Allowed keys and defaults live in
                   Query.ENDPOINT_REGISTRY["PostDetail"]["modes"]["hybrid"]["params"].
                   Pass `None` (or omit) to use the registry default.
@@ -811,6 +939,14 @@ class FacebookScraper:
             mode=mode,
             query={"handle": handle, "post_id": post_id},
             params=cleaned_params,
+            runtime_options=_stream_runtime_options(
+                on_new_posts=on_new_posts,
+                download_media=download_media,
+                media_dir=media_dir,
+                media_manifest=media_manifest,
+                media_concurrency=media_concurrency,
+                include_thumbnails=include_thumbnails,
+            ),
         )
 
         logger.debug(

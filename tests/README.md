@@ -35,7 +35,7 @@ when their fixture file is missing, so a partial capture is OK.
 | --- | --- |
 | `pytest` | unit tier only (default — fast, no network) |
 | `pytest -m integration` | headless scrapes against real Facebook |
-| `pytest -m e2e` | full CLI scrape → flatten / download-media |
+| `pytest -m e2e` | full CLI scrape → flatten / download-media / in-scrape media |
 | `pytest -m ''` | everything (empty marker selector overrides default) |
 | `pytest tests/unit/test_query_registry.py` | one file |
 | `pytest -k flatten` | every test with "flatten" in the name |
@@ -52,6 +52,9 @@ them rather than failing.
 - `FacebookGraphQLParser.flatten(record, endpoint)` for all three endpoints
 - CLI `--input-file` parsing across csv/parquet/json/jsonl/yaml
 - CLI `flatten` routing (file/dir/concat/--format all)
+- In-scrape media streaming (`test_media_stream.py`): media entry extraction +
+  filenames, manifest round-trip, hook composition / exception isolation, and the
+  `runtime_options` chain from CLI flags through `Worker` to the session method
 
 **integration/** — one test per supported `(endpoint, mode)`. All headless,
 tight windows, real FB. Each asserts the scrape returns `result.result` in
@@ -60,7 +63,9 @@ the success set, `len(data) > 0`, and that every returned record flattens.
 **e2e/** — CLI smoke. Runs `python -m fbscrape.cli` as a subprocess, scrapes
 zuck for a one-month window, then flattens (test 1) or downloads media
 (test 2). Confirms wire-format compatibility between the scrape output and
-the post-processing commands.
+the post-processing commands. Test 3 scrapes with `--download-media
+--media-manifest` and drains the manifest, checking both in-scrape media sinks
+agree on target filenames.
 
 ## Adding tests when adding an endpoint
 

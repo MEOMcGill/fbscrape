@@ -2,7 +2,7 @@
 Data models for Facebook scraping results
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, date, timedelta
 from typing import ClassVar
 import json
@@ -347,6 +347,15 @@ class Query:
     mode: str
     query: dict
     params: dict
+    # Per-call runtime options that are NOT part of the scrape spec: streaming
+    # sinks (in-scrape media download / manifest handoff / an `on_new_posts`
+    # callback). Spread as kwargs onto the BrowserSession method by
+    # `Worker.execute_task`, alongside `query` and `params`. Excluded from
+    # `to_dict`/`to_json` (a callable isn't JSON-serializable) and from equality
+    # /repr, so a saved ScrapingResult still records exactly the reproducible
+    # scrape spec. Allowed keys are the streaming kwargs on the BrowserSession
+    # scrape methods — see `BrowserSession._install_stream_hook`.
+    runtime_options: dict | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
         """Validate endpoint/mode/query/params and fill default params from registry."""

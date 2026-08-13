@@ -3,6 +3,7 @@ Response interception and Facebook GraphQL parsing
 """
 
 import base64
+import inspect
 import json
 import os
 import re
@@ -1334,6 +1335,14 @@ class ResponseInterceptor:
         # single-shot endpoints). `post_count` tracks total added either way.
         self.post_sink = None
         self.post_count = 0
+        # Per-batch streaming sink, set by BrowserSession._build_stream_hook when
+        # the caller opts into in-scrape media downloading / manifest handoff or
+        # passes its own `on_new_posts`. Called (awaited if async) with each list
+        # of newly-added records — from `intercept_response` on the auto-extract
+        # path (manual mode) and from the hybrid pagination loops, which add
+        # posts themselves. The two never overlap: hybrid sets
+        # `extract_posts = False`. Cleared in `flush()`.
+        self.on_new_posts = None
         # post_ids of every post in `self.posts`. Maintained by `add_posts`
         # so the auto-extract path and the hybrid replay path share dedup.
         # Without this, FB cursor-degraded responses (which can re-serve the
@@ -1479,7 +1488,11 @@ class ResponseInterceptor:
             if self.extract_posts:
                 parsed = self.parser.parse_timeline_response(body, url)
                 if parsed:
-                    self.add_posts(parsed['posts'])
+                    # Manual mode's collection path: posts arrive here, so this
+                    # is where its streaming sinks fire. Hybrid never reaches
+                    # this branch (extract_posts=False) — its loops fire the
+                    # hook themselves after their own add_posts.
+                    await self.fire_new_posts(self.add_posts(parsed['posts']))
                 else:
                     logger.warning(f"[PARSER] Returned None - parser needs implementation")
 
@@ -1599,7 +1612,7 @@ class ResponseInterceptor:
         """Get collected posts"""
         return self.posts
 
-    def add_posts(self, posts: list[dict]) -> int:
+    def add_posts(self, posts: list[dict]) -> list[dict]:
         """Append posts parsed elsewhere (e.g. by a hybrid replay path)
         to the same accumulator that auto-intercepted posts populate.
         Preferred over directly mutating `self.posts`.
@@ -1609,9 +1622,12 @@ class ResponseInterceptor:
         `{node: Story, ...}` — the `post_id` lives on `node`, not at the
         top level, so we check both. Posts without a `post_id` anywhere are
         appended as-is (defensive — the parser should always set one).
-        Returns the count of posts actually added.
+
+        Returns the posts actually added (post-dedup), so callers can hand the
+        fresh batch to `fire_new_posts` without re-deriving it. Empty list =
+        nothing new, so `if added:` reads the same as the old int return.
         """
-        added = 0
+        added: list[dict] = []
         for post in posts:
             pid = post.get("post_id") or _g(post, "node", "post_id")
             if pid:
@@ -1623,8 +1639,27 @@ class ResponseInterceptor:
             else:
                 self.posts.append(post)     # accumulate in RAM (manual/single-shot)
             self.post_count += 1
-            added += 1
+            added.append(post)
         return added
+
+    async def fire_new_posts(self, batch: list[dict]):
+        """Hand a batch of newly-added records to the `on_new_posts` sink.
+
+        No-op when no sink is set or the batch is empty. The sink may be sync or
+        async. Exceptions are logged, never raised — an in-scrape media download
+        or a caller's own hook must not be able to kill the scrape (the composed
+        hook from `combine_post_hooks` guards each sub-hook too; this is the
+        backstop for a hook passed in directly).
+        """
+        if not batch or self.on_new_posts is None:
+            return
+        try:
+            res = self.on_new_posts(batch)
+            if inspect.isawaitable(res):
+                await res
+        except Exception as e:
+            logger.warning(f"on_new_posts hook raised: {e}")
+            logger.debug(traceback.format_exc())
 
     def _track_request_tokens(self, request):
         """Parse `__csr` and `__dyn` from a natural GraphQL POST body and
@@ -1861,6 +1896,7 @@ class ResponseInterceptor:
         """Clear collected data and reset counters"""
         self.posts = []
         self.post_sink = None
+        self.on_new_posts = None
         self.post_count = 0
         self.seen_post_ids = set()
         self.graphql_request_count = 0
