@@ -69,7 +69,9 @@ TARGETS = {
         "page_id": "20531316728",
     },
     "profile_authenticity": {
-        # Zuckerberg's user id (seen in data/page_transparency saves).
+        # Monique and Jocelyne Lamoureux (LamoureuxTwins) — stable, public
+        # profile with a full authenticity record. Confirmed via live
+        # ProfileAbout capture; NOT Zuckerberg's id (his is "4").
         "user_id": "100044331674441",
     },
     "comments_list_hybrid": {
@@ -89,6 +91,26 @@ TARGETS = {
         "handle": "albertansunitedtostoptheucp",
         "post_id": "27209929835285847",
         "is_group": True,
+    },
+    "profile_info": {
+        # Zuckerberg's profile — stable, public, fully-hydrated header.
+        "handle": "zuck",
+    },
+    "profile_about": {
+        # A public Page with populated contact/basic-info/links sections
+        # (phone, email, address, hours, website). Substitute if it goes
+        # dark. Personal profiles rarely expose these same section keys —
+        # see docstring on Query.ENDPOINT_REGISTRY["ProfileAbout"].
+        "handle": "61582991935083",
+    },
+    "group_info": {
+        # Same stable public group used by group_timeline_hybrid.
+        "handle": "albertaseparatism",
+    },
+    "group_about": {
+        # Same group — has a populated description, rules, and admin
+        # facepile. Substitute if it goes dark.
+        "handle": "albertaseparatism",
     },
 }
 
@@ -131,6 +153,22 @@ async def _capture_post_detail(scraper: FacebookScraper, spec: dict):
     )
 
 
+async def _capture_profile_info(scraper: FacebookScraper, spec: dict):
+    return await scraper.profile_info(spec["handle"])
+
+
+async def _capture_profile_about(scraper: FacebookScraper, spec: dict):
+    return await scraper.profile_about(spec["handle"])
+
+
+async def _capture_group_info(scraper: FacebookScraper, spec: dict):
+    return await scraper.group_info(spec["handle"])
+
+
+async def _capture_group_about(scraper: FacebookScraper, spec: dict):
+    return await scraper.group_about(spec["handle"])
+
+
 CAPTURERS = {
     "user_timeline_hybrid":  lambda s: _capture_user_timeline(s, "hybrid", TARGETS["user_timeline_hybrid"]),
     "user_timeline_manual":  lambda s: _capture_user_timeline(s, "manual", TARGETS["user_timeline_manual"]),
@@ -140,6 +178,10 @@ CAPTURERS = {
     "profile_authenticity":  lambda s: _capture_profile_authenticity(s, TARGETS["profile_authenticity"]),
     "comments_list_hybrid":  lambda s: _capture_comments_list(s, TARGETS["comments_list_hybrid"]),
     "post_detail":           lambda s: _capture_post_detail(s, TARGETS["post_detail"]),
+    "profile_info":          lambda s: _capture_profile_info(s, TARGETS["profile_info"]),
+    "profile_about":         lambda s: _capture_profile_about(s, TARGETS["profile_about"]),
+    "group_info":            lambda s: _capture_group_info(s, TARGETS["group_info"]),
+    "group_about":           lambda s: _capture_group_about(s, TARGETS["group_about"]),
 }
 
 

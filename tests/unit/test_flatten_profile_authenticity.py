@@ -1,4 +1,4 @@
-"""Flatten ProfileAuthenticity record against captured fixture (zuck)."""
+"""Flatten ProfileAuthenticity record against captured fixture (LamoureuxTwins)."""
 
 
 import copy
@@ -49,7 +49,7 @@ def test_user_id_matches_target(record):
 
 def test_name_populated(record):
     flat = PARSER.flatten(record, "ProfileAuthenticity")
-    assert flat["name"], "zuck's profile should have a name field"
+    assert flat["name"], "LamoureuxTwins' profile should have a name field"
 
 
 def test_header_field_dispatch(record):

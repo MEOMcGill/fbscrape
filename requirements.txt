@@ -1,7 +1,7 @@
 aiohttp==3.13.5
 aiosqlite==0.22.1
 browserforge==1.2.4
-camoufox==0.4.11
+camoufox==0.5.4
 click==8.3.3
 ijson==3.5.0
 loguru==0.7.3

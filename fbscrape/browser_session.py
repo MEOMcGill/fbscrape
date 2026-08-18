@@ -44,8 +44,36 @@ GRAPHQL_API_URL = "https://www.facebook.com/api/graphql/"
 HYBRID_HEADER_DROP = frozenset({
     "host", "content-length", "connection", "accept-encoding", "cookie",
 })
+# camoufox/Playwright's bundled driver has broken br/zstd decompression
+# (camoufox issue #473): responses in those encodings intermittently fail with
+# `failed to decompress 'br' encoding`. Restrict Accept-Encoding to encodings
+# the driver decodes reliably. Single source of truth for BOTH request paths —
+# browser-issued requests (set_extra_http_headers in initialize()) and the
+# hybrid replay POSTs sent via the separate page.request API context.
+ALLOWED_ACCEPT_ENCODING = "gzip, deflate"
+
+# Headers we set to a fixed value on replay rather than forwarding verbatim.
+# Accept-Encoding is dropped above (any captured casing) then pinned here — a
+# page.request.post with no Accept-Encoding makes Playwright's APIRequestContext
+# inject its own default (which includes br), and set_extra_http_headers() from
+# initialize() does NOT apply to this separate API context.
+HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING}
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
+
+def _profile_target_url(handle: str) -> str:
+    """Build a profile URL from a handle.
+
+    New-style all-numeric profile IDs (e.g. 61...) do NOT resolve as
+    facebook.com/<id>/ -- they only work via facebook.com/profile.php?id=<id>
+    with no trailing slash (a trailing slash corrupts the id and lands on the
+    wrong page). Vanity handles, and older numeric page IDs which also accept
+    this canonical form, are unaffected.
+    """
+    if handle.isdigit():
+        return f"https://www.facebook.com/profile.php?id={handle}"
+    return f"https://www.facebook.com/{handle}/"
+
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
 GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME = "GroupsCometFeedRegularStoriesPaginationQuery"
 COMMENTS_LIST_HYBRID_TARGET_FRIENDLY_NAME = "CommentsListComponentsPaginationQuery"
@@ -221,7 +249,8 @@ class BrowserSession:
             self.page = await self._context.new_page()
 
             # Workaround for camoufox issue #473: br/zstd decompression broken.
-            await self.page.set_extra_http_headers({"Accept-Encoding": "gzip, deflate"})
+            await self.page.set_extra_http_headers(
+                {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING})
 
             self.response_interceptor = ResponseInterceptor()
             self.response_interceptor.setup_interception(self.page)
@@ -596,7 +625,7 @@ class BrowserSession:
             f"({start_date} → {end_date}, count={pagination_count})"
         )
 
-        target_url = f"https://www.facebook.com/{handle}/"
+        target_url = _profile_target_url(handle)
         scrape_start_time = datetime.now(timezone.utc)
 
         # afterTime: start-of-day UTC, inclusive. None when start_date omitted.
@@ -913,6 +942,8 @@ class BrowserSession:
         media_manifest: str | Path | None = None,
         media_concurrency: int = 8,
         include_thumbnails: bool = False,
+        stream_to_path: str | None = None,
+        stream_compress: bool = False,
     ) -> ScrapeOutcome:
         """Scrape a group's feed by replaying GroupsCometFeedRegularStoriesPaginationQuery.
 
@@ -1045,6 +1076,26 @@ class BrowserSession:
                 f"{self._hybrid_cursor_fp(initial_cursor)}"
             )
 
+        # Write-on-parse streaming: when stream_to_path is set, route each deduped
+        # post straight to a JSONL file (via the interceptor's post_sink) instead
+        # of accumulating in RAM. The JsonlPostWriter autoflushes each line, so if
+        # the scrape is cancelled or killed mid-run — e.g. an outer wall-clock
+        # guard fires after hours — every post parsed so far is already durably on
+        # disk (RAM accumulation would be lost). Must be set AFTER flush() (which
+        # clears post_sink). On the happy path the final return finalizes the
+        # writer and returns a spill-shaped outcome (empty inline data +
+        # post_count + spill_path); the rare early-error returns below leave 0
+        # posts, so they keep the plain (empty) outcome and the file is harmless.
+        writer = None
+        if stream_to_path:
+            from .jsonl_store import JsonlPostWriter
+            stream_query = {"endpoint": "GroupTimeline", "mode": "hybrid",
+                            "handle": handle, "sorting_setting": sorting_setting}
+            writer = JsonlPostWriter(stream_to_path, stream_query, scrape_start_time,
+                                     append=False, compress=stream_compress,
+                                     autoflush=True)
+            self.response_interceptor.post_sink = writer.write_post
+
         # Phase 1 — navigate
         error = await self._hybrid_navigate(
             target_url=target_url,
@@ -1109,11 +1160,25 @@ class BrowserSession:
             },
             initial_cursor=initial_cursor or None,
         )
+        tt = datetime.now(timezone.utc) - scrape_start_time
+        if writer is not None:
+            # write-on-parse: posts already streamed to disk; finalize stamps the
+            # terminal status and closes the file. Inline data is empty.
+            writer.finalize(result_str, tt, next_cursor)
+            return ScrapeOutcome(
+                result=result_str,
+                data=[],
+                post_count=writer.count,
+                spill_path=stream_to_path,
+                time_started=scrape_start_time,
+                time_taken=tt,
+                last_cursor=next_cursor,
+            )
         return ScrapeOutcome(
             result=result_str,
             data=self.response_interceptor.get_posts(),
             time_started=scrape_start_time,
-            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            time_taken=tt,
             last_cursor=next_cursor,
         )
 
@@ -1906,6 +1971,369 @@ class BrowserSession:
                 f"caller_hook={on_new_posts is not None})"
             )
 
+    async def profile_info_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a profile's header info (single-shot).
+
+        Like `post_detail_hybrid`, this does NOT replay a GraphQL query: FB
+        server-renders the profile header (name, follower count, cover photo,
+        verified badge, intro-card fields) into the profile page's embedded
+        JSON, so we navigate, read the rendered document, and pull the node
+        out with `FacebookGraphQLParser.extract_profile_info`.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile (user or page)
+                — drives the navigation URL.
+            document_wait_seconds: Extra settle time after navigation before
+                reading the document, so the server-rendered header blob is
+                present.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list `[profile_dict]`
+            on success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "ProfileInfo"
+        target_url = _profile_target_url(handle)
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] profile info for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        # Phase 1 — navigate to the profile (server-renders the header).
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 2 — let the document settle, then read the rendered HTML.
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        # Phase 3 — extract the profile node from the document's embedded JSON.
+        record = self.response_interceptor.parser.extract_profile_info(
+            html, handle
+        )
+        if record is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def profile_about_hybrid(
+        self,
+        handle: str,
+        sections: tuple = (
+            "directory_contact_info",
+            "directory_basic_info",
+            "directory_links",
+        ),
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a profile's About page (header + requested About sections).
+
+        Unlike `profile_info_hybrid`, this is NOT single-navigation: FB only
+        server-renders a sub-tab's fields (contact info, address/hours,
+        links, ...) when that specific sub-tab is navigated to directly, so
+        this does one landing navigation (`/<handle>/about/` — which also
+        renders the profile header for free, same fields
+        `profile_info_hybrid` returns) followed by one navigation per
+        requested section, using the sub-tab directory FB itself renders on
+        the landing page (`extract_profile_about_collections`) rather than
+        constructing sub-tab URLs — they're query-style for numeric-id
+        profiles (`?...&sk=directory_contact_info`) but path-style for
+        vanity handles (`/<handle>/directory_contact_info`), so only FB's
+        own rendered URLs are reliable.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile.
+            sections: Sub-tab keys to fetch, matched against the discovered
+                directory. A requested key absent from the directory is
+                skipped (not an error) — coverage varies a lot by account
+                (Pages vs. personal profiles expose different section sets).
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list
+            `[{"profile": profile_dict, "sections": [section_dict, ...]}]`
+            on success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "ProfileAbout"
+        target_url = f"https://www.facebook.com/{handle}/about/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] profile about for {target_url} (sections={sections})")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        # Phase 1 — navigate to the About landing page (server-renders the
+        # header, same as ProfileInfo, plus the sub-tab directory).
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        parser = self.response_interceptor.parser
+        profile = parser.extract_profile_info(html, handle)
+        if profile is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        directory = parser.extract_profile_about_collections(html)
+        all_sections = list(parser.extract_profile_about_sections(html))
+
+        # Phase 2 — one navigation per requested section that this account
+        # actually has (per the discovered directory).
+        for tab_key in sections:
+            url = directory.get(tab_key)
+            if not url:
+                logger.info(
+                    f"[hybrid] profile about for {handle}: section "
+                    f"{tab_key!r} not present in this account's directory — skipping"
+                )
+                continue
+
+            error = await self._hybrid_navigate(
+                target_url=url,
+                post_nav_sleep_seconds=post_nav_sleep_seconds,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+            if error:
+                logger.warning(
+                    f"[hybrid] profile about for {handle}: navigation to "
+                    f"section {tab_key!r} failed ({error}) — skipping"
+                )
+                continue
+
+            if document_wait_seconds and document_wait_seconds > 0:
+                await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+            try:
+                section_html = await asyncio.wait_for(
+                    self.page.content(), timeout=operation_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                raise RendererHangError(
+                    f"page.content() timed out after {operation_timeout_seconds}s "
+                    f"(section={tab_key!r})"
+                )
+            all_sections.extend(parser.extract_profile_about_sections(section_html))
+
+        record = {"profile": profile, "sections": all_sections}
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def group_info_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a group's header info (single-shot).
+
+        Like `profile_info_hybrid`, this does NOT replay a GraphQL query: FB
+        server-renders the group header (name, privacy setting, member
+        count, cover photo, content-view directory) into the group page's
+        embedded JSON, so we navigate, read the rendered document, and pull
+        the node out with `FacebookGraphQLParser.extract_group_info`.
+
+        Args:
+            handle: Vanity handle or numeric id of the group — drives the
+                navigation URL.
+            document_wait_seconds: Extra settle time after navigation before
+                reading the document, so the server-rendered header blob is
+                present.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list `[group_dict]` on
+            success, or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "GroupInfo"
+        target_url = f"https://www.facebook.com/groups/{handle}/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] group info for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        record = self.response_interceptor.parser.extract_group_info(html, handle)
+        if record is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
+    async def group_about_hybrid(
+        self,
+        handle: str,
+        post_nav_sleep_seconds: float = 3.0,
+        document_wait_seconds: float = 4.0,
+        operation_timeout_seconds: float = 120,
+    ) -> ScrapeOutcome:
+        """Fetch a group's About page (header + description, activity,
+        rules, admin facepile).
+
+        Unlike `profile_about_hybrid`, this IS single-navigation: FB renders
+        the group's description, privacy/discoverability/history/location
+        info items, activity stats, rules, and admin facepile all together
+        on the one About page (`/groups/<handle>/about/`) — no per-sub-tab
+        navigation needed.
+
+        Args:
+            handle: Vanity handle or numeric id of the group.
+
+        Returns:
+            ScrapeOutcome with `data` as a 1-element list
+            `[{"group": group_dict, "cards": [card_dict, ...]}]` on success,
+            or `[]` with a diagnostic `result` on failure.
+        """
+        self.endpoint = "GroupAbout"
+        target_url = f"https://www.facebook.com/groups/{handle}/about/"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] group about for {target_url}")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self.response_interceptor.skip_unneeded_body_reads = True
+
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        if error:
+            return ScrapeOutcome(
+                result=error,
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        if document_wait_seconds and document_wait_seconds > 0:
+            await self.page.wait_for_timeout(int(document_wait_seconds * 1000))
+        try:
+            html = await asyncio.wait_for(
+                self.page.content(), timeout=operation_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RendererHangError(
+                f"page.content() timed out after {operation_timeout_seconds}s"
+            )
+
+        parser = self.response_interceptor.parser
+        group = parser.extract_group_info(html, handle)
+        if group is None:
+            return ScrapeOutcome(
+                result='parse_error',
+                data=[],
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        cards = parser.extract_group_about_cards(html)
+
+        record = {"group": group, "cards": cards}
+        return ScrapeOutcome(
+            result='success',
+            data=[record],
+            time_started=scrape_start_time,
+            time_taken=datetime.now(timezone.utc) - scrape_start_time,
+        )
+
     # ---------------- Hybrid mode phases ----------------
 
     async def _hybrid_navigate(
@@ -1934,6 +2362,14 @@ class BrowserSession:
             raise RendererHangError(
                 f"post-nav error check timed out after {operation_timeout_seconds}s"
             )
+        # 'content not available' is ambiguous right after navigation: a live
+        # feed with a broken/removed embedded share renders that exact string
+        # before its posts settle into article roles, so a post-nav match
+        # false-positives on healthy pages. Defer it -- let bootstrap + template
+        # capture proceed; a genuinely dead page still surfaces it via the
+        # template-capture-failure error check against a settled DOM.
+        if error == 'content not available':
+            return None
         return error
 
     async def _hybrid_bootstrap(self, operation_timeout_seconds: float) -> str | None:
@@ -2342,7 +2778,14 @@ class BrowserSession:
             return 'account is private'
 
         if await self.page.get_by_text("This content isn't available right now").count() > 0:
-            return 'content not available'
+            # In-feed broken/removed shared items render this exact text inside a
+            # post, so a page-wide match false-positives on a live feed. At a
+            # settled DOM (the template-capture-failure check) a live profile has
+            # rendered its posts, so only a genuinely dead page shows this with
+            # zero articles present. (The post-nav check separately defers this,
+            # since posts may not have rendered into article roles yet there.)
+            if await self.page.get_by_role("article").count() == 0:
+                return 'content not available'
 
         if await self.page.get_by_text("Only members can see who's in the group and what they post").count() > 0:
             return 'group is private'
@@ -2532,7 +2975,12 @@ class BrowserSession:
 
     @staticmethod
     def _hybrid_clean_headers(raw: dict[str, str]) -> dict[str, str]:
-        """Drop HTTP/2 pseudo-headers and headers managed by Playwright (cookie, host, content-length, etc.)."""
+        """Build replay headers from a captured template: drop HTTP/2
+        pseudo-headers and Playwright-managed headers (HYBRID_HEADER_DROP:
+        cookie, host, content-length, accept-encoding, …), then apply
+        HYBRID_HEADER_OVERRIDE (pins Accept-Encoding to gzip/deflate — see its
+        definition for why). Dropping first means the override wins regardless
+        of the captured header's casing, with no duplicate."""
         out = {}
         for k, v in raw.items():
             if k.startswith(":"):
@@ -2540,6 +2988,7 @@ class BrowserSession:
             if k.lower() in HYBRID_HEADER_DROP:
                 continue
             out[k] = v
+        out.update(HYBRID_HEADER_OVERRIDE)
         return out
 
     def _hybrid_build_body(

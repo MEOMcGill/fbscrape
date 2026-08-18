@@ -961,6 +961,230 @@ class FacebookScraper:
         )
         return result
 
+    async def profile_info(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a profile's header info (single-shot).
+
+        FB server-renders the profile header (name, follower count, cover
+        photo, verified badge, intro-card fields) into the profile page's
+        embedded JSON rather than firing a GraphQL XHR, so this navigates to
+        the profile and extracts the header node from the rendered document.
+        No pagination, no date filter. Returns a `ScrapingResult` whose
+        `data` is a 1-element list `[profile_dict]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="ProfileInfo")`.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile (user or page)
+                — drives the navigation URL (`https://www.facebook.com/<handle>/`).
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["ProfileInfo"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[profile_dict]` on success or `[]`
+            on failure (with `result` carrying the reason, e.g. `parse_error`
+            when the profile is private / not visible to the account).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="ProfileInfo",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting ProfileInfo task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed ProfileInfo (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
+    async def profile_about(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a profile's About page (header + requested About sections).
+
+        Unlike `profile_info`, this is NOT single-navigation: FB only
+        server-renders a sub-tab's fields (contact info, address/hours,
+        links, ...) when that sub-tab is navigated to directly, so this
+        does one landing navigation (which also renders the profile header
+        for free — same fields `profile_info` returns) plus one navigation
+        per requested section. Returns a `ScrapingResult` whose `data` is a
+        1-element list `[{"profile": profile_dict, "sections": [...]}]`,
+        flattenable via `FacebookGraphQLParser.flatten(record,
+        endpoint="ProfileAbout")` — the flattened row is a superset of what
+        `profile_info` returns, plus named About fields (phone, email,
+        address, hours, rating, website) and a generic `about_fields` list.
+
+        Args:
+            handle: Vanity handle or numeric id of the profile.
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs, including `sections` (tuple of
+                  sub-tab keys to fetch — a key absent from the account's
+                  own directory is skipped, not an error). Allowed keys and
+                  defaults live in
+                  Query.ENDPOINT_REGISTRY["ProfileAbout"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[{"profile": ..., "sections": ...}]`
+            on success or `[]` on failure (with `result` carrying the reason).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="ProfileAbout",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting ProfileAbout task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed ProfileAbout (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
+    async def group_info(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a group's header info (single-shot).
+
+        FB server-renders the group header (name, privacy setting, member
+        count, cover photo, content-view directory) into the group page's
+        embedded JSON rather than firing a GraphQL XHR, so this navigates to
+        the group and extracts the header node from the rendered document.
+        No pagination, no date filter. Returns a `ScrapingResult` whose
+        `data` is a 1-element list `[group_dict]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="GroupInfo")`.
+
+        Args:
+            handle: Vanity handle or numeric id of the group — drives the
+                navigation URL (`https://www.facebook.com/groups/<handle>/`).
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["GroupInfo"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[group_dict]` on success or `[]`
+            on failure (with `result` carrying the reason, e.g. `parse_error`
+            when the group is private / not visible to the account).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="GroupInfo",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting GroupInfo task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed GroupInfo (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
+    async def group_about(
+        self,
+        handle: str,
+        mode: str = "hybrid",
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch a group's About page (header + description, activity, rules,
+        admin facepile).
+
+        Unlike ProfileAbout, this IS single-navigation: FB renders every
+        About card together on the one page (`/groups/<handle>/about/`).
+        Returns a `ScrapingResult` whose `data` is a 1-element list
+        `[{"group": group_dict, "cards": [...]}]`, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="GroupAbout")` — the
+        flattened row is a superset of what `group_info` returns.
+
+        Admin/moderator data is best-effort: the admin roster comes from a
+        UI "facepile" FB may truncate for groups with many admins/
+        moderators, while the returned count is exact — see
+        `_flatten_group_about_record`'s docstring.
+
+        Args:
+            handle: Vanity handle or numeric id of the group.
+            mode: Currently only "hybrid" is supported.
+            **params: mode-specific knobs. Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["GroupAbout"]["modes"]["hybrid"]["params"].
+                  Pass `None` (or omit) to use the registry default.
+
+        Returns:
+            ScrapingResult — `data` is `[{"group": ..., "cards": ...}]`
+            on success or `[]` on failure (with `result` carrying the reason).
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+
+        query = Query(
+            endpoint="GroupAbout",
+            mode=mode,
+            query={"handle": handle},
+            params=cleaned_params,
+        )
+
+        logger.debug(f"Submitting GroupAbout task (mode={mode}) for handle={handle}")
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed GroupAbout (mode={mode}) for handle={handle}: "
+            f"{result.result} ({len(result.data)} record(s), {result.time_taken})"
+        )
+        return result
+
     async def profile_authenticity(
         self,
         user_id: str,

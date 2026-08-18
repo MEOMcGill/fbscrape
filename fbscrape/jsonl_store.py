@@ -80,12 +80,22 @@ class JsonlPostWriter:
     """
 
     def __init__(self, path: str, query: dict, time_started,
-                 append: bool = False, compress: bool = True):
+                 append: bool = False, compress: bool = True,
+                 autoflush: bool = False):
         self.path = path
         self.query = query
         self.time_started = str(time_started) if time_started is not None else None
         mode = "at" if append else "wt"
-        self._fh = gzip.open(path, mode) if compress else open(path, mode)
+        # autoflush: for streaming (write-on-parse) scrapes, line-buffer and flush
+        # each emitted line to the OS so a mid-scrape cancellation or kill leaves
+        # every already-parsed post on disk — otherwise the process's userspace
+        # buffer (up to a page) is lost on abnormal exit. Uncompressed only; gzip
+        # buffers internally, so streaming callers pass compress=False.
+        self._autoflush = autoflush
+        if compress:
+            self._fh = gzip.open(path, mode)
+        else:
+            self._fh = open(path, mode, buffering=(1 if autoflush else -1))
         self._buffered = None  # (post, cursor) awaiting flush
         self._finalized = False
         self.count = 0  # posts handed to write_post()
@@ -101,6 +111,8 @@ class JsonlPostWriter:
         }
         self._fh.write(json.dumps(line, default=_json_default))
         self._fh.write("\n")
+        if self._autoflush:
+            self._fh.flush()
 
     def write_post(self, post: dict, last_cursor: str | None = None) -> None:
         # Flush the previously-buffered post as a non-final (result=null) line.

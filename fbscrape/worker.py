@@ -50,8 +50,23 @@ class Worker:
         ("PageTransparency", "hybrid"): "page_transparency_hybrid",
         ("ProfileAuthenticity", "hybrid"): "profile_authenticity_hybrid",
         ("PostDetail", "hybrid"): "post_detail_hybrid",
+        ("ProfileInfo", "hybrid"): "profile_info_hybrid",
+        ("ProfileAbout", "hybrid"): "profile_about_hybrid",
+        ("GroupInfo", "hybrid"): "group_info_hybrid",
+        ("GroupAbout", "hybrid"): "group_about_hybrid",
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
     }
+
+    # These endpoints never scroll, so scroll_count-based rotation below never
+    # fires for them — rotate unconditionally after every task instead.
+    ALWAYS_ROTATE_ENDPOINTS = frozenset({
+        "ProfileInfo", "ProfileAbout", "GroupInfo", "GroupAbout",
+    })
+
+    # Default account selection (scroll_count_overall_24h ASC) is meaningless
+    # for the endpoints above; least-recently-used first, with scroll count
+    # only as a tie-breaker.
+    LAST_USED_ORDER_BY = "last_used ASC, scroll_count_overall_24h ASC"
 
     def __init__(
         self,
@@ -157,7 +172,9 @@ class Worker:
         await self.close()
         return False  # Don't suppress exceptions
 
-    async def initialize(self, raise_override: bool | None = None) -> bool:
+    async def initialize(
+        self, raise_override: bool | None = None, order_by: str | None = None,
+    ) -> bool:
         """
         Initialize worker by acquiring an account from the pool.
 
@@ -171,6 +188,8 @@ class Worker:
                 True at startup for extra workers so they fail-fast even when
                 the user has globally requested wait mode (rotations still
                 wait, since they call initialize() with no override).
+            order_by: passed through to `AccountsPool.get_available[_or_wait]`
+                — see `ALWAYS_ROTATE_ENDPOINTS`.
 
         Returns:
             True if account acquired successfully, False otherwise
@@ -181,9 +200,9 @@ class Worker:
             f"(raise_when_no_account={flag}, persistent={self.raise_when_no_account})"
         )
         if flag:
-            account = await self.pool.get_available()
+            account = await self.pool.get_available(order_by=order_by)
         else:
-            account = await self.pool.get_available_or_wait()
+            account = await self.pool.get_available_or_wait(order_by=order_by)
         if not account:
             logger.warning(f"Worker {self.id}: no account available")
             return False
@@ -358,6 +377,9 @@ class Worker:
                             f"Returning partial result."
                         )
 
+                    if task.endpoint in self.ALWAYS_ROTATE_ENDPOINTS:
+                        await self.rotate_account(order_by=self.LAST_USED_ORDER_BY)
+
                     return result
 
             except AccountDisabledError as e:
@@ -464,6 +486,22 @@ class Worker:
                 )
                 retry_count += 1
 
+            except Exception as e:
+                # Anything not covered above (e.g. a raw Playwright/Camoufox
+                # driver crash) would otherwise escape execute_task entirely
+                # without ever rotating — leaving this account stuck for the
+                # worker's next task. Only ALWAYS_ROTATE_ENDPOINTS get this;
+                # everything else keeps its prior behavior (propagate as-is).
+                if task.endpoint not in self.ALWAYS_ROTATE_ENDPOINTS:
+                    raise
+                logger.warning(
+                    f"Worker {self.id}: unexpected error on "
+                    f"{self.current_account.display_name if self.current_account else 'None'} "
+                    f"for {task.endpoint}: {e!r} — rotating and retrying"
+                )
+                await self.rotate_account(order_by=self.LAST_USED_ORDER_BY)
+                retry_count += 1
+
         # If we exhausted retries, raise to signal failure
         raise RetryBudgetExhaustedError(
             f"Worker {self.id}: failed to execute task after {max_retries} retries"
@@ -473,6 +511,7 @@ class Worker:
         self,
         lock_until: str | None = None,
         error_msg: str | None = None,
+        order_by: str | None = None,
     ):
         """
         Release current account and acquire a new one.
@@ -482,6 +521,10 @@ class Worker:
         account's `error_msg` column alongside the lock so post-hoc DB
         inspection can explain *why* the account was locked (the lock
         itself expires; the error_msg persists).
+
+        Args:
+            order_by: passed through to `initialize()` — see
+                `ALWAYS_ROTATE_ENDPOINTS`.
 
         Raises:
             NoAccountError: If no account available for rotation
@@ -503,7 +546,7 @@ class Worker:
         self._initialized = False
 
         # Get new account
-        success = await self.initialize()
+        success = await self.initialize(order_by=order_by)
         if not success:
             raise NoAccountError(f"Worker {self.id}: no account available for rotation")
 
