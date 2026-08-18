@@ -119,6 +119,10 @@ _ATTACHMENT_TYPE_BY_STYLE = {
 _METADATA_TIMESTAMP_TYPENAMES = (
     "CometFeedStoryLongerTimestampStrategy",
     "CometFeedStoryMinimizedTimestampStrategy",
+    # Backdated posts (e.g. imported/scheduled with an earlier date) carry the
+    # timestamp under this sibling strategy; same inner shape (story.creation_time).
+    # Without it, such posts yield 0 creation_times and trip ResponseShapeError.
+    "CometFeedStoryBackdatedTimestampStrategy",
 )
 _METADATA_AUDIENCE_TYPENAMES  = ("CometFeedStoryAudienceStrategy",)
 _METADATA_MUSIC_TYPENAMES     = ("CometStoryMusicPostLevelAttributionStrategy",)

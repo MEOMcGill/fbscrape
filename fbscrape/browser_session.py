@@ -58,6 +58,20 @@ ALLOWED_ACCEPT_ENCODING = "gzip, deflate"
 HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING}
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
+
+def _profile_target_url(handle: str) -> str:
+    """Build a profile URL from a handle.
+
+    New-style all-numeric profile IDs (e.g. 61...) do NOT resolve as
+    facebook.com/<id>/ -- they only work via facebook.com/profile.php?id=<id>
+    with no trailing slash (a trailing slash corrupts the id and lands on the
+    wrong page). Vanity handles, and older numeric page IDs which also accept
+    this canonical form, are unaffected.
+    """
+    if handle.isdigit():
+        return f"https://www.facebook.com/profile.php?id={handle}"
+    return f"https://www.facebook.com/{handle}/"
+
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
 GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME = "GroupsCometFeedRegularStoriesPaginationQuery"
 COMMENTS_LIST_HYBRID_TARGET_FRIENDLY_NAME = "CommentsListComponentsPaginationQuery"
@@ -577,7 +591,7 @@ class BrowserSession:
             f"({start_date} → {end_date}, count={pagination_count})"
         )
 
-        target_url = f"https://www.facebook.com/{handle}/"
+        target_url = _profile_target_url(handle)
         scrape_start_time = datetime.now(timezone.utc)
 
         # afterTime: start-of-day UTC, inclusive. None when start_date omitted.
@@ -1804,7 +1818,7 @@ class BrowserSession:
             on success, or `[]` with a diagnostic `result` on failure.
         """
         self.endpoint = "ProfileInfo"
-        target_url = f"https://www.facebook.com/{handle}/"
+        target_url = _profile_target_url(handle)
         scrape_start_time = datetime.now(timezone.utc)
         logger.info(f"[hybrid] profile info for {target_url}")
 
@@ -2168,6 +2182,14 @@ class BrowserSession:
             raise RendererHangError(
                 f"post-nav error check timed out after {operation_timeout_seconds}s"
             )
+        # 'content not available' is ambiguous right after navigation: a live
+        # feed with a broken/removed embedded share renders that exact string
+        # before its posts settle into article roles, so a post-nav match
+        # false-positives on healthy pages. Defer it -- let bootstrap + template
+        # capture proceed; a genuinely dead page still surfaces it via the
+        # template-capture-failure error check against a settled DOM.
+        if error == 'content not available':
+            return None
         return error
 
     async def _hybrid_bootstrap(self, operation_timeout_seconds: float) -> str | None:
@@ -2571,7 +2593,14 @@ class BrowserSession:
             return 'account is private'
 
         if await self.page.get_by_text("This content isn't available right now").count() > 0:
-            return 'content not available'
+            # In-feed broken/removed shared items render this exact text inside a
+            # post, so a page-wide match false-positives on a live feed. At a
+            # settled DOM (the template-capture-failure check) a live profile has
+            # rendered its posts, so only a genuinely dead page shows this with
+            # zero articles present. (The post-nav check separately defers this,
+            # since posts may not have rendered into article roles yet there.)
+            if await self.page.get_by_role("article").count() == 0:
+                return 'content not available'
 
         if await self.page.get_by_text("Only members can see who's in the group and what they post").count() > 0:
             return 'group is private'
