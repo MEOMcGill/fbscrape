@@ -1,0 +1,35 @@
+# Collected data
+data/*
+
+# Mac OS files
+*/.DS_Store
+.DS_Store
+
+# Pycharm
+__pycache__
+.idea
+
+# Authentication / secrets
+auth/*
+db
+*.cfg
+meo_facebook_scraper_config.cfg
+meo_instagram_scraper_config.cfg
+
+# Scratch
+tmp
+tmp/creepjs_results
+tmp/hybrid
+tmp/endpoint_additions
+tmp/tmp
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Local scratch / examples
+examples/
+
+# Internal / non-public docs (research notes, proposals, design decisions)
+docs/internal/
