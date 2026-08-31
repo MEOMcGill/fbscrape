@@ -393,12 +393,12 @@ async def login_manual(session: "BrowserSession") -> bool:
 
     try:
         breakpoint()
+        return True
     except (bdb.BdbQuit, KeyboardInterrupt) as e:
         logger.info("login_manual: aborted by user")
         raise FailedLoginError(
             f"Manual login aborted for {session.account.display_name}"
         ) from e
-    return True
 
 
 async def check_logged_in(session: "BrowserSession", timeout: float = 10.0) -> bool:
