@@ -638,6 +638,7 @@ Deeper references live under [`docs/`](docs/) (indexed in
 | [`docs/architecture/account_management.md`](docs/architecture/account_management.md) | Account state machine + DB semantics |
 | [`docs/results_and_errors.md`](docs/results_and_errors.md) | Result strings, exception → Worker-action, the `gather()` contract |
 | [`docs/search_filters.md`](docs/search_filters.md) | Search filter usage + adding a filter |
+| [`docs/group_scraping_runbook.md`](docs/group_scraping_runbook.md) | Running a group collection: sort and termination choices, resuming / topping up, batch bookkeeping, recovery paths |
 | [`docs/media_streaming.md`](docs/media_streaming.md) | Collecting media during a scrape |
 | [`docs/adding_endpoints.md`](docs/adding_endpoints.md) | Playbook for adding a new endpoint |
 

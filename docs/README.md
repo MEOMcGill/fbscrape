@@ -29,6 +29,17 @@ and gotchas.
   authority, and the cost model. Read this before touching `downloaders.py` or
   the hook firing points.
 
+## Field runbooks
+
+Hard-won operational knowledge from real collection runs — the workarounds that
+aren't obvious from the CLI help.
+
+- [`group_scraping_runbook.md`](group_scraping_runbook.md) — running a group
+  collection end to end: sort choice, client-side termination, resuming and
+  topping up with `--continue`, batch bookkeeping, and — should you need them —
+  the recovery paths (`unstick-cursor`, the forensic dumps, `result`-string
+  triage), each with the experiment that backs it.
+
 ## Architecture
 
 Reference for someone modifying the core scrape flow.

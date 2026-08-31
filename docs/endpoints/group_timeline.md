@@ -79,6 +79,11 @@ fbscrape scrape group-timeline 392585550772135 --start-date 2024-01-01 \
 - **`CHRONOLOGICAL` is ban-correlated** — prefer `TOP_POSTS` for sustained runs.
 - **No multi-leg resume.** A `cursor_reset` ends the scrape (partial data kept);
   use `--continue` to pick back up, and `unstick-cursor` if a resume stalls.
+- **Running a real collection?** Read
+  [`../group_scraping_runbook.md`](../group_scraping_runbook.md) — the
+  operational layer: how to set a run up, how to resume or top one up, batch
+  bookkeeping, and the recovery paths if a run is ever interrupted, each with
+  the experiment that backs it.
 
 ## Output shape
 
