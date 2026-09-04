@@ -2,7 +2,7 @@
 
 A Python library for scraping Facebook using Camoufox with account pooling, rotation, and concurrent scraping.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
 Built and maintained at the [Media Ecosystem Observatory](https://mediatechdemocracy.com/en/meo/)
@@ -647,4 +647,10 @@ on this repo? [`CLAUDE.md`](CLAUDE.md) is the agent-facing map.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) — see [LICENSE](LICENSE).
+
+Free to use, modify, and redistribute for noncommercial purposes, including by
+educational institutions, public research organizations, charities, and
+government bodies regardless of funding source. Commercial use is not
+permitted under this license; contact the Media Ecosystem Observatory for
+other arrangements.
