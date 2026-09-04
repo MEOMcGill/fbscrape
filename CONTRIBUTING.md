@@ -174,4 +174,4 @@ saves the resulting cookies into the account pool when you continue.
 ## License
 
 By contributing, you agree that your contributions will be licensed under the
-project's [MIT License](LICENSE).
+project's [PolyForm Noncommercial 1.0.0](LICENSE) license.
