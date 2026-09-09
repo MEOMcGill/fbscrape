@@ -7,7 +7,8 @@ A Python library for scraping Facebook using Camoufox with account pooling, rota
 
 Built and maintained at the [Media Ecosystem Observatory](https://mediatechdemocracy.com/en/meo/)
 for social-media research. Sibling projects: [igscrape](https://github.com/MEOMcGill/igscrape)
-for Instagram and [pytok](https://github.com/networkdynamics/pytok) for TikTok.
+for Instagram, [pytok](https://github.com/networkdynamics/pytok) for TikTok and
+[xscrape](https://github.com/MEOMcGill/xscrape) for X/Twitter.
 
 ## Features
 
