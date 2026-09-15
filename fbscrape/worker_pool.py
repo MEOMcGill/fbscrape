@@ -38,7 +38,7 @@ class WorkerPool:
         headless: bool = False,
         mobile: bool = False,
         raise_when_no_account: bool = True,
-        tasks_per_session: int = 1,
+        requests_per_session: int | None = None,
     ):
         """
         Initialize WorkerPool configuration.
@@ -54,9 +54,9 @@ class WorkerPool:
                 first worker blocks until an account frees up; subsequent
                 workers still fail-fast (otherwise we'd deadlock waiting for
                 more accounts than the pool can ever supply at once).
-            tasks_per_session: Consecutive tasks each worker runs on one
-                BrowserSession before tearing it down. 1 (default) = a fresh
-                browser + login per task. See Worker.__init__.
+            requests_per_session: Request budget for one browser session
+                before the worker rotates its account. None (default) = a
+                fresh browser + login per task, no reuse. See Worker.__init__.
         """
         self.pool = pool
         self.max_workers = max_workers
@@ -64,7 +64,7 @@ class WorkerPool:
         self.headless = headless
         self.mobile = mobile
         self.raise_when_no_account = raise_when_no_account
-        self.tasks_per_session = tasks_per_session
+        self.requests_per_session = requests_per_session
 
         # State
         self.workers: list[Worker] = []
@@ -91,7 +91,7 @@ class WorkerPool:
         logger.debug(
             f"WorkerPool initializing with config: max_workers={self.max_workers}, "
             f"scroll_threshold={self.scroll_threshold}, headless={self.headless}, "
-            f"tasks_per_session={self.tasks_per_session}, "
+            f"requests_per_session={self.requests_per_session}, "
             f"raise_when_no_account={self.raise_when_no_account}"
         )
         active_accounts = await self.pool.get_active_accounts()
@@ -128,7 +128,7 @@ class WorkerPool:
                     mobile=self.mobile,
                     raise_when_no_account=self.raise_when_no_account,
                     raise_at_startup=startup_raise,
-                    tasks_per_session=self.tasks_per_session,
+                    requests_per_session=self.requests_per_session,
                 )
                 self.workers.append(worker)
 

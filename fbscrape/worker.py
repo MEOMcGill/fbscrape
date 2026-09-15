@@ -3,9 +3,9 @@ Worker class for managing account lifecycle and executing scraping tasks.
 
 By default each task gets a fresh BrowserSession (via context manager),
 allowing clean separation between tasks and automatic resource cleanup.
-Setting `tasks_per_session > 1` reuses one session (browser process + login)
-across that many consecutive tasks before tearing it down — see
-`Worker._task_session`.
+Setting `requests_per_session` instead reuses one session (browser process +
+login) across consecutive tasks, rotating the account once that many requests
+have gone out — see `Worker._task_session`.
 """
 
 import asyncio
@@ -37,8 +37,8 @@ class Worker:
     Manages account lifecycle and executes scraping tasks.
 
     Creates a BrowserSession via context manager (a fresh one per task by
-    default, or one shared across `tasks_per_session` consecutive tasks),
-    tracks scroll counts across tasks, and handles account rotation
+    default, or one shared across tasks under a `requests_per_session`
+    budget), tracks scroll counts across tasks, and handles account rotation
     when thresholds are reached or errors occur.
     """
 
@@ -62,9 +62,9 @@ class Worker:
     }
 
     # These endpoints never scroll, so scroll_count-based rotation below never
-    # fires for them — rotate on the session boundary instead. With the default
-    # `tasks_per_session=1` that boundary is every task (unconditional
-    # rotation, the original behavior); with N>1 they rotate every N tasks.
+    # fires for them — rotate unconditionally after every task instead. When a
+    # `requests_per_session` budget is set it drives rotation for every
+    # endpoint on a comparable unit, so this per-task rotation steps aside.
     ALWAYS_ROTATE_ENDPOINTS = frozenset({
         "ProfileInfo", "ProfileAbout", "GroupInfo", "GroupAbout",
     })
@@ -82,7 +82,7 @@ class Worker:
         headless: bool = False,
         mobile: bool = False,
         raise_when_no_account: bool = True,
-        tasks_per_session: int = 1,
+        requests_per_session: int | None = None,
     ):
         """
         Initialize Worker with configuration only.
@@ -101,15 +101,24 @@ class Worker:
                 `get_available_or_wait()` and blocks (polling every 5s) until
                 an account frees up; only returns False when the pool has zero
                 active accounts (everything banned/inactive).
-            tasks_per_session: How many consecutive tasks reuse one
-                BrowserSession before it is torn down. 1 (default) reproduces
-                the original behavior exactly — a fresh browser + login per
-                task. Higher values amortize that startup cost across tasks,
-                which matters most for short single-shot endpoints
-                (ProfileInfo, ProfileAbout, ...) where launch + login dominates
-                the run time. The account is unchanged across the reused
-                session; account rotation still follows `scroll_threshold`
-                and the error paths.
+            requests_per_session: Budget of requests (scrape navigations +
+                replay POSTs, counted by `BrowserSession.requests_sent`) for
+                one browser session before the account is rotated. `None`
+                (default) reproduces the original behavior exactly — a fresh
+                browser + login per task, with no reuse.
+
+                With a budget set, one session is reused across consecutive
+                tasks, which amortizes launch + login. That matters most for
+                short single-shot endpoints (ProfileInfo, ProfileAbout, ...)
+                where startup dominates the run time, and a request budget —
+                unlike a task count — means the same thing across endpoints:
+                a timeline scrape paginating 500 times and a profile fetch
+                doing one navigation are not one unit of activity each.
+
+                The budget is a HIGH-WATER MARK checked at task boundaries,
+                not a hard cap: a session is never torn down mid-task (that
+                would discard the scrape), so one long task can overshoot it.
+                Overshoot is bounded by the largest single task.
         """
         self.id = id
         self.pool = pool
@@ -117,11 +126,11 @@ class Worker:
         self.headless = headless
         self.mobile = mobile
         self.raise_when_no_account = raise_when_no_account
-        if tasks_per_session < 1:
+        if requests_per_session is not None and requests_per_session < 1:
             raise ValueError(
-                f"tasks_per_session must be >= 1, got {tasks_per_session}"
+                f"requests_per_session must be >= 1 or None, got {requests_per_session}"
             )
-        self.tasks_per_session = tasks_per_session
+        self.requests_per_session = requests_per_session
 
         # State set during initialize()
         self.current_account: Optional[Account] = None
@@ -129,9 +138,8 @@ class Worker:
         self._initialized: bool = False
 
         # Reused BrowserSession (see `_task_session`). None means "no live
-        # session" — the next task opens one. `tasks_on_session` counts tasks
-        # STARTED on the current session, incremented at acquire time so the
-        # in-task rotation checks can see it.
+        # session" — the next task opens one. `tasks_on_session` is for
+        # logging only; rotation is driven by the session's request count.
         self.session: Optional[BrowserSession] = None
         self.tasks_on_session: int = 0
         # `session.scrolls_recorded` is cumulative over a reused session, so
@@ -148,7 +156,7 @@ class Worker:
         mobile: bool = False,
         raise_when_no_account: bool = True,
         raise_at_startup: bool | None = None,
-        tasks_per_session: int = 1,
+        requests_per_session: int | None = None,
     ) -> "Worker":
         """
         Factory method to create and initialize a Worker.
@@ -166,7 +174,7 @@ class Worker:
                 WorkerPool to fail-fast on extra workers at startup while
                 still letting the persistent flag honor user wait preference
                 during rotations.
-            tasks_per_session: see Worker.__init__.
+            requests_per_session: see Worker.__init__.
 
         Returns:
             Initialized Worker instance
@@ -186,7 +194,7 @@ class Worker:
             headless=headless,
             mobile=mobile,
             raise_when_no_account=raise_when_no_account,
-            tasks_per_session=tasks_per_session,
+            requests_per_session=requests_per_session,
         )
         success = await instance.initialize(raise_override=raise_at_startup)
         if not success:
@@ -316,8 +324,8 @@ class Worker:
             logger.debug(f"Worker {self.id}: attempt {retry_count + 1}/{max_retries} for {task.endpoint}")
             try:
                 # Session for this task: a fresh BrowserSession, or the
-                # worker's live one when `tasks_per_session > 1`.
-                async with self._task_session() as session:
+                # worker's live one when a request budget is set.
+                async with self._task_session(task) as session:
                     method = self._get_scraping_method(session, task.endpoint, task.mode)
                     # Query.params is fully populated with registry defaults at
                     # Query construction, so a single spread covers everything
@@ -411,13 +419,15 @@ class Worker:
                             f"Returning partial result."
                         )
 
-                    # Rotate on the session boundary. `tasks_on_session` was
-                    # incremented when this task acquired the session, so with
-                    # the default tasks_per_session=1 this fires on every task
-                    # — identical to the original unconditional rotation.
+                    # Without a request budget these endpoints rotate after
+                    # every task, as they always have. With one, the budget
+                    # rotates on a unit comparable across endpoints and this
+                    # would just undercut it (one profile fetch is one
+                    # request, not one session's worth of activity), so
+                    # `_task_session` owns rotation instead.
                     if (
                         task.endpoint in self.ALWAYS_ROTATE_ENDPOINTS
-                        and self.tasks_on_session >= self.tasks_per_session
+                        and self.requests_per_session is None
                     ):
                         await self.rotate_account(order_by=self.LAST_USED_ORDER_BY)
 
@@ -597,19 +607,25 @@ class Worker:
             raise NoAccountError(f"Worker {self.id}: no account available for rotation")
 
     @asynccontextmanager
-    async def _task_session(self):
-        """Yield the BrowserSession for one task, honoring `tasks_per_session`.
+    async def _task_session(self, task: Query):
+        """Yield the BrowserSession for one task, honoring `requests_per_session`.
 
         Replaces the per-task `async with BrowserSession(...)`. The session is
         opened on demand and kept on the worker; it is torn down when
 
           - the task raises (every error path in `execute_task` rotates or
             retries, and both assume a clean browser), or
-          - `tasks_per_session` tasks have run on it, or
+          - the session has spent its request budget — in which case the
+            ACCOUNT is rotated too, since a session is bound to the account it
+            logged in as, or
           - `rotate_account()` / `close()` drop it.
 
-        With `tasks_per_session=1` a session is opened and closed around every
-        task, which is exactly the original behavior.
+        With `requests_per_session=None` a session is opened and closed around
+        every task, which is exactly the original behavior.
+
+        The budget is checked here, between tasks, and so is a high-water mark
+        rather than a hard cap: tearing a session down mid-task would discard
+        the scrape, so a single long task can overshoot.
         """
         session = await self._acquire_session()
         try:
@@ -620,8 +636,30 @@ class Worker:
             await self._close_session()
             raise
         else:
-            if self.tasks_on_session >= self.tasks_per_session:
+            if self.requests_per_session is None:
                 await self._close_session()
+            elif session.requests_sent >= self.requests_per_session:
+                logger.info(
+                    f"Worker {self.id}: session spent its request budget "
+                    f"({session.requests_sent}/{self.requests_per_session} "
+                    f"after {self.tasks_on_session} task(s)); rotating account"
+                )
+                order_by = (
+                    self.LAST_USED_ORDER_BY
+                    if task.endpoint in self.ALWAYS_ROTATE_ENDPOINTS
+                    else None
+                )
+                try:
+                    await self.rotate_account(order_by=order_by)
+                except NoAccountError:
+                    # Best-effort: the task already succeeded, so don't throw
+                    # its result away because the pool is momentarily dry.
+                    # rotate_account has released the old account and left
+                    # current_account None; the next execute_task waits for one.
+                    logger.warning(
+                        f"Worker {self.id}: no account free to rotate into after "
+                        f"spending the request budget; continuing without one"
+                    )
 
     async def _acquire_session(self) -> BrowserSession:
         """Return a live BrowserSession for the current account, opening one
@@ -665,14 +703,14 @@ class Worker:
             logger.debug(
                 f"Worker {self.id}: opened BrowserSession for "
                 f"{self.current_account.display_name} "
-                f"(tasks_per_session={self.tasks_per_session})"
+                f"(requests_per_session={self.requests_per_session})"
             )
 
         self.tasks_on_session += 1
         self._scrolls_at_task_start = self.session.scrolls_recorded
         logger.debug(
-            f"Worker {self.id}: task {self.tasks_on_session}/"
-            f"{self.tasks_per_session} on this session"
+            f"Worker {self.id}: starting task {self.tasks_on_session} on this "
+            f"session ({self.session.requests_sent} requests sent so far)"
         )
         return self.session
 

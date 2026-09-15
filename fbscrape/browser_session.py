@@ -188,6 +188,17 @@ class BrowserSession:
         # as a rotation signal — see Worker.execute_task).
         self.scrolls_recorded: int = 0
 
+        # Per-session count of requests this session has sent to Facebook:
+        # every scrape navigation (`_hybrid_navigate`) plus every replay POST
+        # (`_hybrid_send_replay`). Unlike the interceptor's
+        # `graphql_request_count` this is NOT reset by `flush()` — it is
+        # session-scoped on purpose, so a Worker reusing one session across
+        # tasks can budget total activity per account (see
+        # `Worker.requests_per_session`). Replays are sent through Playwright's
+        # APIRequestContext, which doesn't fire page response events, so the
+        # interceptor never sees them and can't be used for this.
+        self.requests_sent: int = 0
+
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -2087,6 +2098,7 @@ class BrowserSession:
     ) -> str | None:
         """Navigate to the profile and run a post-nav error check. Returns an error string or None."""
         logger.info(f"[hybrid] navigating to {target_url}")
+        self.requests_sent += 1
         try:
             await self.goto(target_url, wait_until="domcontentloaded")
         except Exception as e:
@@ -3212,6 +3224,9 @@ class BrowserSession:
         attempt = 0
 
         while True:
+            # Counted per attempt, not per success: a 5xx retry is another
+            # request that actually went out.
+            self.requests_sent += 1
             try:
                 response = await asyncio.wait_for(
                     self.page.request.post(
