@@ -148,6 +148,7 @@ class FacebookScraper:
         headless: bool = False,
         mobile: bool = False,
         raise_when_no_account: bool = True,
+        tasks_per_session: int = 1,
     ):
         """
         Initialize Facebook scraper.
@@ -162,6 +163,16 @@ class FacebookScraper:
                 no account is available. If False, block (polling every 5s)
                 until an account frees up — useful for long-running scrapes
                 where you'd rather idle than abort. Threaded down to Worker.
+            tasks_per_session: How many consecutive tasks each worker runs on
+                one browser session (browser process + login) before tearing
+                it down. 1 (default) opens a fresh browser per task. Raising
+                it amortizes launch + login across tasks, which dominates the
+                run time of short single-shot endpoints (ProfileInfo,
+                ProfileAbout, GroupInfo, GroupAbout) — a batch of those is
+                mostly browser startup at the default. The account is held
+                across the reused session, so a higher value also means more
+                consecutive activity per account: rotation still happens on
+                `scroll_threshold` and on the error paths, but less often.
 
         Note: per-call knobs like `stall_timeout_seconds` are passed to
         `user_timeline()` (see Query.ENDPOINT_REGISTRY), not here.
@@ -172,6 +183,7 @@ class FacebookScraper:
         self.headless = headless
         self.mobile = mobile
         self.raise_when_no_account = raise_when_no_account
+        self.tasks_per_session = tasks_per_session
         self.worker_pool: WorkerPool | None = None
         self._init_lock = asyncio.Lock()
 
@@ -187,6 +199,7 @@ class FacebookScraper:
                     headless=self.headless,
                     mobile=self.mobile,
                     raise_when_no_account=self.raise_when_no_account,
+                    tasks_per_session=self.tasks_per_session,
                 )
 
     async def user_timeline(
