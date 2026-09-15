@@ -61,11 +61,16 @@ class Worker:
         # ("UserTimeline", "api"): "user_timeline_api",  -- future
     }
 
-    # These endpoints never scroll, so scroll_count-based rotation below never
-    # fires for them — rotate unconditionally after every task instead. When a
-    # `requests_per_session` budget is set it drives rotation for every
-    # endpoint on a comparable unit, so this per-task rotation steps aside.
-    ALWAYS_ROTATE_ENDPOINTS = frozenset({
+    # Single-shot endpoints: one navigation (or a handful), no pagination, no
+    # scrolling. They used to rotate the account after EVERY task, which is a
+    # 2-minute cooldown lock per task (rotate_account's default) — on a pool of
+    # ~9 usable accounts that caps a batch at ~4.5 tasks/min and starves
+    # workers into NoAccountError. Rotation is now driven by
+    # `requests_per_session` instead, which measures the same thing across
+    # endpoints. NOTE: with no budget set, a batch of these will hold one
+    # account for the whole run, since scroll_threshold can never fire for
+    # them either.
+    NON_SCROLLING_ENDPOINTS = frozenset({
         "ProfileInfo", "ProfileAbout", "GroupInfo", "GroupAbout",
     })
 
@@ -231,7 +236,7 @@ class Worker:
                 the user has globally requested wait mode (rotations still
                 wait, since they call initialize() with no override).
             order_by: passed through to `AccountsPool.get_available[_or_wait]`
-                — see `ALWAYS_ROTATE_ENDPOINTS`.
+                — see `NON_SCROLLING_ENDPOINTS`.
 
         Returns:
             True if account acquired successfully, False otherwise
@@ -419,18 +424,6 @@ class Worker:
                             f"Returning partial result."
                         )
 
-                    # Without a request budget these endpoints rotate after
-                    # every task, as they always have. With one, the budget
-                    # rotates on a unit comparable across endpoints and this
-                    # would just undercut it (one profile fetch is one
-                    # request, not one session's worth of activity), so
-                    # `_task_session` owns rotation instead.
-                    if (
-                        task.endpoint in self.ALWAYS_ROTATE_ENDPOINTS
-                        and self.requests_per_session is None
-                    ):
-                        await self.rotate_account(order_by=self.LAST_USED_ORDER_BY)
-
                     return result
 
             except AccountDisabledError as e:
@@ -541,9 +534,9 @@ class Worker:
                 # Anything not covered above (e.g. a raw Playwright/Camoufox
                 # driver crash) would otherwise escape execute_task entirely
                 # without ever rotating — leaving this account stuck for the
-                # worker's next task. Only ALWAYS_ROTATE_ENDPOINTS get this;
+                # worker's next task. Only NON_SCROLLING_ENDPOINTS get this;
                 # everything else keeps its prior behavior (propagate as-is).
-                if task.endpoint not in self.ALWAYS_ROTATE_ENDPOINTS:
+                if task.endpoint not in self.NON_SCROLLING_ENDPOINTS:
                     raise
                 logger.warning(
                     f"Worker {self.id}: unexpected error on "
@@ -575,7 +568,7 @@ class Worker:
 
         Args:
             order_by: passed through to `initialize()` — see
-                `ALWAYS_ROTATE_ENDPOINTS`.
+                `NON_SCROLLING_ENDPOINTS`.
 
         Raises:
             NoAccountError: If no account available for rotation
@@ -588,13 +581,20 @@ class Worker:
         await self._close_session()
         # Release the current account with cooldown to prevent immediate re-acquisition
         if self.current_account:
+            lock_expr = "datetime('now', '+2 minutes')" if lock_until is None else lock_until
             await self.pool.lock_until(
                 self.current_account.identifier,
-                "datetime('now', '+2 minutes')" if lock_until is None else lock_until,
+                lock_expr,
                 error_msg=error_msg,
             )
             await self.pool.release_account(self.current_account.identifier)
-            logger.info(f"Worker {self.id} released account {self.current_account.display_name} (5s cooldown)")
+            # The log used to claim "5s cooldown" while the default lock is 2
+            # minutes — misleading when diagnosing account starvation, which is
+            # exactly when anyone reads this line.
+            logger.info(
+                f"Worker {self.id} released account "
+                f"{self.current_account.display_name} (locked until {lock_expr})"
+            )
             self.current_account = None
 
         # Reset state
@@ -646,7 +646,7 @@ class Worker:
                 )
                 order_by = (
                     self.LAST_USED_ORDER_BY
-                    if task.endpoint in self.ALWAYS_ROTATE_ENDPOINTS
+                    if task.endpoint in self.NON_SCROLLING_ENDPOINTS
                     else None
                 )
                 try:

@@ -16,8 +16,11 @@ paginates 500 times and a profile fetch that does one navigation are not both
 "one unit" of account activity.
 
 Asserted invariants:
-- `requests_per_session=None` (the default) is the old behavior: one session
-  opened and closed per task, and ALWAYS_ROTATE_ENDPOINTS rotate every task.
+- `requests_per_session=None` (the default) is the old session behavior: one
+  session opened and closed per task.
+- Single-shot endpoints no longer rotate the account after every task. That
+  rotation cost a 2-minute cooldown lock each time, which on a small pool
+  starved workers; the request budget replaces it.
 - Under a budget one session serves consecutive tasks; crossing the budget
   rotates the ACCOUNT (a session is bound to the account it logged in as).
 - Cheap tasks get many per session, expensive ones few — the point of counting
@@ -60,6 +63,7 @@ class _FakePool:
         self._handed_out = 0
         self.exhausted_after = exhausted_after
         self.released = []
+        self.locks = []
 
     async def get_available(self, order_by=None):
         if self.exhausted_after is not None and self._handed_out >= self.exhausted_after:
@@ -76,7 +80,7 @@ class _FakePool:
         self.released.append(identifier)
 
     async def lock_until(self, identifier, until, error_msg=None):
-        pass
+        self.locks.append((identifier, until))
 
 
 def _session_factory(log, requests_per_task=1, scrolls_per_task=0, raises=None):
@@ -275,20 +279,28 @@ def test_scroll_accounting_uses_a_per_task_delta(monkeypatch):
     assert worker.scroll_count == 30
 
 
-def test_always_rotate_endpoint_still_rotates_per_task_without_a_budget(monkeypatch):
+def test_single_shot_endpoint_does_not_rotate_per_task(monkeypatch):
+    """ProfileInfo & co. used to rotate after every task. Each rotation locks
+    the released account for 2 minutes (rotate_account's default), so on a pool
+    of ~9 usable accounts that capped a profile batch at ~4.5 tasks/min and
+    starved workers into NoAccountError."""
     log = []
-    worker = _make_worker(monkeypatch, log, requests_per_session=None)
+    pool = _FakePool()
+    worker = _make_worker(monkeypatch, log, requests_per_session=None, pool=pool)
     first = worker.current_account.identifier
 
-    asyncio.run(worker.execute_task(_profile_query()))
+    for _ in range(5):
+        asyncio.run(worker.execute_task(_profile_query()))
 
-    assert worker.current_account.identifier != first
-    assert worker.session is None
+    assert worker.current_account.identifier == first, "no per-task rotation"
+    assert pool.locks == [], "and therefore no per-task cooldown lock"
+    # Session lifecycle is unchanged: still one per task without a budget.
+    assert [e[0] for e in log] == ["open", "task", "close"] * 5
 
 
-def test_always_rotate_endpoint_defers_to_the_budget(monkeypatch):
-    """With a budget set, ProfileInfo must NOT rotate after every task —
-    otherwise reuse buys nothing for exactly the workload it's meant for."""
+def test_single_shot_endpoint_rotates_on_the_budget(monkeypatch):
+    """The budget is now the only thing that rotates these endpoints — which is
+    the point, since scroll_threshold can never fire for them."""
     log = []
     worker = _make_worker(
         monkeypatch, log, requests_per_session=3, requests_per_task=1
