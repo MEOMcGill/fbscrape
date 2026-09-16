@@ -367,6 +367,7 @@ def test_worker_spreads_runtime_options_onto_the_session_method(monkeypatch):
 
     class _FakeSession:
         scrolls_recorded = 0
+        requests_sent = 0
 
         def __init__(self, **kwargs):
             pass

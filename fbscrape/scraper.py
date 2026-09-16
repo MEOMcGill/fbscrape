@@ -148,6 +148,7 @@ class FacebookScraper:
         headless: bool = False,
         mobile: bool = False,
         raise_when_no_account: bool = True,
+        requests_per_session: int | None = None,
     ):
         """
         Initialize Facebook scraper.
@@ -162,6 +163,22 @@ class FacebookScraper:
                 no account is available. If False, block (polling every 5s)
                 until an account frees up — useful for long-running scrapes
                 where you'd rather idle than abort. Threaded down to Worker.
+            requests_per_session: Request budget — scrape navigations plus
+                replay POSTs — for one browser session before the worker
+                rotates its account. None (default) opens a fresh browser +
+                login per task, which is the historical behavior.
+
+                Setting it reuses one session across tasks, amortizing launch
+                + login. That dominates the run time of short single-shot
+                endpoints (ProfileInfo, ProfileAbout, GroupInfo, GroupAbout),
+                where a batch is mostly browser startup at the default. It
+                also caps how much a single account/browser identity does in
+                a row on a unit that is comparable across endpoints: a
+                timeline scrape paginating 500 times is not the same activity
+                as one profile fetch, though both are one "task".
+
+                Checked at task boundaries, so it's a high-water mark, not a
+                hard cap — a session is never torn down mid-scrape.
 
         Note: per-call knobs like `stall_timeout_seconds` are passed to
         `user_timeline()` (see Query.ENDPOINT_REGISTRY), not here.
@@ -172,6 +189,7 @@ class FacebookScraper:
         self.headless = headless
         self.mobile = mobile
         self.raise_when_no_account = raise_when_no_account
+        self.requests_per_session = requests_per_session
         self.worker_pool: WorkerPool | None = None
         self._init_lock = asyncio.Lock()
 
@@ -187,6 +205,7 @@ class FacebookScraper:
                     headless=self.headless,
                     mobile=self.mobile,
                     raise_when_no_account=self.raise_when_no_account,
+                    requests_per_session=self.requests_per_session,
                 )
 
     async def user_timeline(
