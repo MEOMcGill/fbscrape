@@ -424,6 +424,41 @@ class Worker:
                             f"Returning partial result."
                         )
 
+                    # Template capture runs BEFORE any data is collected — the
+                    # hybrid phase order is navigate -> bootstrap scroll ->
+                    # capture template -> paginate, and posts only accumulate in
+                    # the last phase. So unlike cursor_reset / rate_limit above,
+                    # this outcome carries no posts and no cursor: there is
+                    # nothing to preserve by returning, and nothing to lose by
+                    # retrying. The miss is typically transient.
+                    #
+                    # Retry on the SAME account: the failure is not
+                    # account-specific, so rotating would spend a cooldown lock
+                    # for nothing. Close the session explicitly.
+                    #
+                    # On the final attempt return the outcome rather than falling
+                    # through to RetryBudgetExhaustedError at the bottom of the
+                    # loop to save the reason for this fail.
+                    if outcome.result == 'template_capture_timeout':
+                        if retry_count >= max_retries - 1:
+                            logger.error(
+                                f"Worker {self.id}: template_capture_timeout on "
+                                f"{self.current_account.display_name} persisted across "
+                                f"{max_retries} attempts (records={len(outcome.data or [])}) "
+                                f"- returning the diagnosis instead of exhausting the "
+                                f"retry budget."
+                            )
+                            return result
+                        logger.warning(
+                            f"Worker {self.id}: template_capture_timeout on "
+                            f"{self.current_account.display_name} "
+                            f"(records={len(outcome.data or [])} at attempt {retry_count}) - retryable and likely transient error. "
+                            f"Retrying."
+                        )
+                        await self._close_session()
+                        retry_count += 1
+                        continue
+
                     return result
 
             except AccountDisabledError as e:
