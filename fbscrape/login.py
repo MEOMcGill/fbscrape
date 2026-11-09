@@ -35,7 +35,6 @@ import asyncio
 import bdb
 import random
 import re
-from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 from playwright.async_api import (
@@ -453,20 +452,24 @@ async def check_logged_in(session: "BrowserSession", timeout: float = 10.0) -> b
 
 async def _on_login_success(session: "BrowserSession") -> None:
     """Post-successful-login bookkeeping: persist cookies, mark account active,
-    reset stale scroll counts, update last_used, and clear post-login popups."""
+    refresh last_used, and clear post-login popups.
+
+    The 24h scroll-count reset used to live here, guarded by
+    `now - session.account.last_used > 24h`. That could never be true:
+    `AccountsPool._get_and_mark_in_use` stamps `last_used = now` as it
+    acquires the account and returns the post-update row, so by the time
+    this ran the account's real idle time had already been overwritten and
+    the delta was always ~0s. Counts therefore never reset and
+    `scroll_count_overall_24h` grew without bound (observed: 237k on
+    accounts that had been idle for days), which in turn made the pool's
+    default `scroll_count_overall_24h ASC` ordering sort by lifetime load
+    instead of recent load. The reset now happens inside acquisition, the
+    only place that still sees the previous `last_used`.
+    """
     # Save cookies after successful login
     await session.save_cookies()
     # Mark account as active and clear any previous error message
     await session.pool.set_active(session.account.identifier, True, None)
-    # Reset scroll_count_overall_24h if last_used was over 24h ago
-    if session.account.last_used:
-        time_since_last_used = datetime.now(timezone.utc) - session.account.last_used.replace(tzinfo=timezone.utc)
-        if time_since_last_used > timedelta(hours=24):
-            await session.pool.reset_scroll_counts(session.account.identifier)
-            logger.info(
-                f"Reset scroll counts for {session.account.display_name} "
-                f"(last used {time_since_last_used} ago)"
-            )
     # Update last_used timestamp
     await session.pool.update_last_used(session.account.identifier)
     # Clear any post-login popups
