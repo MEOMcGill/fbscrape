@@ -17,6 +17,7 @@ server-rendered document read for the header/about endpoints).
 | GroupTimeline | paginated posts | `handle` | [group_timeline.md](group_timeline.md) |
 | CommentsList | paginated comments | `handle`, `post_id` | [comments_list.md](comments_list.md) |
 | PostDetail | single post | `handle`, `post_id` | [post_detail.md](post_detail.md) |
+| PostMediaSet | paginated media (a post's photo set) | `post_id`, `start_media_id` | [post_media_set.md](post_media_set.md) |
 | PageTransparency | single-shot | `page_id` | [page_transparency.md](page_transparency.md) |
 | ProfileAuthenticity | single-shot | `user_id` | [profile_authenticity.md](profile_authenticity.md) |
 | ProfileInfo | single-shot | `handle` | [profile_info.md](profile_info.md) |
