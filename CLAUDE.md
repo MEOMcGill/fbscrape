@@ -1,6 +1,6 @@
 # Project Context
 
-**Last Updated:** 2026-08-13
+**Last Updated:** 2026-11-09
 
 `fbscrape` is a Facebook scraper built on Camoufox (stealth Firefox) with persistent SQLite-backed account rotation and parallel browser sessions. Every endpoint uses the `hybrid` strategy: capture a real request template from the live page, then replay it (a GraphQL POST for the feed/comment endpoints; a server-rendered document read for the header/about/post-detail endpoints).
 
@@ -41,6 +41,7 @@ caller
 | `PageTransparency` | `hybrid` | `page_id` (handle optional) | single-shot POST | none |
 | `ProfileAuthenticity` | `hybrid` | `user_id` | single-shot POST | none |
 | `PostDetail` | `hybrid` | `handle`, `post_id` (+`is_group`) | single-shot **document** scrape | none |
+| `PostMediaSet` | `hybrid` | `post_id`, `start_media_id` (`handle` optional) | CPRCQ (media viewer), one replay per item | none |
 | `ProfileInfo` | `hybrid` | `handle` | single-shot **document** scrape | none |
 | `ProfileAbout` | `hybrid` | `handle` | multi-navigation **document** scrape | none |
 | `GroupInfo` | `hybrid` | `handle` | single-shot **document** scrape | none |
@@ -60,6 +61,7 @@ FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
     "PageTransparency":    "_flatten_pagetransparency_record",
     "ProfileAuthenticity": "_flatten_profile_authenticity_record",
     "PostDetail":          "_flatten_postdetail_record",
+    "PostMediaSet":        "_flatten_post_media_set_record",
     "ProfileInfo":         "_flatten_profile_info_record",
     "ProfileAbout":        "_flatten_profile_about_record",
     "GroupInfo":           "_flatten_group_info_record",
@@ -71,7 +73,7 @@ FacebookGraphQLParser.ENDPOINT_FLATTENERS = {
 
 ## In-scrape media streaming
 
-Media can be collected *as* the scrape runs instead of afterwards (fbcdn signatures die in ~4-5 days). Two sinks, per batch of newly-parsed records, on every post-bearing endpoint (`UserTimeline`, `Search`, `GroupTimeline`, `CommentsList`, `PostDetail`):
+Media can be collected *as* the scrape runs instead of afterwards (fbcdn signatures die in ~4-5 days). Two sinks, per batch of newly-parsed records, on every post-bearing endpoint (`UserTimeline`, `Search`, `GroupTimeline`, `CommentsList`, `PostDetail`, `PostMediaSet`):
 
 - **immediate** — `download_media=True` + `media_dir` fetches the batch's media inline (pagination waits on it).
 - **handoff** — `media_manifest=<path.jsonl>` appends one line per media item (`url`, `filename`, `queued_at`, `endpoint`, `label`) for another process to drain (`fbscrape download-media --from-manifest`). Near-zero loop cost.

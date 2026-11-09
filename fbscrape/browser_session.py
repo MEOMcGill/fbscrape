@@ -1,6 +1,6 @@
 """Browser management and page control for Facebook scraping."""
 from .accounts_pool import AccountsPool
-from .response import ResponseInterceptor, FacebookGraphQLParser
+from .response import ResponseInterceptor, FacebookGraphQLParser, _g
 from .account import Account
 from .downloaders import build_media_stream_hook, combine_post_hooks
 from .logger import logger
@@ -76,6 +76,7 @@ def _profile_target_url(handle: str) -> str:
 SEARCH_HYBRID_TARGET_FRIENDLY_NAME = "SearchCometResultsPaginatedResultsQuery"
 GROUP_TIMELINE_HYBRID_TARGET_FRIENDLY_NAME = "GroupsCometFeedRegularStoriesPaginationQuery"
 COMMENTS_LIST_HYBRID_TARGET_FRIENDLY_NAME = "CommentsListComponentsPaginationQuery"
+MEDIA_VIEWER_FRIENDLY_NAME = "CometPhotoRootContentQuery"
 PAGE_TRANSPARENCY_FRIENDLY_NAME = "ProfileTransparencyDialogQuery"
 PROFILE_AUTHENTICITY_FRIENDLY_NAME = "ProfileCometDirectoryAuthenticityModalQuery"
 
@@ -1672,6 +1673,251 @@ class BrowserSession:
             time_taken=datetime.now(timezone.utc) - scrape_start_time,
         )
 
+    async def post_media_set_hybrid(
+        self,
+        post_id: str,
+        start_media_id: str,
+        handle: str | None = None,
+        mediaset_token: str = "",
+        skip_media_ids: list | None = None,
+        expected_count: int = -1,
+        max_media: int = -1,
+        media_index_offset: int = 0,
+        pagination_sleep_mean: float = 2.0,
+        pagination_sleep_std: float = 0.5,
+        template_capture_timeout: float = 30.0,
+        post_nav_sleep_seconds: float = 3.0,
+        request_timeout_ms: int = 30000,
+        operation_timeout_seconds: float = 600,
+        on_new_posts: Callable[[list[dict]], None | Awaitable[None]] | None = None,
+        download_media: bool = False,
+        media_dir: str | Path | None = None,
+        media_manifest: str | Path | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
+    ) -> ScrapeOutcome:
+        """Walk a post's photo set in the media viewer, one replay of
+        CometPhotoRootContentQuery per item.
+
+        Feed / permalink Stories carry only the first 5 album subattachments
+        (`all_subattachments.count` holds the real size), so a multi-photo post
+        loses everything past the 5th. The media viewer pages through the whole
+        set: each CometPhotoRootContentQuery response carries the item
+        (`data.currMedia`, full-size `image`) and, in a deferred chunk, the id of
+        the next item *in the requested set* (`nextMediaAfterNodeId`). The set
+        is the post's own (`pcb.<post_id>`), not the page album the
+        subattachment URLs point at.
+
+        Phases: (1) navigate to `/photo/?fbid=<start_media_id>&set=<token>`
+        without pressing Escape (that closes the viewer); (2) capture the
+        natural query — the viewer prefetches the neighbouring items on load,
+        and one ArrowRight is sent if it hasn't yet; (3) replay it with
+        `nodeID` set to each next item until the walk ends.
+
+        Termination: the set wraps (last → first), so the walk stops at the
+        first repeat (an item already visited, or one of `skip_media_ids`), when
+        `expected_count` distinct items have been seen (skipped ids included),
+        when there is no next item, or at `max_media` emitted items.
+
+        Args:
+            post_id: Numeric id of the post that owns the set.
+            start_media_id: Item to start from. PostDetail's first album
+                subattachment for a full walk; the last one already collected
+                to continue past the 5-node cap (pass the collected ids as
+                `skip_media_ids` so they're neither re-emitted nor re-fetched).
+            handle: Optional; only used in labels (the viewer URL doesn't need it).
+            mediaset_token: Set to walk; "" → `pcb.<post_id>`.
+            skip_media_ids: Already-collected item ids: not emitted; reaching
+                one (other than `start_media_id`) ends the walk.
+            expected_count: Album size when known (-1 = walk until wrap).
+            max_media: -1 disables; caps emitted items.
+            media_index_offset: File index of the first emitted photo (see
+                `build_media_set_record`).
+            on_new_posts / download_media / media_dir / media_manifest /
+                media_concurrency / include_thumbnails: streaming sinks — see
+                `_install_stream_hook`; fired once per emitted item.
+
+        Returns:
+            ScrapeOutcome with `data` = one PostMediaSet record per emitted item.
+        """
+        self.endpoint = "PostMediaSet"
+        token = mediaset_token or f"pcb.{post_id}"
+        label = f"{handle}/{post_id}" if handle else str(post_id)
+        target_url = f"https://www.facebook.com/photo/?fbid={start_media_id}&set={token}"
+        scrape_start_time = datetime.now(timezone.utc)
+        logger.info(f"[hybrid] media set {token} from {start_media_id} ({label})")
+
+        self.response_interceptor.flush()
+        self.response_interceptor.extract_posts = False
+        self._install_stream_hook(
+            label=label,
+            on_new_posts=on_new_posts,
+            download_media=download_media,
+            media_dir=media_dir,
+            media_manifest=media_manifest,
+            media_concurrency=media_concurrency,
+            include_thumbnails=include_thumbnails,
+        )
+
+        def _outcome(result: str) -> ScrapeOutcome:
+            return ScrapeOutcome(
+                result=result,
+                data=self.response_interceptor.get_posts(),
+                time_started=scrape_start_time,
+                time_taken=datetime.now(timezone.utc) - scrape_start_time,
+            )
+
+        # Phase 1 — open the viewer on the start item.
+        error = await self._hybrid_navigate(
+            target_url=target_url,
+            post_nav_sleep_seconds=post_nav_sleep_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+            dismiss_overlays=False,
+        )
+        if error:
+            return _outcome(error)
+
+        # Phase 2 — capture the natural CometPhotoRootContentQuery. The viewer
+        # normally prefetches the previous / next item right after load; step
+        # once if it hasn't, which fires the query for the next item.
+        if self.response_interceptor.latest_cprcq_request is None:
+            await self._hybrid_wait_for_template(
+                min(5.0, template_capture_timeout),
+                friendly_name=MEDIA_VIEWER_FRIENDLY_NAME,
+                interceptor_attr="latest_cprcq_request",
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+        if self.response_interceptor.latest_cprcq_request is None:
+            await self.page.keyboard.press("ArrowRight")
+        error, template = await self._hybrid_capture_template(
+            template_capture_timeout=template_capture_timeout,
+            operation_timeout_seconds=operation_timeout_seconds,
+            friendly_name=MEDIA_VIEWER_FRIENDLY_NAME,
+            interceptor_attr="latest_cprcq_request",
+            rescroll=False,
+        )
+        if error:
+            return _outcome(error)
+        logger.info(f"[hybrid] media set {token}: template captured (doc_id={template['doc_id']})")
+
+        # Phase 3 — walk the set.
+        result_str = await self._hybrid_media_set_loop(
+            label=label,
+            post_id=str(post_id),
+            mediaset_token=token,
+            start_media_id=str(start_media_id),
+            template=template,
+            skip_media_ids=skip_media_ids,
+            expected_count=expected_count,
+            max_media=max_media,
+            media_index_offset=media_index_offset,
+            pagination_sleep_mean=pagination_sleep_mean,
+            pagination_sleep_std=pagination_sleep_std,
+            request_timeout_ms=request_timeout_ms,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+        return _outcome(result_str)
+
+    async def _hybrid_media_set_loop(
+        self,
+        label: str,
+        post_id: str,
+        mediaset_token: str,
+        start_media_id: str,
+        template: dict,
+        skip_media_ids: list | None,
+        expected_count: int,
+        max_media: int,
+        media_index_offset: int,
+        pagination_sleep_mean: float,
+        pagination_sleep_std: float,
+        request_timeout_ms: int,
+        operation_timeout_seconds: float,
+    ) -> str:
+        """Replay CometPhotoRootContentQuery item by item; return a result string.
+
+        Same error contract as `_hybrid_comments_pagination_loop`: replay
+        transport errors return their error string, auth GraphQL errors raise
+        `FailedLoginError` (Worker rotates), in-body rate limits return
+        `'rate_limit'` (Worker locks the account). A response without
+        `currMedia` returns `'response_shape_error'`.
+        """
+        parser = self.response_interceptor.parser
+        skip = {str(x) for x in (skip_media_ids or [])}
+        visited: set[str] = set()
+        node_id = start_media_id
+        position = 0
+        emitted = 0
+        file_index = media_index_offset or 0
+
+        while True:
+            body = self._hybrid_build_body(
+                template["form"], {"nodeID": node_id, "mediasetToken": mediaset_token}
+            )
+            response, text, error_str = await self._hybrid_send_replay(
+                handle=label,
+                body=body,
+                template_headers=template["headers"],
+                request_timeout_ms=request_timeout_ms,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
+            if error_str is not None:
+                return error_str
+            await self.record_scroll(endpoint=self.endpoint, count=1)
+
+            graphql_error_detail = self._hybrid_extract_graphql_error_detail(text)
+            if graphql_error_detail:
+                gql_msg = graphql_error_detail.get("message", "")
+                logger.warning(
+                    f"[hybrid] @{label}: GraphQL error: {gql_msg} "
+                    f"(code={graphql_error_detail.get('code')}, "
+                    f"severity={graphql_error_detail.get('severity')})"
+                )
+                if self._hybrid_is_auth_error(gql_msg):
+                    raise FailedLoginError(f"Session invalid mid-scrape (graphql error: {gql_msg})")
+                if self._hybrid_is_rate_limit_error(graphql_error_detail):
+                    return 'rate_limit'
+
+            parsed = parser.parse_media_viewer_response((text or "").encode("utf-8")) or {}
+            media = parsed.get("media")
+            if not isinstance(media, dict) or not media.get("id"):
+                logger.warning(f"[hybrid] @{label}: no currMedia for {node_id} (status {response.status})")
+                return 'response_shape_error'
+            media_id = str(media["id"])
+            if media_id in visited:
+                return 'success'
+            visited.add(media_id)
+
+            if media_id not in skip:
+                is_photo = media.get("__typename") == "Photo" and _g(media, "image", "uri")
+                record = parser.build_media_set_record(
+                    post_id, mediaset_token, media, position, file_index if is_photo else None
+                )
+                if is_photo:
+                    file_index += 1
+                await self.response_interceptor.fire_new_posts(
+                    self.response_interceptor.add_posts([record])
+                )
+                emitted += 1
+            position += 1
+
+            next_id = parsed.get("next_media_id")
+            logger.debug(
+                f"[hybrid] @{label} item {position}: {media_id} "
+                f"({media.get('__typename')}), next={next_id}, emitted={emitted}"
+            )
+            if not next_id:
+                return 'success'
+            next_id = str(next_id)
+            if next_id in visited or next_id == start_media_id or next_id in skip:
+                return 'success'          # wrapped back into the part already walked / collected
+            if expected_count and expected_count > 0 and len(visited | skip) >= expected_count:
+                return 'success'
+            if max_media and max_media > 0 and emitted >= max_media:
+                return 'max_media_reached'
+            node_id = next_id
+            await asyncio.sleep(abs(random.gauss(pagination_sleep_mean, pagination_sleep_std)))
+
     # ---------------- Streaming sinks (media / caller hooks) ----------------
 
     def _install_stream_hook(
@@ -2095,8 +2341,14 @@ class BrowserSession:
         target_url: str,
         post_nav_sleep_seconds: float,
         operation_timeout_seconds: float,
+        dismiss_overlays: bool = True,
     ) -> str | None:
-        """Navigate to the profile and run a post-nav error check. Returns an error string or None."""
+        """Navigate to the profile and run a post-nav error check. Returns an error string or None.
+
+        `dismiss_overlays` presses Escape after load to close FB's interstitial
+        dialogs. The media viewer (PostMediaSet) IS an overlay that Escape
+        closes, so that endpoint passes False.
+        """
         logger.info(f"[hybrid] navigating to {target_url}")
         self.requests_sent += 1
         try:
@@ -2105,8 +2357,9 @@ class BrowserSession:
             return f'navigation_error: {e}'
         await asyncio.sleep(post_nav_sleep_seconds)
 
-        await self.page.keyboard.press('Escape')
-        await asyncio.sleep(abs(random.gauss(1, 0.2)))
+        if dismiss_overlays:
+            await self.page.keyboard.press('Escape')
+            await asyncio.sleep(abs(random.gauss(1, 0.2)))
 
         try:
             error = await asyncio.wait_for(
@@ -2151,6 +2404,7 @@ class BrowserSession:
         operation_timeout_seconds: float,
         friendly_name: str = HYBRID_TARGET_FRIENDLY_NAME,
         interceptor_attr: str = "latest_pctfrq_request",
+        rescroll: bool = True,
     ) -> tuple[str | None, dict | None]:
         """Wait for the natural pagination request and extract a replay template.
 
@@ -2158,12 +2412,14 @@ class BrowserSession:
         `form`, `headers`, `cursor` (always None — first replay uses
         cursor=null), `doc_id`, and `profile_id`. On capture failure, re-runs
         the DOM error check to surface a clean reason (private profile, etc.).
+        `rescroll=False` for pages where the query isn't scroll-driven (the
+        media viewer).
         """
         template = await self._hybrid_wait_for_template(
             template_capture_timeout,
             friendly_name=friendly_name,
             interceptor_attr=interceptor_attr,
-            rescroll=True,
+            rescroll=rescroll,
             operation_timeout_seconds=operation_timeout_seconds,
         )
         if not template:

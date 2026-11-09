@@ -968,6 +968,92 @@ class FacebookScraper:
         )
         return result
 
+    async def post_media_set(
+        self,
+        post_id: str,
+        start_media_id: str,
+        handle: str | None = None,
+        mode: str = "hybrid",
+        on_new_posts=None,
+        download_media: bool = False,
+        media_dir: str | None = None,
+        media_manifest: str | None = None,
+        media_concurrency: int = 8,
+        include_thumbnails: bool = False,
+        **params,
+    ) -> ScrapingResult:
+        """
+        Fetch every item of a post's photo set through FB's media viewer.
+
+        Feed and permalink Stories carry only the first 5 album subattachments
+        (the album's real size is `all_subattachments.count`). This walks the
+        post's own set (`pcb.<post_id>`) from `start_media_id`, one
+        CometPhotoRootContentQuery replay per item, and returns one record per
+        item in the set's order, flattenable via
+        `FacebookGraphQLParser.flatten(record, endpoint="PostMediaSet")`.
+        Records are shaped as one-item albums of the parent post, so
+        `download_media` names files `<post_id>_img_NN` like the post's own
+        media (starting at `media_index_offset`).
+
+        Args:
+            post_id: Numeric id of the post owning the set.
+            start_media_id: Item to start from — PostDetail's first album
+                subattachment for a full walk, or the last collected one to
+                continue past the 5-node cap (then pass the collected ids in
+                `skip_media_ids` and the Story's media-entry count in
+                `media_index_offset`).
+            handle: Optional; labels only (the viewer URL doesn't need it).
+            mode: Currently only "hybrid" is supported.
+            on_new_posts / download_media / media_dir / media_manifest /
+                  media_concurrency / include_thumbnails: streaming sinks —
+                  see `user_timeline`. Fired once per item.
+            **params: mode-specific knobs (`mediaset_token`, `skip_media_ids`,
+                  `expected_count`, `max_media`, `media_index_offset`, sleeps,
+                  timeouts). Allowed keys and defaults live in
+                  Query.ENDPOINT_REGISTRY["PostMediaSet"]["modes"]["hybrid"]["params"].
+
+        Returns:
+            ScrapingResult — `data` is one record per item emitted; `result` is
+            `success` when the walk ended (wrap / end / expected_count),
+            `max_media_reached`, or a failure reason.
+
+        Raises:
+            NoAccountError: If no accounts available in pool
+            ValueError: If endpoint/mode/query/params validation fails
+        """
+        await self._ensure_initialized()
+
+        cleaned_params = {k: v for k, v in params.items() if v is not None}
+        query_fields = {"post_id": str(post_id), "start_media_id": str(start_media_id)}
+        if handle:
+            query_fields["handle"] = handle
+
+        query = Query(
+            endpoint="PostMediaSet",
+            mode=mode,
+            query=query_fields,
+            params=cleaned_params,
+            runtime_options=_stream_runtime_options(
+                on_new_posts=on_new_posts,
+                download_media=download_media,
+                media_dir=media_dir,
+                media_manifest=media_manifest,
+                media_concurrency=media_concurrency,
+                include_thumbnails=include_thumbnails,
+            ),
+        )
+
+        logger.debug(
+            f"Submitting PostMediaSet task (mode={mode}) for {post_id} from {start_media_id}"
+        )
+        future = await self.worker_pool.submit_task(query)
+        result = await future
+        logger.info(
+            f"Completed PostMediaSet (mode={mode}) for {post_id}: "
+            f"{result.result} ({len(result.data)} item(s), {result.time_taken})"
+        )
+        return result
+
     async def profile_info(
         self,
         handle: str,
