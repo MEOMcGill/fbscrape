@@ -107,6 +107,8 @@ Firing points: `add_posts` returns the deduped batch; `ResponseInterceptor.fire_
 
 Scroll-based rotation: pre-task when `Worker.scroll_count >= scroll_threshold` (default 500), reading `BrowserSession.scrolls_recorded` (per-session integer), not the DB. 5-minute cooldown prevents immediately re-acquiring the same account.
 
+Account selection: `AccountsPool._order_by` = `scroll_count_overall_24h ASC, last_used ASC` (recent scroll load, least-recently-used as tie-break). The 24h scroll-count reset is applied **inside `_get_and_mark_in_use`**, not at login — acquisition overwrites `last_used` and returns the post-update row, so it is the last point that can still see an account's real idle time. See the KDD in [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
+
 In-body rate-limit (`errors[{code:1675004}]`) → `'rate_limit'` result, account locked 24h, partial data preserved, no retry slot burned. In-body `graphql_error` → no rotation, forensic dump to `tmp/hybrid/graphql_error/`. See [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 
 ---

@@ -15,7 +15,13 @@ class NoAccountError(Exception):
 
 
 class AccountsPool:
-    _order_by: str = "scroll_count_overall_24h ASC"
+    # `last_used ASC` is a tie-breaker, not a change of policy: the primary
+    # key stays recent scroll load. It matters because the 24h reset (applied
+    # in `_get_and_mark_in_use`) puts every rested account at 0, and without a
+    # second key SQLite is free to return the same one from that tied group
+    # over and over — which is how a single freshly-reset account ends up
+    # absorbing a whole batch while its peers sit idle.
+    _order_by: str = "scroll_count_overall_24h ASC, last_used ASC"
 
     def __init__(
             self,
@@ -285,12 +291,42 @@ class AccountsPool:
         await execute(self._db_file, qs)
 
     async def _get_and_mark_in_use(self, condition: str):
-        """Internal method to get an account and mark it as in_use"""
+        """Internal method to get an account and mark it as in_use.
+
+        Also performs the 24h scroll-count reset, because this is the ONLY
+        place that still sees the account's real idle time. Acquisition
+        overwrites `last_used` with now and hands the caller the post-update
+        row, so by the time anything downstream (e.g. login's post-success
+        bookkeeping) compares `now - account.last_used` the answer is always
+        ~0s and a reset there can never fire. See KDD below.
+
+        Every right-hand side in an UPDATE's SET clause reads the PRE-update
+        row, so the CASE expressions below test the account's previous
+        `last_used` even though the same statement reassigns it.
+        """
+        # One timestamp for the whole statement: utc.ts() called twice could
+        # straddle a second boundary and make the cutoff disagree with the
+        # value written to last_used.
+        now_ts = utc.ts()
+        # Rolling window: a NULL last_used (never used) also resets, which is
+        # a no-op on a fresh row but keeps the invariant simple.
+        stale = (
+            f"last_used IS NULL "
+            f"OR last_used <= datetime({now_ts} - 86400, 'unixepoch')"
+        )
+        reset_clause = (
+            f"scroll_count_overall_24h = "
+            f"CASE WHEN {stale} THEN 0 ELSE scroll_count_overall_24h END,\n"
+            f"                scroll_count_per_endpoint_total = "
+            f"CASE WHEN {stale} THEN '{{}}' "
+            f"ELSE scroll_count_per_endpoint_total END,\n"
+            f"                last_used = datetime({now_ts}, 'unixepoch')"
+        )
         # condition is a subquery that selects the identifier
         if int(sqlite3.sqlite_version_info[1]) >= 35:
             qs = f"""
             UPDATE accounts SET
-                last_used = datetime({utc.ts()}, 'unixepoch'),
+                {reset_clause},
                 in_use = true
             WHERE COALESCE(email, phone_number) = ({condition})
             RETURNING *
@@ -300,7 +336,7 @@ class AccountsPool:
             tx = uuid.uuid4().hex
             qs = f"""
             UPDATE accounts SET
-                last_used = datetime({utc.ts()}, 'unixepoch'),
+                {reset_clause},
                 in_use = true,
                 _tx = '{tx}'
             WHERE COALESCE(email, phone_number) = ({condition})

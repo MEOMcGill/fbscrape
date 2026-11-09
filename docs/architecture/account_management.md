@@ -115,11 +115,61 @@ proxy, and fingerprint columns are omitted — they don't drive state.
 | `in_use` | BOOLEAN | A worker currently holds the account. | `_get_and_mark_in_use()` (278), `release_account()` (382), `mark_inactive()` (406) | `get_available()` SQL |
 | `locks` | JSON | Holds key `$.locked_until` (ISO 8601 datetime) when the account is rate-limited / cooling down. `NULL`/missing ⇒ not locked. | `lock_until()` (234), `unlock()` (256) | `get_available()` SQL, `next_available_at()` (360) |
 | `error_msg` | TEXT | Human-readable reason an account became Inactive. Cleared on next successful login. | `set_active()` (200), `mark_inactive()` (406) | logs / admin queries |
-| `last_used` | TEXT (ISO 8601) | Updated on every state-changing pool method touch. | `_get_and_mark_in_use`, `release_account`, `lock_until`, `unlock`, `update_scroll_count`, `update_last_used` | `_on_login_success` 24h-stale check (`browser_session.py:438`) |
-| `scroll_count_overall_24h` | INTEGER | Total scrolls in last 24 h; reset by `_on_login_success` if `last_used` was > 24 h ago. | `update_scroll_count()` (457), `reset_scroll_counts()` (507) | worker scroll-threshold check (`worker.py:243`) |
-| `scroll_count_per_endpoint_total` | JSON | Per-endpoint scroll totals. Same lifecycle as `_overall_24h`. | `update_scroll_count()` (457), `reset_scroll_counts()` (507) | scoping per-endpoint quotas |
+| `last_used` | TEXT (ISO 8601) | Updated on every state-changing pool method touch. | `_get_and_mark_in_use`, `release_account`, `lock_until`, `unlock`, `update_scroll_count`, `update_last_used` | `_get_and_mark_in_use` 24h-stale check (see below) |
+| `scroll_count_overall_24h` | INTEGER | Scrolls in the current 24 h window; zeroed during acquisition when the *previous* `last_used` was > 24 h ago. | `update_scroll_count()`, `reset_scroll_counts()`, `_get_and_mark_in_use()` | `get_available()` ordering, worker scroll-threshold check (`worker.py`) |
+| `scroll_count_per_endpoint_total` | JSON | Per-endpoint scroll totals. Same lifecycle as `_overall_24h`. | `update_scroll_count()`, `reset_scroll_counts()`, `_get_and_mark_in_use()` | scoping per-endpoint quotas |
 
 All file/line references point to `fbscrape/accounts_pool.py` unless prefixed.
+
+### The 24h scroll-count reset lives in acquisition
+
+`_get_and_mark_in_use` stamps `last_used = now` and returns the **post-update**
+row (`RETURNING *`, or a `_tx` re-select on SQLite < 3.35). An account's real
+idle time is therefore gone the instant it is acquired, before any caller sees
+the `Account` object.
+
+That makes acquisition the only place the reset can be applied, so it happens
+there, in the same `UPDATE`:
+
+```sql
+UPDATE accounts SET
+    scroll_count_overall_24h = CASE WHEN <stale> THEN 0 ELSE scroll_count_overall_24h END,
+    scroll_count_per_endpoint_total = CASE WHEN <stale> THEN '{}' ELSE … END,
+    last_used = datetime(:now, 'unixepoch'),
+    in_use = true
+WHERE …
+-- <stale> := last_used IS NULL OR last_used <= datetime(:now - 86400, 'unixepoch')
+```
+
+Every right-hand side in a SET clause reads the pre-update row, so the CASE
+guards test the account's *previous* `last_used` even though the same statement
+reassigns it. One timestamp is computed for the whole statement so the cutoff
+cannot disagree with the value written.
+
+> **KDD — the reset that never fired.** This logic previously sat in
+> `login._on_login_success`, guarded by
+> `now - session.account.last_used > timedelta(hours=24)`. Because acquisition
+> had already overwritten `last_used`, that delta was always ~0 s and the reset
+> never ran. `scroll_count_overall_24h` accumulated for the life of the account
+> (237k observed on accounts idle for days), so it tracked *lifetime* rather
+> than recent load. The pool's default `scroll_count_overall_24h ASC` ordering
+> then meant rest could never move an account up the queue — only a manual
+> `reset_scroll_counts` could — and a freshly-reset account would absorb an
+> entire batch while rested peers sat idle. Covered by
+> `tests/unit/test_accounts_pool_scroll_reset.py`.
+
+### Selection order
+
+`AccountsPool._order_by` defaults to
+`scroll_count_overall_24h ASC, last_used ASC`. The primary key is recent scroll
+load; `last_used` is a tie-break, needed because the reset puts every rested
+account at 0 and SQLite would otherwise be free to return the same member of
+that tied group every time.
+
+Callers may override via `get_available(order_by=…)`. `Worker.LAST_USED_ORDER_BY`
+(`last_used ASC, scroll_count_overall_24h ASC`) inverts the keys for endpoints
+that record no scrolls (`ProfileInfo`, `ProfileAbout`, `GroupInfo`,
+`GroupAbout`), where the scroll count never moves and so cannot spread load.
 
 ## Exception → State-Change Matrix
 
