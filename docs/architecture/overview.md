@@ -132,13 +132,13 @@ async with BrowserSession(account, pool, headless=True) as session:
 
 ### 4. Account Rotation with Cooldown
 
-When rotating accounts, we add a 5-minute lock:
+When rotating accounts, we add a 2-minute lock (the default when no `lock_until` is passed):
 
 ```python
 async def rotate_account(self):
     await self.pool.lock_until(
         self.current_account.identifier,
-        "datetime('now', '+5 minutes')"
+        "datetime('now', '+2 minutes')"
     )
     await self.pool.release_account(...)
 ```
@@ -209,7 +209,7 @@ async for result in gather(
 |-------|--------|---------|
 | `FailedLoginError` | Mark account inactive, rotate | Up to 3 |
 | `AccountBannedError` | Mark account inactive, rotate | Up to 3 |
-| `RateLimitError` | Lock account 1 hour, rotate | Up to 3 |
+| `RateLimitError` | Lock account 24 hours, rotate | Up to 3 |
 | `NoAccountError` | Propagate to caller | None |
 | Other exceptions | Propagate via Future | None |
 

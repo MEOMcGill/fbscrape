@@ -53,7 +53,7 @@ state machine in
 |---|---|---|
 | `AccountDisabledError` | rotate to a new account | no |
 | `CheckpointError` | rotate to a new account | yes |
-| `TransientLoginError` | rotate, account stays active | yes |
+| `TransientLoginError` | rotate, account stays active — until 3 consecutive (per process, reset on success), then mark inactive | yes |
 | `RendererHangError` | restart task on **same** account, fresh `BrowserSession` | yes |
 | `FailedLoginError` | mark account inactive + rotate | yes |
 | `AccountBannedError` | mark account inactive + rotate | yes |

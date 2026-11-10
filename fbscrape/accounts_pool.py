@@ -30,6 +30,11 @@ class AccountsPool:
     ):
         self._db_file = db_file
         self._raise_when_no_account = _raise_when_no_account
+        # identifier -> consecutive TransientLoginError count. In-memory and
+        # per-process on purpose: it only needs to stop one run from cycling
+        # a genuinely broken account forever, and keeping it out of the DB
+        # avoids a schema change. Shared by every Worker in a WorkerPool.
+        self._transient_login_failures: dict[str, int] = {}
 
     def _identifier_condition(self, identifier: str) -> str:
         """Build SQL condition for matching by email or phone_number"""
@@ -456,6 +461,16 @@ class AccountsPool:
             """
 
         await execute(self._db_file, qs)
+
+    def record_transient_login_failure(self, identifier: str) -> int:
+        """Count one more consecutive transient login failure; return the streak."""
+        n = self._transient_login_failures.get(identifier, 0) + 1
+        self._transient_login_failures[identifier] = n
+        return n
+
+    def clear_transient_login_failures(self, identifier: str) -> None:
+        """Reset the transient-login-failure streak (on success or once acted on)."""
+        self._transient_login_failures.pop(identifier, None)
 
     async def mark_inactive(self, identifier: str, error_msg: str | None):
         """Mark an account as inactive with an error message"""
