@@ -83,6 +83,13 @@ if TYPE_CHECKING:
 # flakes before escalating to the worker via TransientLoginError.
 LOGIN_FORM_MAX_ATTEMPTS = 2
 
+# How long `_wait_for_log_in_outcome` waits for the URL to settle into a known
+# pattern. `wait_for_url` returns as soon as the URL matches, so this only
+# costs time on attempts that would otherwise have failed. 5 s was too tight
+# under load: with ~10 Camoufox instances on one box, the cookie probe timed
+# out hundreds of times per run on accounts whose cookies were valid.
+LOGIN_OUTCOME_URL_TIMEOUT_MS = 15_000
+
 
 # ==================== Public API ====================
 
@@ -115,8 +122,19 @@ async def login(session: "BrowserSession") -> None:
     try:
         if await login_with_cookies(session):
             return
-        if await login_automatic(session):
-            return
+        try:
+            if await login_automatic(session):
+                return
+        except TransientLoginError:
+            # Headless: nobody can intervene, so let the worker rotate.
+            # Non-headless: a human is present — hand over to manual login
+            # rather than giving up on a page we couldn't classify.
+            if session.headless:
+                raise
+            logger.warning(
+                f"Automatic login inconclusive for {session.account.display_name}; "
+                f"falling back to manual"
+            )
         if not session.headless:
             if await login_manual(session):
                 return
@@ -153,14 +171,13 @@ async def login_automatic(session: "BrowserSession") -> bool:
     account WITHOUT marking the current one inactive.
 
     Returns:
-        True if login successful or already logged in, False on known "can't
-        login here" conditions (no form visible, viewer never resolved, URL
-        never settled).
+        True if login successful or already logged in.
 
     Raises:
         CheckpointError / AccountDisabledError: Facebook redirected to a
             /checkpoint/ page (detector already wrote DB state).
-        TransientLoginError: Both internal attempts hit unexpected errors.
+        TransientLoginError: Both internal attempts hit unexpected errors, or
+            the page showed neither a logged-in state nor a login form.
     """
     logger.debug(f"login_automatic() for {session.account.display_name}")
     # Check if already logged in
@@ -194,8 +211,19 @@ async def login_automatic(session: "BrowserSession") -> bool:
 
     # Check if login form is visible
     if not await _is_login_form_visible(session):
+        # Neither logged in nor showing a login form: the page is in a state we
+        # can't classify — in practice a page that hasn't finished loading
+        # (slow FB / overloaded host). That says nothing about the account, so
+        # escalate as transient: the worker rotates without marking it
+        # inactive, and only marks it inactive after repeated consecutive
+        # failures (see Worker / MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES).
+        # Returning False here used to fall through to "All login methods
+        # failed" → mark_inactive, which retired accounts with valid cookies.
         logger.warning(f"Cannot login {session.account.display_name}: no login form and not logged in")
-        return False
+        raise TransientLoginError(
+            f"No login form and not logged in for {session.account.display_name} "
+            f"(page likely not loaded)"
+        )
 
     logger.info(f"Logging in to Facebook as {session.account.display_name}")
     logger.debug("Login form is visible, proceeding with credentials")
@@ -468,6 +496,8 @@ async def _on_login_success(session: "BrowserSession") -> None:
     """
     # Save cookies after successful login
     await session.save_cookies()
+    # A success ends any streak of transient login failures for this account.
+    session.pool.clear_transient_login_failures(session.account.identifier)
     # Mark account as active and clear any previous error message
     await session.pool.set_active(session.account.identifier, True, None)
     # Update last_used timestamp
@@ -575,10 +605,10 @@ async def _wait_for_log_in_outcome(session: "BrowserSession") -> bool:
     ]
 
     try:
-        await session.page.wait_for_url(wait_re, timeout=5000)
+        await session.page.wait_for_url(wait_re, timeout=LOGIN_OUTCOME_URL_TIMEOUT_MS)
     except Exception as e:
         logger.debug(
-            f"No known login-outcome URL after 5s: {e} "
+            f"No known login-outcome URL after {LOGIN_OUTCOME_URL_TIMEOUT_MS / 1000:g}s: {e} "
             f"(last url={session.page.url})"
         )
         return False

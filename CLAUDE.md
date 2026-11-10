@@ -99,13 +99,13 @@ Firing points: `add_posts` returns the deduped batch; `ResponseInterceptor.fire_
 | `AccountDisabledError` | rotate (no retry burn) | no |
 | `AutomationCheckpointError` | lock 24h + rotate (stays active) | yes |
 | `CheckpointError` | rotate + retry | yes |
-| `TransientLoginError` | rotate (stays active) | yes |
+| `TransientLoginError` | rotate (stays active); mark inactive after 3 in a row | yes |
 | `FailedLoginError` | mark inactive + rotate | yes |
 | `AccountBannedError` | mark inactive + rotate | yes |
 | `RateLimitError` (HTTP 429) | lock 24h + rotate | yes |
 | `NoAccountError` | put task back; stop | — |
 
-Scroll-based rotation: pre-task when `Worker.scroll_count >= scroll_threshold` (default 500), reading `BrowserSession.scrolls_recorded` (per-session integer), not the DB. 5-minute cooldown prevents immediately re-acquiring the same account.
+Scroll-based rotation: pre-task when `Worker.scroll_count >= scroll_threshold` (default 500), reading `BrowserSession.scrolls_recorded` (per-session integer), not the DB. 2-minute cooldown (`rotate_account` default lock) prevents immediately re-acquiring the same account.
 
 Account selection: `AccountsPool._order_by` = `scroll_count_overall_24h ASC, last_used ASC` (recent scroll load, least-recently-used as tie-break). The 24h scroll-count reset is applied **inside `_get_and_mark_in_use`**, not at login — acquisition overwrites `last_used` and returns the post-update row, so it is the last point that can still see an account's real idle time. See the KDD in [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 

@@ -23,8 +23,8 @@ stateDiagram-v2
     ActiveFree --> ActiveInUse: _get_and_mark_in_use<br/>(via get_available)
     ActiveInUse --> ActiveFree: release_account()<br/>(from Worker.close)
 
-    ActiveInUse --> ActiveLocked: lock_until('+5 min')<br/>(rotate_account cooldown)
-    ActiveInUse --> ActiveLocked: lock_until('+1 hour')<br/>(RateLimitError)
+    ActiveInUse --> ActiveLocked: lock_until('+2 min')<br/>(rotate_account cooldown)
+    ActiveInUse --> ActiveLocked: lock_until('+24 hours')<br/>(RateLimitError)
 
     ActiveLocked --> ActiveFree: locks.locked_until < now<br/>(implicit, query-driven)
 
@@ -73,10 +73,10 @@ flowchart TD
 
     J -- AccountDisabledError --> L[rotate_account<br/>NO retry++]
     J -- CheckpointError --> M[rotate_account<br/>retry++]
-    J -- TransientLoginError --> N[rotate_account<br/>retry++<br/>account stays Active]
+    J -- TransientLoginError --> N[rotate_account<br/>retry++<br/>account stays Active<br/>mark_inactive on 3rd in a row]
     J -- FailedLoginError --> O[mark_inactive<br/>rotate_account<br/>retry++]
     J -- AccountBannedError --> P[mark_inactive<br/>rotate_account<br/>retry++]
-    J -- RateLimitError --> Q["lock_until('+1 hour')<br/>rotate_account<br/>retry++"]
+    J -- RateLimitError --> Q["lock_until('+24 hours')<br/>rotate_account<br/>retry++"]
 
     L --> I
     M --> I
@@ -94,7 +94,7 @@ flowchart TD
   (pool empty) and left `current_account = None`. The guard re-acquires (with
   wait, since locked accounts may free up) before falling through to
   `BrowserSession`.
-- `rotate_account()` itself: `lock_until('+5 min')` on the current account →
+- `rotate_account()` itself: `lock_until('+2 min')` on the current account →
   `release_account()` → set `current_account=None` → `initialize()` to acquire
   a new one (raises `NoAccountError` if pool empty).
 - Detector→worker contract: `AccountDisabledError` and `CheckpointError` are
@@ -181,10 +181,10 @@ detector → worker handler → final state.
 | `AccountDisabledError` | `login.py:_wait_for_log_in_outcome` on `/checkpoint/disabled/` | detector via `set_active(False, "Account disabled by Facebook (…)")` | `worker.py` → `rotate_account()` only | **Inactive** | **No** (dead account doesn't burn retry budget) |
 | `AutomationCheckpointError` | `login.py:_dispatch_login_outcome` on `/checkpoint/<id>/` + page body matches `_is_automation_suspected_checkpoint` ("suspect automated behavior") | none (worker writes) | `worker.py` → `rotate_account(lock_until='+24 hours', error_msg='automation suspected …')` | **Active**, locked +24h | Yes |
 | `CheckpointError` | `login.py:_wait_for_log_in_outcome` on other `/checkpoint/` (after automation refinement) | detector via `set_active(False, "Checkpoint challenge — manual intervention required (…)")` | `worker.py` → `rotate_account()` | Inactive | Yes |
-| `TransientLoginError` | `login.py login()` — internal retry exhausted, "URL never settled", "viewer never came through", **or a raw playwright `TimeoutError`/`TargetClosedError` from a bare `page.goto`/`reload` in the login flow (reclassified at the `login()` chokepoint — see note below)** | none (account stays Active) | `worker.py:302` → `rotate_account()` | **Active**, locked +5 min by rotate's cooldown | Yes |
+| `TransientLoginError` | `login.py login()` — internal retry exhausted, "URL never settled", "viewer never came through", "no login form and not logged in" (page not loaded — used to fall through to generic `FailedLoginError` and retire healthy accounts), **or a raw playwright `TimeoutError`/`TargetClosedError` from a bare `page.goto`/`reload` in the login flow (reclassified at the `login()` chokepoint — see note below)** | none (account stays Active) | `worker.py` → `pool.record_transient_login_failure()` + `rotate_account()`; on the `MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES` (3)th in a row → `mark_inactive()`. Streak is in-memory per process, reset by `_on_login_success` | **Active**, locked +2 min by rotate's cooldown (Inactive after 3 in a row) | Yes |
 | `FailedLoginError` (generic) | `browser_session.py:_resolve_not_logged_in` last-resort when `login()` returns False | none (worker writes) | `worker.py:313` → `mark_inactive()` + `rotate_account()` | Inactive | Yes |
 | `AccountBannedError` | scraping methods (e.g., `user_timeline`) | none (worker writes) | `worker.py:326` → `mark_inactive()` + `rotate_account()` | Inactive | Yes |
-| `RateLimitError` | scraping methods | none (worker writes) | `worker.py:337` → `lock_until('+1 hour')` + `rotate_account()` | **Active**, locked +1 hour | Yes |
+| `RateLimitError` | scraping methods | none (worker writes) | `worker.py` → `rotate_account(lock_until='+24 hours', error_msg='Rate limited at … locked 24h')` | **Active**, locked +24 hours | Yes |
 | `NoAccountError` | `pool.get_available_or_wait()` returning None **or** `Worker.initialize()` failing | none | `worker.py:190` (worker_pool's `_worker_loop` catches via generic `except`) | n/a (no account held) | n/a |
 
 > **`login()` transient-nav chokepoint.** The login helpers (`login_with_cookies`, `check_logged_in`) issue several *bare* `page.goto` / `page.reload` calls. A renderer/network flake there raises a raw playwright `TimeoutError` / `TargetClosedError` — which is **not** one of the typed-retry exceptions above, so it would escape untyped out of `execute_task`, get set on the future by `_worker_loop`, re-raise through `FacebookScraper.user_timeline`'s `await future`, and then through `gather()`'s `yield await c` — tearing down the **entire batch** (one bad navigation killing every other handle; observed in production 2026-06-02). `login()` wraps its orchestration in a narrow `except (TimeoutError, TargetClosedError)` that reclassifies *only* those two into `TransientLoginError`, so the worker rotates + retries instead. The catch is deliberately narrow: checkpoint/ban/disabled typed exceptions and the terminal `FailedLoginError` pass straight through, never swallowed.
@@ -249,8 +249,8 @@ immediately on any unavailability — useful for CI.
 
 | Reason | Lock duration | Set by |
 |---|---|---|
-| Post-rotation cooldown | **5 min** | `worker.py:rotate_account()` via `lock_until('+5 minutes')` |
-| Rate limit hit during scraping | **1 hour** | `worker.py except RateLimitError` via `lock_until('+1 hour')` |
+| Post-rotation cooldown | **2 min** | `worker.py:rotate_account()` via `lock_until('+2 minutes')` (default when no `lock_until` is passed) |
+| Rate limit hit during scraping | **24 hours** | `worker.py except RateLimitError` via `rotate_account(lock_until='+24 hours')` |
 
 Lock state lives in the `locks` column under `$.locked_until` (ISO 8601 UTC).
 The lock auto-expires — there is no scheduled unlock; the next

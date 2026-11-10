@@ -32,6 +32,12 @@ from .logger import logger
 from .models import Query, ScrapingResult
 
 
+# A TransientLoginError keeps the account active, but an account that fails
+# this way this many times in a row (with no success in between, within one
+# process) is marked inactive so it isn't re-picked after every cooldown.
+MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES = 3
+
+
 class Worker:
     """
     Manages account lifecycle and executes scraping tasks.
@@ -503,13 +509,30 @@ class Worker:
                 retry_count += 1
 
             except TransientLoginError as e:
-                # Unexpected error inside login() that both internal attempts couldn't recover.
-                # Probably a transient playwright / page issue — do NOT mark this account
-                # inactive. Rotate to a different account and count as a retry.
-                logger.warning(
-                    f"Worker {self.id}: transient login error on {self.current_account.display_name}: "
-                    f"{e} — rotating (account stays active)"
-                )
+                # Login didn't complete for a reason that isn't evidence against
+                # the account (playwright flake, page never loaded). Keep it
+                # active and rotate — unless it has now failed this way
+                # MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES times in a row, in
+                # which case it's probably genuinely broken: retire it so it
+                # doesn't get re-picked every cooldown forever.
+                ident = self.current_account.identifier
+                streak = self.pool.record_transient_login_failure(ident)
+                if streak >= MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES:
+                    logger.warning(
+                        f"Worker {self.id}: {streak} consecutive transient login failures on "
+                        f"{self.current_account.display_name} — marking inactive and rotating"
+                    )
+                    await self.pool.mark_inactive(
+                        ident,
+                        f"Login failed: {streak} consecutive transient login failures (last: {e})",
+                    )
+                    self.pool.clear_transient_login_failures(ident)
+                else:
+                    logger.warning(
+                        f"Worker {self.id}: transient login error on {self.current_account.display_name} "
+                        f"({streak}/{MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES}): {e} — rotating "
+                        f"(account stays active)"
+                    )
                 await self.rotate_account()
                 retry_count += 1
 

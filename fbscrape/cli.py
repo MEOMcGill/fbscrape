@@ -729,11 +729,11 @@ def login(ctx, identifier, mode, cookies, headless, log_level):
                     else:
                         click.echo("Cookies didn't validate — falling back to form-fill.")
 
-                # login_automatic returns False on "no login form visible",
-                # raises typed exceptions on checkpoint / disabled / transient.
+                # login_automatic raises typed exceptions on checkpoint /
+                # disabled / transient (incl. "no login form visible").
                 # On success it runs _on_login_success which already saves cookies.
                 if not await login_automatic(session):
-                    click.echo(f"Automatic login failed for {ident}: no login form visible")
+                    click.echo(f"Automatic login failed for {ident}")
                     return False
                 click.echo(f"Login OK for {ident} (cookies persisted).")
                 return True
