@@ -69,3 +69,32 @@ def test_streamed_dedup_and_emoji_roundtrip(tmp_path):
     nodes = [r["node"] for r in recs if isinstance(r, dict) and r.get("node")]
     assert [n["post_id"] for n in nodes] == ["p0", "p1", "p2"]
     assert any("🤮" in n["text"] for n in nodes)
+
+
+def test_post_count_is_the_only_valid_progress_signal_under_streaming():
+    """The hybrid loops must measure progress with `post_count`, not `len(get_posts())`.
+
+    `add_posts` routes to `post_sink` *instead of* `self.posts` when a sink is
+    installed (an intended, separately-tested contract). A loop that derives
+    `new_posts_in_iter` from `len(get_posts())` therefore sees zero progress on
+    every pagination of a streamed scrape, never resets `no_progress_streak`,
+    and bails at `max_no_progress_streak * pagination_count` posts — 90 for
+    GroupTimeline, which is exactly what a live run produced (87/89/90/90)
+    before this was fixed.
+    """
+    ri = ResponseInterceptor()
+    ri.extract_posts = False
+    sunk = []
+    ri.post_sink = sunk.append
+
+    progress_by_count, progress_by_list = [], []
+    previous_count, previous_len = ri.post_count, len(ri.get_posts())
+    for batch in range(3):
+        ri.add_posts([_fake_post(batch * 2), _fake_post(batch * 2 + 1)])
+        progress_by_count.append(ri.post_count - previous_count)
+        progress_by_list.append(len(ri.get_posts()) - previous_len)
+        previous_count, previous_len = ri.post_count, len(ri.get_posts())
+
+    assert progress_by_count == [2, 2, 2]   # what the loop now uses — real progress
+    assert progress_by_list == [0, 0, 0]    # what it used to use — permanently stalled
+    assert len(sunk) == 6

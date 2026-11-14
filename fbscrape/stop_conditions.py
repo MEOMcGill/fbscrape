@@ -154,7 +154,11 @@ class EndOfFeed:
                 f"[hybrid] @{state.label}: end_cursor null after "
                 f"{state.iter_index} paginations — end of feed within filter range"
             )
-            return 'scraped until user-specified starting date was reached'
+            # Distinct from OldestInBatchBelowStartDate's return value: a null
+            # end_cursor means FB stopped serving the feed, which says nothing
+            # about whether `start_date` was reached. These shared one string
+            # historically, making the two outcomes indistinguishable.
+            return 'end_of_feed'
         return None
 
 

@@ -24,7 +24,7 @@ async def test_search_returns_results(fb_scraper):
     )
     assert result.result in {
         "success",
-        "scraped until user-specified starting date was reached",
+        "end_of_feed",
     }
     assert result.num_records > 0
 

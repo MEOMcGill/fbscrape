@@ -17,6 +17,19 @@ Each high-level call resolves to a `ScrapingResult` with a `result` string:
   data preserved, account locked), `"parse_error"` (e.g. a `user_id` sent to
   `PageTransparency`), `"graphql_error: …"`, `"error: …"`.
 
+- **Stop-condition outcomes** (paginated endpoints) — how the pagination loop
+  decided to stop, all carrying usable data: `"end_of_feed"` (FB returned a
+  null `end_cursor`), `"scraped until user-specified starting date was reached"` (the oldest post in a batch fell below
+  `start_date` — chronological feeds only), `"consecutive_out_of_range"`,
+  `"max_posts_reached"`, `"no_new_posts_streak"`, `"cursor_reset"`,
+  `"response_shape_error"`.
+
+  `end_of_feed` and the date-stop string are **not** interchangeable: the first
+  means FB stopped serving, which implies nothing about whether `start_date`
+  was reached. They shared one return string before, making the two
+  indistinguishable; results saved by older versions still carry the date-stop
+  string for both cases.
+
 Always branch on `result` before trusting `data` — a resolved future does not
 imply a full, clean scrape.
 

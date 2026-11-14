@@ -92,11 +92,11 @@ def test_end_of_feed_null_cursor_fires():
     cond = EndOfFeed()
     assert (
         cond.evaluate(StopState(end_cursor=None))
-        == 'scraped until user-specified starting date was reached'
+        == 'end_of_feed'
     )
     assert (
         cond.evaluate(StopState(end_cursor=""))
-        == 'scraped until user-specified starting date was reached'
+        == 'end_of_feed'
     )
 
 
@@ -126,6 +126,27 @@ def test_oldest_below_start_exempt_on_iter_1():
         cursor_sent=None,
     )
     assert cond.evaluate(state) is None
+
+
+def test_end_of_feed_and_date_stop_return_distinct_values():
+    """EndOfFeed must not claim the start date was reached.
+
+    The two conditions shared one return string historically, which made
+    "FB stopped serving the feed" indistinguishable from "we reached your
+    start_date" — a real difference, since only the latter implies the
+    requested window was covered.
+    """
+    end_of_feed = EndOfFeed().evaluate(StopState(end_cursor=None))
+    date_stop = OldestInBatchBelowStartDate().evaluate(
+        StopState(
+            start_unix=1_700_000_000,
+            oldest_in_batch=1_600_000_000,
+            cursor_sent="anchor-from-iter-1",
+        )
+    )
+    assert end_of_feed == 'end_of_feed'
+    assert date_stop == 'scraped until user-specified starting date was reached'
+    assert end_of_feed != date_stop
 
 
 def test_oldest_below_start_fires_on_iter_2_plus():

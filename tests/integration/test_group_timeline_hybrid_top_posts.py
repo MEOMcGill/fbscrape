@@ -51,7 +51,7 @@ async def test_group_timeline_top_posts_terminates_cleanly(fb_scraper):
     # FB serves on the day the test runs.
     assert result.result in {
         "consecutive_out_of_range",
-        "scraped until user-specified starting date was reached",
+        "end_of_feed",
         "no_new_posts_streak",
         "max_posts_reached",
         "success",

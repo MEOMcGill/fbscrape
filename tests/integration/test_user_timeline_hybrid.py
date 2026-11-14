@@ -13,7 +13,7 @@ async def test_zuck_hybrid_returns_posts(fb_scraper):
     result = await fb_scraper.user_timeline(
         "zuck", "2025-04-01", "2025-07-01", mode="hybrid",
     )
-    assert result.result in {"success", "scraped until user-specified starting date was reached"}
+    assert result.result in {"success", "end_of_feed", "scraped until user-specified starting date was reached"}
     assert len(result.data) > 0
 
     parser = FacebookGraphQLParser()

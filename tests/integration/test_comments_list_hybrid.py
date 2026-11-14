@@ -33,7 +33,7 @@ async def test_comments_list_hybrid_returns_comments(fb_scraper):
     assert result.result in {
         "success",
         # Natural exhaustion (FB returned has_next_page=false before the cap).
-        "scraped until user-specified starting date was reached",
+        "end_of_feed",
         # Cap fired at a batch boundary.
         "max_posts_reached",
     }

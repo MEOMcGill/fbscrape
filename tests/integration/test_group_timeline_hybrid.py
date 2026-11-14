@@ -35,7 +35,7 @@ async def test_group_timeline_hybrid_returns_posts(fb_scraper):
     )
     assert result.result in {
         "success",
-        "scraped until user-specified starting date was reached",
+        "end_of_feed",
         # cursor_reset is terminal for GroupTimeline (no server-side date
         # filter to advance), so it's a valid end-state with partial data.
         "cursor_reset",

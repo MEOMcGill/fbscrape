@@ -393,7 +393,8 @@ but the partial data is preserved — resume normally.
 |---|---|---|
 | `consecutive_out_of_range` | walked past the date window under a non-chronological sort — **normal, clean finish** | nothing |
 | `max_posts_reached` | hit your `--max-posts` cap | another `--continue` leg if you want more depth |
-| `scraped until user-specified starting date was reached` | chronological date-tail stop | nothing |
+| `end_of_feed` | FB returned a null `end_cursor` — the feed is exhausted as served. Does **not** mean your date window was covered | nothing to resume |
+| `scraped until user-specified starting date was reached` | chronological date-tail stop — `CHRONOLOGICAL` only, never appears under `TOP_POSTS` | nothing |
 | `no_new_posts_streak` | dedup wall — cursor anchored in already-collected territory | auto-unstick already appended a deeper cursor; run the next leg. If it repeats, `unstick-cursor --rank 6` (or higher) |
 | `graphql_error: … field_exception` at pagination 1 | invalid / poisoned cursor | `fbscrape unstick-cursor <file>` (no `--only-if-stuck`), then resume |
 | `graphql_error: … field_exception` deep in the run | FB degraded a long pagination run | resume; consider smaller `--max-posts` legs |
