@@ -418,6 +418,25 @@ class Query:
                         # highlights from prior runs aren't re-counted.
                         "initial_cursor": "",
                         "seen_post_ids_to_skip": [],
+                        # Write-on-parse streaming. Set to a path and each
+                        # deduped post is routed straight to that JSONL file
+                        # (BrowserSession installs a JsonlPostWriter as the
+                        # interceptor's post_sink) instead of accumulating in
+                        # `self.posts`; the outcome comes back spill-shaped
+                        # (empty inline data + post_count + spill_path) and
+                        # `ScrapingResult.iter_posts()` hides the difference.
+                        # Needed for long group scrapes: without it a 5-worker
+                        # run reached ~40 GB RSS and was OOM-killed, and an
+                        # interrupted scrape loses everything (the writer
+                        # autoflushes, so a killed one keeps what it parsed).
+                        # NB the pagination loops must measure progress with
+                        # `interceptor.post_count`, not `len(get_posts())` —
+                        # the latter is always 0 while streaming, which capped
+                        # scrapes at max_no_progress_streak * pagination_count.
+                        # Sentinel "" (not None) so the registry's
+                        # `None` = required convention isn't triggered;
+                        # `if stream_to_path:` reads "" as off.
+                        "stream_to_path": "",
                         "post_nav_sleep_seconds": 3.0,
                         "request_timeout_ms": 30000,
                         "max_no_progress_streak": 30,

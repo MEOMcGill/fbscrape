@@ -39,7 +39,7 @@ async def test_group_timeline_open_terminates_on_max_posts(fb_scraper):
     assert result.result in {
         "max_posts_reached",
         "no_new_posts_streak",
-        "scraped until user-specified starting date was reached",  # EndOfFeed string
+        "end_of_feed",
         "success",
     }, f"unexpected terminal result: {result.result!r}"
 

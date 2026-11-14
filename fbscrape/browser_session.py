@@ -1178,7 +1178,13 @@ class BrowserSession:
 
         total_paginations = 0
         no_progress_streak = 0
-        previous_post_count = len(self.response_interceptor.get_posts())
+        # post_count, not len(get_posts()): `add_posts` increments post_count in
+        # both branches, but only appends to `self.posts` when no post_sink is
+        # installed. Under write-on-parse streaming (stream_to_path) the list
+        # stays empty, so a len()-based progress check never registers progress,
+        # the no-progress streak never resets, and the scrape dies at
+        # max_no_progress_streak * pagination_count posts.
+        previous_post_count = self.response_interceptor.post_count
         iter_window: deque = deque(maxlen=HYBRID_CURSOR_RESET_WINDOW)
 
         while True:
@@ -1243,7 +1249,7 @@ class BrowserSession:
                 if self._hybrid_is_rate_limit_error(graphql_error_detail):
                     return 'rate_limit', next_cursor
 
-            current_post_count = len(self.response_interceptor.get_posts())
+            current_post_count = self.response_interceptor.post_count
             new_posts_in_iter = current_post_count - previous_post_count
             no_progress_streak = 0 if new_posts_in_iter else no_progress_streak + 1
             previous_post_count = current_post_count
@@ -2270,7 +2276,13 @@ class BrowserSession:
 
         total_paginations = 0
         no_progress_streak = 0
-        previous_post_count = len(self.response_interceptor.get_posts())
+        # post_count, not len(get_posts()): `add_posts` increments post_count in
+        # both branches, but only appends to `self.posts` when no post_sink is
+        # installed. Under write-on-parse streaming (stream_to_path) the list
+        # stays empty, so a len()-based progress check never registers progress,
+        # the no-progress streak never resets, and the scrape dies at
+        # max_no_progress_streak * pagination_count posts.
+        previous_post_count = self.response_interceptor.post_count
 
         # Rolling per-iter window for the diagnostic dump path (cursor_reset,
         # graphql_error). Loop is the sole writer; conditions read it.
@@ -2346,7 +2358,7 @@ class BrowserSession:
                     # for 24h + rotate.
                     return 'rate_limit', next_cursor
 
-            current_post_count = len(self.response_interceptor.get_posts())
+            current_post_count = self.response_interceptor.post_count
             new_posts_in_iter = current_post_count - previous_post_count
             no_progress_streak = 0 if new_posts_in_iter else no_progress_streak + 1
             previous_post_count = current_post_count
