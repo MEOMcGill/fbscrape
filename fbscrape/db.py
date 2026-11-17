@@ -51,6 +51,7 @@ async def migrate(db: aiosqlite.Connection):
         (1, migrate_v1),
         (2, migrate_v2),
         (3, migrate_v3),
+        (4, migrate_v4),
     ]
 
     for version, migration_fn in MIGRATIONS:
@@ -166,6 +167,38 @@ async def migrate_v2(db: aiosqlite.Connection):
     await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_phone ON accounts(phone_number) WHERE phone_number IS NOT NULL")
 
     logger.info("Migration v2 complete")
+
+
+async def migrate_v4(db: aiosqlite.Connection):
+    """Persist each account's login history.
+
+    Until now the only login signal was `AccountsPool._transient_login_failures`,
+    an in-memory dict. Callers that run one process per unit of work -- the
+    group chain runs one per leg -- rebuilt the pool every time, so the streak
+    reset to zero and the retirement threshold was unreachable: an account
+    observed failing four logins in a row across four legs never got past a
+    streak of 1.
+
+    That same gap made login reliability unusable for account SELECTION. The
+    pool orders by `scroll_count_overall_24h ASC`, and an account that never
+    completes a login never scrolls, so it keeps the lowest count and is picked
+    FIRST, every time. Failure earned queue priority. These columns are what
+    the later login-retry tiers sort on to break that loop.
+
+    Plain ADD COLUMN with defaults: older code ignores the new columns, so a
+    database migrated here still works unchanged against a previous release.
+    """
+    for col, decl in (
+        ("login_ok_total", "INTEGER DEFAULT 0 NOT NULL"),
+        ("login_fail_total", "INTEGER DEFAULT 0 NOT NULL"),
+        ("login_fail_streak", "INTEGER DEFAULT 0 NOT NULL"),
+    ):
+        try:
+            await db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")
+        except Exception as exc:  # column already present
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            logger.debug(f"migrate_v4: {col} already present, skipping")
 
 
 async def migrate_v3(db: aiosqlite.Connection):

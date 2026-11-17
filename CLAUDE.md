@@ -99,7 +99,7 @@ Firing points: `add_posts` returns the deduped batch; `ResponseInterceptor.fire_
 | `AccountDisabledError` | rotate (no retry burn) | no |
 | `AutomationCheckpointError` | lock 24h + rotate (stays active) | yes |
 | `CheckpointError` | rotate + retry | yes |
-| `TransientLoginError` | rotate (stays active); mark inactive after 3 in a row | yes |
+| `TransientLoginError` | rotate (stays active); mark inactive after 3 in a row | **login budget**, not the scrape one |
 | `FailedLoginError` | mark inactive + rotate | yes |
 | `AccountBannedError` | mark inactive + rotate | yes |
 | `RateLimitError` (HTTP 429) | lock 24h + rotate | yes |
@@ -107,7 +107,9 @@ Firing points: `add_posts` returns the deduped batch; `ResponseInterceptor.fire_
 
 Scroll-based rotation: pre-task when `Worker.scroll_count >= scroll_threshold` (default 500), reading `BrowserSession.scrolls_recorded` (per-session integer), not the DB. 2-minute cooldown (`rotate_account` default lock) prevents immediately re-acquiring the same account.
 
-Account selection: `AccountsPool._order_by` = `scroll_count_overall_24h ASC, last_used ASC` (recent scroll load, least-recently-used as tie-break). The 24h scroll-count reset is applied **inside `_get_and_mark_in_use`**, not at login — acquisition overwrites `last_used` and returns the post-update row, so it is the last point that can still see an account's real idle time. See the KDD in [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
+Account selection: `AccountsPool._order_by` = `scroll_count_overall_24h ASC, last_used ASC` (recent scroll load, least-recently-used as tie-break).
+
+Login retries escalate that ordering rather than replacing it. The first `Worker.LOGIN_TIER_RESTED_ATTEMPTS` (3) login attempts use the default, so rested accounts get real chances regardless of record; attempt 4 leads on `login_fail_streak` with rest as tie-break; attempt 5 sorts on smoothed login success ratio alone, scroll count ignored. Rationale and the failure it fixes: [`docs/results_and_errors.md`](docs/results_and_errors.md) ("Two retry budgets"). The `login_ok_total` / `login_fail_total` / `login_fail_streak` columns backing it are persisted (migrate_v4) — the streak used to be in-memory, so a caller running one process per unit of work reset it every time and never reached the retirement threshold. The 24h scroll-count reset is applied **inside `_get_and_mark_in_use`**, not at login — acquisition overwrites `last_used` and returns the post-update row, so it is the last point that can still see an account's real idle time. See the KDD in [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 
 In-body rate-limit (`errors[{code:1675004}]`) → `'rate_limit'` result, account locked 24h, partial data preserved, no retry slot burned. In-body `graphql_error` → no rotation, forensic dump to `tmp/hybrid/graphql_error/`. See [`docs/architecture/account_management.md`](docs/architecture/account_management.md).
 

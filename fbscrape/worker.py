@@ -37,6 +37,16 @@ from .models import Query, ScrapingResult
 # process) is marked inactive so it isn't re-picked after every cooldown.
 MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES = 3
 
+# Login rotations get their own, larger budget, separate from `max_retries`.
+# A transient login failure says nothing about the task -- it is one account
+# that would not let us in -- so spending a scrape retry on it is the wrong
+# accounting. The pool is also ordered by `scroll_count_overall_24h ASC`, and
+# an account that never completes a login never scrolls, so it keeps its low
+# count and keeps getting picked FIRST. That puts the weakest accounts at the
+# head of the queue, and a budget of 3 can be gone before a working one is
+# reached. Five rotations buys enough depth to walk past them.
+MAX_LOGIN_RETRIES = 5
+
 
 class Worker:
     """
@@ -84,6 +94,35 @@ class Worker:
     # for the endpoints above; least-recently-used first, with scroll count
     # only as a tie-breaker.
     LAST_USED_ORDER_BY = "last_used ASC, scroll_count_overall_24h ASC"
+
+    # Login-retry tiers. The pool's default ordering is by rest
+    # (`scroll_count_overall_24h ASC`), which is right for a normal pick and
+    # wrong as a response to repeated login failure: an account that never
+    # completes a login never scrolls, so it keeps the lowest count and is
+    # picked FIRST, forever. Failure earns queue priority.
+    #
+    # So escalate rather than replace. The first LOGIN_TIER_RESTED_ATTEMPTS
+    # attempts use the default: rested accounts get real chances regardless of
+    # their record, which is how an account that merely had a bad night earns
+    # its history back. Only once those are spent does reliability start to
+    # outweigh rest -- first as the lead term with rest still breaking ties,
+    # then, for the final attempt, outright.
+    #
+    # Over-use remains bounded by the scroll threshold, which rotates a heavily
+    # used account out independently of any of this.
+    LOGIN_TIER_RESTED_ATTEMPTS = 3
+
+    # Tier 4: proven logins first, most rested among equals.
+    LOGIN_ORDER_BY_RELIABLE = "login_fail_streak ASC, scroll_count_overall_24h ASC, last_used ASC"
+
+    # Tier 5: best login history outright, scroll count ignored. The +1 is
+    # Laplace smoothing -- without it an account with no login record at all
+    # scores 0/0 and would have to be special-cased; with it, an unproven
+    # account ranks below any account that has actually logged in.
+    LOGIN_ORDER_BY_BEST_HISTORY = (
+        "CAST(login_ok_total AS REAL) / (login_ok_total + login_fail_total + 1) DESC, "
+        "login_fail_streak ASC, last_used ASC"
+    )
 
     def __init__(
         self,
@@ -328,11 +367,17 @@ class Worker:
 
         max_retries = 3
         retry_count = 0
+        # Counted separately so a run of bad accounts cannot consume the
+        # scrape-error budget (and vice versa). See MAX_LOGIN_RETRIES.
+        login_retry_count = 0
 
         logger.debug(f"Worker {self.id}: executing task {task.endpoint}, current scroll_count={self.scroll_count}")
 
-        while retry_count < max_retries:
-            logger.debug(f"Worker {self.id}: attempt {retry_count + 1}/{max_retries} for {task.endpoint}")
+        while retry_count < max_retries and login_retry_count < MAX_LOGIN_RETRIES:
+            logger.debug(
+                f"Worker {self.id}: attempt {retry_count + 1}/{max_retries} "
+                f"(login rotations {login_retry_count}/{MAX_LOGIN_RETRIES}) for {task.endpoint}"
+            )
             try:
                 # Session for this task: a fresh BrowserSession, or the
                 # worker's live one when a request budget is set.
@@ -516,7 +561,7 @@ class Worker:
                 # which case it's probably genuinely broken: retire it so it
                 # doesn't get re-picked every cooldown forever.
                 ident = self.current_account.identifier
-                streak = self.pool.record_transient_login_failure(ident)
+                streak = await self.pool.record_transient_login_failure(ident)
                 if streak >= MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES:
                     logger.warning(
                         f"Worker {self.id}: {streak} consecutive transient login failures on "
@@ -526,15 +571,15 @@ class Worker:
                         ident,
                         f"Login failed: {streak} consecutive transient login failures (last: {e})",
                     )
-                    self.pool.clear_transient_login_failures(ident)
+                    await self.pool.clear_transient_login_failures(ident)
                 else:
                     logger.warning(
                         f"Worker {self.id}: transient login error on {self.current_account.display_name} "
                         f"({streak}/{MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES}): {e} — rotating "
                         f"(account stays active)"
                     )
-                await self.rotate_account()
-                retry_count += 1
+                login_retry_count += 1
+                await self.rotate_account(order_by=self._login_order_by(login_retry_count))
 
             except RendererHangError as e:
                 # Browser is wedged; account is fine. Restart with the SAME account
@@ -604,10 +649,30 @@ class Worker:
                 await self.rotate_account(order_by=self.LAST_USED_ORDER_BY)
                 retry_count += 1
 
-        # If we exhausted retries, raise to signal failure
+        # If we exhausted retries, raise to signal failure. Name the budget that
+        # ran out: "no account would log in" and "the scrape kept erroring" are
+        # different failures and get diagnosed in different places.
+        if login_retry_count >= MAX_LOGIN_RETRIES:
+            raise RetryBudgetExhaustedError(
+                f"Worker {self.id}: failed to execute task after {login_retry_count} "
+                f"login rotations (no account completed a login)"
+            )
         raise RetryBudgetExhaustedError(
             f"Worker {self.id}: failed to execute task after {max_retries} retries"
         )
+
+    def _login_order_by(self, login_failures_so_far: int) -> str | None:
+        """Ordering for the NEXT login attempt, given how many have failed.
+
+        None means the pool's default (most rested first). See the
+        LOGIN_ORDER_BY_* constants for why this escalates instead of simply
+        preferring the most reliable account from the start.
+        """
+        if login_failures_so_far < self.LOGIN_TIER_RESTED_ATTEMPTS:
+            return None
+        if login_failures_so_far == self.LOGIN_TIER_RESTED_ATTEMPTS:
+            return self.LOGIN_ORDER_BY_RELIABLE
+        return self.LOGIN_ORDER_BY_BEST_HISTORY
 
     async def rotate_account(
         self,

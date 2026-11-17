@@ -27,6 +27,12 @@ class Account(JSONTrait):
     last_used: datetime | None = None
     in_use: bool = False
     scroll_count_overall_24h: int = 0
+    # Login history (migrate_v4). `from_rs` spreads every column into this
+    # dataclass, so a column added to `accounts` without a field here is a
+    # TypeError on the next acquisition -- these are not optional bookkeeping.
+    login_ok_total: int = 0
+    login_fail_total: int = 0
+    login_fail_streak: int = 0
 
     def __post_init__(self):
         if self.email is None and self.phone_number is None:

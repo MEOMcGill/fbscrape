@@ -66,7 +66,7 @@ state machine in
 |---|---|---|
 | `AccountDisabledError` | rotate to a new account | no |
 | `CheckpointError` | rotate to a new account | yes |
-| `TransientLoginError` | rotate, account stays active — until 3 consecutive (per process, reset on success), then mark inactive | yes |
+| `TransientLoginError` | rotate, account stays active — until 3 consecutive (per process, reset on success), then mark inactive | spends the **login** budget (`MAX_LOGIN_RETRIES`, 5), not `max_retries` |
 | `RendererHangError` | restart task on **same** account, fresh `BrowserSession` | yes |
 | `FailedLoginError` | mark account inactive + rotate | yes |
 | `AccountBannedError` | mark account inactive + rotate | yes |
@@ -97,3 +97,54 @@ from fbscrape.exceptions import (
     RetryBudgetExhaustedError,  # Task failed its 3-retry budget
 )
 ```
+
+## Two retry budgets
+
+`Worker.execute_task` counts login rotations separately from scrape retries:
+
+| budget | constant | spent by |
+|---|---|---|
+| scrape | `max_retries` (3) | checkpoints, rate limits, renderer hangs, retryable result strings |
+| login | `MAX_LOGIN_RETRIES` (5) | `TransientLoginError` — an account that would not let us in |
+
+They are independent in both directions: a run of accounts that refuse to log
+in cannot consume the scrape's retries, and a flaky scrape cannot consume the
+login budget. `RetryBudgetExhaustedError` names whichever one ran out, because
+"no account completed a login" and "the scrape kept erroring" are diagnosed in
+completely different places.
+
+The login budget is the larger of the two, and deliberately so. `AccountsPool`
+orders candidates by `scroll_count_overall_24h ASC`, and an account that never
+completes a login never scrolls — so it keeps the lowest count in the pool and
+keeps getting picked FIRST. The weakest accounts therefore collect at the head
+of the queue, and the budget has to be deep enough to walk past them. Observed
+2026-11-16: a group chain ended after three consecutive login timeouts on the
+three lowest-scroll accounts, with four healthy accounts sitting untouched
+behind them.
+
+### Which account each attempt asks for
+
+Raising the budget alone would treat the symptom: the same weak accounts would
+simply absorb five attempts instead of three. So the ordering escalates as
+attempts are spent.
+
+| attempt | `ORDER BY` | intent |
+|---|---|---|
+| 1-3 | `scroll_count_overall_24h ASC, last_used ASC` (pool default) | most rested first, record ignored — a healthy account that had a bad night still gets tried on merit |
+| 4 | `login_fail_streak ASC, scroll_count_overall_24h ASC, last_used ASC` | proven logins lead, rest breaks ties |
+| 5 | `login_ok_total / (login_ok_total + login_fail_total + 1) DESC, login_fail_streak ASC` | best login history outright; scroll count ignored entirely |
+
+The `+ 1` is Laplace smoothing: without it an account with no login record
+scores `0/0`, and an account that has never been tried would outrank one with a
+long clean history. With it, unproven ranks below proven.
+
+Tier 5 deliberately ignores scroll count, so a heavily used but reliable
+account is reachable as a last resort. Over-use stays bounded by the scroll
+threshold, which rotates such an account out on its own schedule.
+
+Both of the columns this ranks on are persisted (`migrate_v4`). They had to be:
+the consecutive-failure streak that retires a chronically broken account used
+to live in memory on the pool object, so a caller that runs one process per
+unit of work (as the group chain does, one per leg) reset it to zero every time
+and never reached the threshold. Persisting it fixes the retirement path and
+supplies the selection signal in the same stroke.
