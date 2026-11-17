@@ -6,6 +6,7 @@ import asyncio
 import click
 import json
 import os
+import re
 from datetime import datetime, timezone
 from tabulate import tabulate
 import gzip
@@ -2460,6 +2461,164 @@ def scrape_post_detail(
                     f"{handle.replace('.', '_')}_{post_id}_postdetail_{ts}.jsonl"
                 )
                 data.save(os.path.join(output_dir, filename))
+
+    run_async(_scrape())
+
+
+def _media_set_list(value) -> list[str]:
+    """`skip_media_ids` from a file cell: a list, or ids separated by ; , or spaces."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if str(v).strip()]
+    return [p for p in re.split(r"[;,\s]+", str(value)) if p]
+
+
+@scrape.command(name='post-media-set')
+@click.argument('pairs', nargs=-1)
+@click.option('--input-file', default=None, type=click.Path(exists=True),
+              help='Read targets from a CSV, Parquet, YAML, or JSON/JSONL file. '
+                   'Required columns: post_id, start_media_id. Optional: handle, '
+                   'mediaset_token, skip_media_ids (list, or ids separated by ; , or '
+                   'spaces), expected_count, media_index_offset. Mutually exclusive '
+                   'with positional args.')
+@click.option('--handle', default=None,
+              help='Owner handle, for labels / media folder names (positional targets only).')
+@click.option('--output-dir', default=None,
+              help='Directory to save results (default: data/post_media_set/)')
+@click.option('--expected-count', type=int, default=None,
+              help="Album size when known (all_subattachments.count); positional targets only")
+@click.option('--max-media', type=int, default=None,
+              help='Cap on emitted items per post (-1 = no cap, the default)')
+@click.option('--max-sessions', default=2, type=int,
+              help='Max concurrent browser sessions')
+@click.option('--scroll-threshold', default=5000, type=int,
+              help='Paginations before rotating account')
+@click.option('--headless', is_flag=True, help='Run browsers headless')
+@click.option('--mobile', is_flag=True, help='Use mobile emulation')
+@click.option('--log-level', default='INFO',
+              help='Log level (DEBUG/INFO/WARNING/ERROR)')
+@click.option('--pagination-sleep-mean', type=float, default=None,
+              help='mean pause between item replays, seconds (default 2.0)')
+@click.option('--post-nav-sleep-seconds', type=float, default=None,
+              help='pause after opening the viewer (default 3)')
+@click.option('--operation-timeout-seconds', type=float, default=None,
+              help='per-await safety timeout for hangs (default 600)')
+@click.option('--wait-for-account', is_flag=True,
+              help='Block (polling every 5s) until an account frees up.')
+@media_stream_options
+@click.pass_context
+def scrape_post_media_set(
+    ctx, pairs, input_file, handle, output_dir, expected_count, max_media, max_sessions,
+    scroll_threshold, headless, mobile, log_level, pagination_sleep_mean,
+    post_nav_sleep_seconds, operation_timeout_seconds, wait_for_account,
+    download_media, media_dir, media_manifest, media_concurrency, include_thumbnails,
+):
+    """Fetch every photo of a multi-photo post through FB's media viewer (hybrid mode only).
+
+    \b
+    Feed and permalink Stories carry only the first 5 album photos; this walks
+    the post's own photo set (pcb.<post_id>) one item per request. Each target
+    is a post_id plus a start_media_id: PostDetail's first album subattachment
+    id for the whole set, or the last one you already have to continue past
+    the 5th (pass the ids you have as skip_media_ids and the number of media
+    files the post already has as media_index_offset, so --download-media
+    names the new files <post_id>_img_05, _06, ...).
+
+    \b
+    Examples:
+      fbscrape scrape post-media-set 2049017276045005:2049016942711705 --headless
+      fbscrape scrape post-media-set --input-file albums.csv --download-media --headless
+    """
+    from .scraper import FacebookScraper
+    from .logger import set_log_level, logger
+    from .models import ScrapingResult
+
+    set_log_level(log_level)
+
+    if pairs and input_file:
+        raise click.UsageError("Cannot use both positional 'post_id:start_media_id' pairs and --input-file.")
+    if input_file:
+        targets = _load_scrape_targets(
+            input_file,
+            key_field='post_id',
+            extra_keys=('start_media_id', 'handle', 'mediaset_token', 'skip_media_ids',
+                        'expected_count', 'media_index_offset'),
+            required_extra_keys=('start_media_id',),
+        )
+    elif pairs:
+        targets = []
+        for s in pairs:
+            post_id, _, start = s.partition(':')
+            if not post_id.strip() or not start.strip():
+                raise click.UsageError(f"Positional arg {s!r} must be 'post_id:start_media_id'.")
+            t = {'post_id': post_id.strip(), 'start_media_id': start.strip()}
+            if handle:
+                t['handle'] = handle
+            if expected_count is not None:
+                t['expected_count'] = expected_count
+            targets.append(t)
+    else:
+        raise click.UsageError("Must provide either positional 'post_id:start_media_id' pairs or --input-file.")
+
+    if output_dir is None:
+        output_dir = os.path.join(get_home_dir_path(), "data", "post_media_set")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    mode_params = {
+        "max_media": max_media,
+        "pagination_sleep_mean": pagination_sleep_mean,
+        "post_nav_sleep_seconds": post_nav_sleep_seconds,
+        "operation_timeout_seconds": operation_timeout_seconds,
+    }
+    mode_params = {k: v for k, v in mode_params.items() if v is not None}
+
+    def _target_params(t: dict) -> dict:
+        p = {}
+        if t.get('mediaset_token'):
+            p['mediaset_token'] = str(t['mediaset_token'])
+        if t.get('skip_media_ids') is not None:
+            p['skip_media_ids'] = _media_set_list(t['skip_media_ids'])
+        for k in ('expected_count', 'media_index_offset'):
+            if t.get(k) not in (None, ''):
+                p[k] = int(float(t[k]))
+        return p
+
+    def _label(t: dict) -> str:
+        h = t.get('handle')
+        pid = _commentslist_post_id_label(str(t['post_id']))
+        return f"{h.replace('.', '_')}_{pid}" if h else pid
+
+    async def _scrape():
+        pool = AccountsPool(ctx.obj['db'])
+        async with FacebookScraper(
+            db=pool,
+            max_browser_sessions=max_sessions,
+            scroll_threshold=scroll_threshold,
+            headless=headless,
+            mobile=mobile,
+            raise_when_no_account=not wait_for_account,
+        ) as scraper:
+            async for result in gather(
+                scraper.post_media_set(
+                    post_id=str(t['post_id']),
+                    start_media_id=str(t['start_media_id']),
+                    handle=t.get('handle'),
+                    **_media_runtime_kwargs(
+                        output_dir, _label(t),
+                        download_media, media_dir, media_manifest,
+                        media_concurrency, include_thumbnails,
+                    ),
+                    **mode_params,
+                    **_target_params(t),
+                )
+                for t in targets
+            ):
+                data: ScrapingResult = result
+                q = data.query.query
+                ts = utc.now().strftime("%Y%m%dT%H%M%SZ")
+                data.save(os.path.join(output_dir, f"{_label(q)}_postmediaset_{ts}.jsonl"))
 
     run_async(_scrape())
 

@@ -194,6 +194,52 @@ class Query:
                 },
             },
         },
+        "PostMediaSet": {
+            # Walks the photo set behind a multi-photo post (FB's media viewer,
+            # `/photo/?fbid=<id>&set=pcb.<post_id>`), one replay of
+            # CometPhotoRootContentQuery per item. Feed and permalink Stories
+            # only carry the first 5 album subattachments (plus the album's
+            # `count`); this endpoint returns every item, in the set's order.
+            # Caller supplies the parent `post_id` and `start_media_id` — any
+            # item of the set (PostDetail's first album subattachment for a
+            # full walk, or the last one already collected to continue past
+            # the 5-node cap). `handle` is optional (the viewer URL doesn't
+            # need it); it is carried through for labelling only.
+            "query_required": ["post_id", "start_media_id"],
+            "modes": {
+                "hybrid": {
+                    "params": {
+                        # "" → "pcb.<post_id>" (the post's own set). FB's
+                        # subattachment `url`s point at the page's general
+                        # album (`set=a.<id>`) instead — walking that one
+                        # returns unrelated photos.
+                        "mediaset_token": "",
+                        # Item ids already collected (e.g. the 5 the Story
+                        # carried): not emitted, and reaching one again ends
+                        # the walk (the viewer wraps from last to first).
+                        "skip_media_ids": [],
+                        # Album size when known (all_subattachments.count);
+                        # the walk stops once that many distinct items are
+                        # seen (skipped ones included). -1 = walk until wrap.
+                        "expected_count": -1,
+                        # -1 disables; positive int caps emitted items.
+                        "max_media": -1,
+                        # File index of the first emitted photo, so media
+                        # files continue the post's `<post_id>_img_NN`
+                        # numbering instead of restarting at 00. Callers
+                        # continuing a Story pass the number of media
+                        # entries the Story already produced.
+                        "media_index_offset": 0,
+                        "pagination_sleep_mean": 2.0,
+                        "pagination_sleep_std": 0.5,
+                        "template_capture_timeout": 30.0,
+                        "post_nav_sleep_seconds": 3.0,
+                        "request_timeout_ms": 30000,
+                        "operation_timeout_seconds": 600,
+                    },
+                },
+            },
+        },
         "ProfileInfo": {
             # Caller supplies the profile's vanity `handle` (or numeric id;
             # both resolve via /<handle>/). Like PostDetail, there is NO

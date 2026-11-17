@@ -90,6 +90,15 @@ TARGETS = {
         "post_id": "27209929835285847",
         "is_group": True,
     },
+    "post_media_set": {
+        # An 8-photo post on a Quebec candidate's public page (the Story only
+        # carries the first 5). Full walk from the first photo, bounded by the
+        # album size. Substitute if it goes dark (needs a 6+ photo post).
+        "handle": "IsabelleBlaisPQMaskinonge",
+        "post_id": "2049017276045005",
+        "start_media_id": "2049016942711705",
+        "expected_count": 8,
+    },
     "profile_info": {
         # Zuckerberg's profile — stable, public, fully-hydrated header.
         "handle": "zuck",
@@ -151,6 +160,13 @@ async def _capture_post_detail(scraper: FacebookScraper, spec: dict):
     )
 
 
+async def _capture_post_media_set(scraper: FacebookScraper, spec: dict):
+    return await scraper.post_media_set(
+        spec["post_id"], spec["start_media_id"], handle=spec.get("handle"),
+        expected_count=spec.get("expected_count", -1),
+    )
+
+
 async def _capture_profile_info(scraper: FacebookScraper, spec: dict):
     return await scraper.profile_info(spec["handle"])
 
@@ -175,6 +191,7 @@ CAPTURERS = {
     "profile_authenticity":  lambda s: _capture_profile_authenticity(s, TARGETS["profile_authenticity"]),
     "comments_list_hybrid":  lambda s: _capture_comments_list(s, TARGETS["comments_list_hybrid"]),
     "post_detail":           lambda s: _capture_post_detail(s, TARGETS["post_detail"]),
+    "post_media_set":        lambda s: _capture_post_media_set(s, TARGETS["post_media_set"]),
     "profile_info":          lambda s: _capture_profile_info(s, TARGETS["profile_info"]),
     "profile_about":         lambda s: _capture_profile_about(s, TARGETS["profile_about"]),
     "group_info":            lambda s: _capture_group_info(s, TARGETS["group_info"]),

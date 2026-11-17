@@ -12,7 +12,7 @@ for Instagram, [pytok](https://github.com/networkdynamics/pytok) for TikTok and
 
 ## Features
 
-- **Eleven endpoints** - `UserTimeline`, `Search`, `GroupTimeline`, `CommentsList`, `PostDetail`, `PageTransparency`, `ProfileAuthenticity`, `ProfileInfo`, `ProfileAbout`, `GroupInfo`, `GroupAbout`
+- **Twelve endpoints** - `UserTimeline`, `Search`, `GroupTimeline`, `CommentsList`, `PostDetail`, `PostMediaSet`, `PageTransparency`, `ProfileAuthenticity`, `ProfileInfo`, `ProfileAbout`, `GroupInfo`, `GroupAbout`
 - **High-level API** - Simple `FacebookScraper` class handles all complexity
 - **Concurrent scraping** - WorkerPool manages multiple browser sessions
 - **Account management** - SQLite-backed pool with automatic rotation
@@ -132,6 +132,7 @@ single-shot record fetches.
 | [`GroupTimeline`](docs/endpoints/group_timeline.md) | `handle` (dates optional) | `data: list[dict]` — one per group post |
 | [`CommentsList`](docs/endpoints/comments_list.md) | `handle`, `post_id` | `data: list[dict]` — one per top-level comment |
 | [`PostDetail`](docs/endpoints/post_detail.md) | `handle`, `post_id` | `data: [record]` — one post, timeline schema |
+| [`PostMediaSet`](docs/endpoints/post_media_set.md) | `post_id`, `start_media_id` | `data: list[dict]` — one per item of the post's photo set (past FB's 5-subattachment cap) |
 | [`PageTransparency`](docs/endpoints/page_transparency.md) | `page_id` (handle optional) | `data: [transparency_dict]` |
 | [`ProfileAuthenticity`](docs/endpoints/profile_authenticity.md) | `user_id` | `data: [authenticity_dict]` |
 | [`ProfileInfo`](docs/endpoints/profile_info.md) | `handle` | `data: [profile_header_dict]` |

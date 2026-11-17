@@ -104,6 +104,11 @@ def extract_media_from_post(post: dict, include_thumbnails: bool = False) -> lis
     Dedupes by URL so reel-share hoists and carousel recursion don't double-count.
     Comment records (CommentsList) are keyed by their comment id — see
     `_resolve_media_root`.
+
+    `idx` starts at the Story's `media_index_offset` when present (0 otherwise).
+    PostMediaSet records set it so the items it fetches past a Story's first
+    album subattachments continue that post's `<post_id>_img_NN` numbering
+    instead of colliding with the files the Story already produced.
     """
     story, post_id = _resolve_media_root(post)
     if not story or not post_id:
@@ -111,6 +116,7 @@ def extract_media_from_post(post: dict, include_thumbnails: bool = False) -> lis
 
     entries: list[dict] = []
     seen_urls: set[str] = set()
+    base_idx = story.get("media_index_offset") or 0
 
     def _add(kind: str, url: str | None, ext_default: str):
         if not url or url in seen_urls:
@@ -119,7 +125,7 @@ def extract_media_from_post(post: dict, include_thumbnails: bool = False) -> lis
         entries.append({
             "post_id": post_id,
             "kind": kind,
-            "idx": len(entries),
+            "idx": base_idx + len(entries),
             "url": url,
             "ext": _ext_from_url(url, ext_default),
         })

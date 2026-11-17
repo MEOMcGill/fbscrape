@@ -177,6 +177,7 @@ class FacebookGraphQLParser:
         "ProfileAuthenticity": "_flatten_profile_authenticity_record",
         "CommentsList": "_flatten_commentslist_comment",
         "PostDetail": "_flatten_postdetail_record",
+        "PostMediaSet": "_flatten_post_media_set_record",
         "ProfileInfo": "_flatten_profile_info_record",
         "ProfileAbout": "_flatten_profile_about_record",
         "GroupInfo": "_flatten_group_info_record",
@@ -339,6 +340,98 @@ class FacebookGraphQLParser:
             logger.error(f"[PARSER ERROR] {e}")
             logger.error(traceback.print_exc())
             return None
+
+    def parse_media_viewer_response(self, body: bytes) -> dict | None:
+        """Parse a CometPhotoRootContentQuery response (the media viewer's
+        per-item query) into `{media, next_media_id, prev_media_id}`.
+
+        The body is JSONL (@defer): the first line carries `data.currMedia`
+        (the item: `id`, `__typename`, full-size `image{uri,width,height}`,
+        `owner`, `accessibility_caption`, ...); later lines labelled
+        `CometNoCursorMediaSetViewer{Next,Prev}MediaFetcher_mediaset` carry
+        `data.nextMediaAfterNodeId` / `data.prevMediaBeforeNodeId` — the
+        neighbours *within the requested mediaset* (e.g. `pcb.<post_id>`).
+        `currMedia.default_mediaset.{next,prev}Media` is the page's general
+        album, NOT the requested set, and is ignored on purpose. The set wraps
+        (last item's next is the first), so callers must stop on a repeat.
+
+        Returns None on decode failure, `{"media": None, ...}` when no
+        `currMedia` is present (shape drift / unavailable item).
+        """
+        try:
+            lines = parse_json_or_jsonl(body.decode('utf-8'))
+        except Exception as e:
+            logger.error(f"[PARSER ERROR] media viewer response: {e}")
+            return None
+        media = None
+        next_id = prev_id = None
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            payload = line.get('data')
+            if not isinstance(payload, dict):
+                continue
+            if media is None and isinstance(payload.get('currMedia'), dict):
+                media = payload['currMedia']
+            if 'nextMediaAfterNodeId' in payload:
+                next_id = (payload.get('nextMediaAfterNodeId') or {}).get('id')
+            if 'prevMediaBeforeNodeId' in payload:
+                prev_id = (payload.get('prevMediaBeforeNodeId') or {}).get('id')
+        return {'media': media, 'next_media_id': next_id, 'prev_media_id': prev_id}
+
+    @staticmethod
+    def build_media_set_record(
+        post_id: str,
+        mediaset_token: str,
+        media: dict,
+        position: int,
+        file_index: int | None,
+    ) -> dict:
+        """Wrap one media-viewer item as a PostMediaSet record.
+
+        Shape: the parent Story reduced to a one-item album, so the media
+        pipeline (`extract_media_from_post`, `MediaCollector`, `download-media`)
+        handles it unchanged and names the file after the parent post:
+        `<post_id>_img_<file_index>`. `node.media_index_offset` carries that
+        index (see `downloaders.extract_media_from_post`). The top-level
+        `post_id` is the record's own id (the media id) — the key the
+        interceptor dedups on, as CommentsList does with comment ids; the
+        parent post id is `node.post_id`. `node.media_set_item` keeps the
+        item's own fields for the flattener.
+        """
+        image = media.get('image') or {}
+        typename = media.get('__typename')
+        item = {
+            'media_id': media.get('id'),
+            'typename': typename,
+            'position': position,
+            'file_index': file_index,
+            'mediaset_token': mediaset_token,
+            'image': {k: image.get(k) for k in ('uri', 'width', 'height')} if image else None,
+            'accessibility_caption': media.get('accessibility_caption'),
+            'owner_id': _g(media, 'owner', 'id'),
+            'created_time': media.get('created_time'),
+            'url': media.get('url') or media.get('permalink_url'),
+        }
+        subnode_media = {'__typename': typename, 'id': media.get('id'),
+                         'accessibility_caption': media.get('accessibility_caption')}
+        if typename == 'Photo' and image.get('uri'):
+            subnode_media['viewer_image'] = item['image']
+        node = {
+            'post_id': post_id,
+            'media_index_offset': file_index or 0,
+            'media_set_item': item,
+            'attachments': [{
+                'styles': {
+                    '__typename': 'StoryAttachmentAlbumStyleRenderer',
+                    'attachment': {
+                        'mediaset_token': mediaset_token,
+                        'all_subattachments': {'nodes': [{'media': subnode_media, 'url': item['url']}]},
+                    },
+                },
+            }],
+        }
+        return {'post_id': media.get('id'), 'node': node}
 
     def parse_search_response(self, body: bytes, url: str) -> dict | None:
         """Parse a SearchCometResultsPaginatedResultsQuery response body into
@@ -881,6 +974,41 @@ class FacebookGraphQLParser:
         the timeline flatteners.
         """
         return self._flatten_pctfrq_post(post)
+
+    def _flatten_post_media_set_record(self, record: dict) -> dict | None:
+        """Orchestrator for PostMediaSet: one row per item of a post's photo set
+        (see `build_media_set_record`). `position` counts from the walk's start
+        item (0 = `start_media_id`); `file_index` is the `<post_id>_img_NN`
+        index the media pipeline gives a photo (None for items that produce no
+        file, e.g. videos)."""
+        node = record.get('node') if isinstance(record, dict) else None
+        item = (node or {}).get('media_set_item')
+        if not isinstance(item, dict):
+            return None
+        image = item.get('image') or {}
+        typename = item.get('typename')
+        created = item.get('created_time')
+        return {
+            'post_id': node.get('post_id'),
+            'media_id': item.get('media_id'),
+            'media_type': ('photo' if typename == 'Photo'
+                           else 'video' if typename == 'Video'
+                           else (typename or 'unknown').lower()),
+            'position': item.get('position'),
+            'file_index': item.get('file_index'),
+            'mediaset_token': item.get('mediaset_token'),
+            'image_url': image.get('uri'),
+            'width': image.get('width'),
+            'height': image.get('height'),
+            'accessibility_caption': item.get('accessibility_caption'),
+            'owner_id': item.get('owner_id'),
+            'created_at': created,
+            'created_at_utc': (
+                datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                if isinstance(created, (int, float)) else None
+            ),
+            'url': item.get('url'),
+        }
 
     def _flatten_pagetransparency_record(self, record: dict) -> dict | None:
         """Orchestrator for ProfileTransparencyDialogQuery (PageTransparency).
@@ -2063,6 +2191,10 @@ class ResponseInterceptor:
         # Same role as latest_pctfrq_request, but for the CommentsList
         # endpoint's hybrid mode. Reset on flush().
         self.latest_clcpq_request: dict | None = None
+        # Latest captured CometPhotoRootContentQuery request (the media viewer's
+        # per-photo query), if any. Same role as latest_pctfrq_request, but for
+        # the PostMediaSet endpoint's hybrid mode. Reset on flush().
+        self.latest_cprcq_request: dict | None = None
         # Latest captured natural GraphQL POST (any friendly-name). Populated
         # on every browser-issued GraphQL POST observed. Used by single-shot
         # endpoints (e.g., PageTransparency) that synthesize the request body
@@ -2124,6 +2256,7 @@ class ResponseInterceptor:
             await self._track_scrq_template(response.request)
             await self._track_gcfrspq_template(response.request)
             await self._track_clcpq_template(response.request)
+            await self._track_cprcq_template(response.request)
             await self._track_any_graphql_request(response.request)
 
         # Full network capture is opt-in via FB_NETWORK_CAPTURE_ALL=1. Off by
@@ -2528,6 +2661,45 @@ class ResponseInterceptor:
             "headers": headers,
         }
 
+    async def _track_cprcq_template(self, request):
+        """If this request is a `CometPhotoRootContentQuery` (the media viewer
+        loading / prefetching one photo), save a replay-template snapshot
+        (post_data + headers) to `self.latest_cprcq_request`. Mirrors
+        `_track_clcpq_template` for the PostMediaSet endpoint's hybrid mode.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            headers = dict(request.headers) if request.headers else {}
+
+        is_cprcq = headers.get("x-fb-friendly-name") == "CometPhotoRootContentQuery"
+        post_data = None
+        if not is_cprcq:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            if post_data:
+                try:
+                    form = parse_qs(post_data, keep_blank_values=True)
+                    name = form.get("fb_api_req_friendly_name") or []
+                    if name and name[-1] == "CometPhotoRootContentQuery":
+                        is_cprcq = True
+                except Exception:
+                    pass
+        if not is_cprcq:
+            return
+
+        if post_data is None:
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+        self.latest_cprcq_request = {
+            "post_data": post_data,
+            "headers": headers,
+        }
+
     async def _track_any_graphql_request(self, request):
         """Save (post_data, headers) for any natural GraphQL POST to
         `self.latest_natural_graphql_request`. Called from intercept_response
@@ -2587,6 +2759,7 @@ class ResponseInterceptor:
         self.latest_scrq_request = None
         self.latest_gcfrspq_request = None
         self.latest_clcpq_request = None
+        self.latest_cprcq_request = None
         self.latest_natural_graphql_request = None
         # network_capture is opt-in (FB_NETWORK_CAPTURE_ALL=1); reset anyway
         # so a fresh scrape starts with a clean slate when capture is enabled.
