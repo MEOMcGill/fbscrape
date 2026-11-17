@@ -33,3 +33,10 @@ examples/
 
 # Internal / non-public docs (research notes, proposals, design decisions)
 docs/internal/
+
+# Archive: files kept for provenance but no longer part of how the repo works.
+# Contents are NOT tracked -- an archived account database carries real
+# passwords and cookies. Only the README is committed, so the folder's purpose
+# survives a fresh clone even though its contents do not.
+archive/*
+!archive/README.md
