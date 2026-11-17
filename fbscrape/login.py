@@ -496,8 +496,9 @@ async def _on_login_success(session: "BrowserSession") -> None:
     """
     # Save cookies after successful login
     await session.save_cookies()
-    # A success ends any streak of transient login failures for this account.
-    session.pool.clear_transient_login_failures(session.account.identifier)
+    # A success ends any streak of transient login failures for this account,
+    # and is credited to its login history (which the retry tiers rank on).
+    await session.pool.record_login_success(session.account.identifier)
     # Mark account as active and clear any previous error message
     await session.pool.set_active(session.account.identifier, True, None)
     # Update last_used timestamp

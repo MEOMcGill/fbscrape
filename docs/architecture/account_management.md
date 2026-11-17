@@ -160,6 +160,18 @@ cannot disagree with the value written.
 
 ### Selection order
 
+> **Login-failure feedback loop.** This ordering has one pathological case.
+> An account that never completes a login never scrolls, so its
+> `scroll_count_overall_24h` stays at the bottom and it is served FIRST on
+> every acquisition — failure earns queue priority, permanently. Observed
+> 2026-11-16: a group chain ended after three consecutive login timeouts on
+> the three lowest-scroll accounts, with four healthy accounts untouched
+> behind them. `Worker` breaks the loop by escalating the ordering across a
+> login retry (see "Login retry tiers" in
+> [`../results_and_errors.md`](../results_and_errors.md)), and `migrate_v4`
+> persists `login_ok_total` / `login_fail_total` / `login_fail_streak` so
+> there is a reliability signal to escalate TO.
+
 `AccountsPool._order_by` defaults to
 `scroll_count_overall_24h ASC, last_used ASC`. The primary key is recent scroll
 load; `last_used` is a tie-break, needed because the reset puts every rested

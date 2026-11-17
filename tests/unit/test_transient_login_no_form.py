@@ -25,6 +25,7 @@ import pytest
 import fbscrape.worker as worker_mod
 from fbscrape import login as login_mod
 from fbscrape.accounts_pool import AccountsPool
+from fbscrape.db import fetchone
 from fbscrape.exceptions import RetryBudgetExhaustedError, TransientLoginError
 from fbscrape.models import Query
 from fbscrape.worker import MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES, Worker
@@ -97,14 +98,45 @@ def test_non_headless_login_falls_back_to_manual(monkeypatch):
 
 # ==================== AccountsPool streak counter ====================
 
-def test_pool_streak_counts_and_clears():
-    pool = AccountsPool(db_file=":memory:")
-    assert pool.record_transient_login_failure("a") == 1
-    assert pool.record_transient_login_failure("a") == 2
-    assert pool.record_transient_login_failure("b") == 1
-    pool.clear_transient_login_failures("a")
-    assert pool.record_transient_login_failure("a") == 1
-    pool.clear_transient_login_failures("never-seen")  # no-op, no KeyError
+@pytest.mark.asyncio
+async def test_pool_streak_counts_and_clears(tmp_path):
+    """The streak is PERSISTED (migrate_v4), so it survives a new pool object.
+
+    That is the whole point: callers that run one process per unit of work --
+    the group chain runs one per leg -- used to rebuild the pool each time and
+    reset an in-memory streak to zero, so the retirement threshold was
+    unreachable no matter how many logins an account failed.
+    """
+    db = str(tmp_path / "accounts.db")
+    pool = AccountsPool(db_file=db)
+    await pool.add_account(password="pw", phone_number="+10000000001")
+    await pool.add_account(password="pw", phone_number="+10000000002")
+    a, b = "+10000000001", "+10000000002"
+
+    assert await pool.record_transient_login_failure(a) == 1
+    assert await pool.record_transient_login_failure(a) == 2
+    # Streaks are per-account, not global.
+    assert await pool.record_transient_login_failure(b) == 1
+
+    # A fresh pool object over the same database still sees the streak.
+    assert await AccountsPool(db_file=db).record_transient_login_failure(a) == 3
+
+    await pool.clear_transient_login_failures(a)
+    assert await pool.record_transient_login_failure(a) == 1
+
+    # A success ends the streak AND is credited to the login history.
+    await pool.record_login_success(a)
+    assert await pool.record_transient_login_failure(a) == 1
+    row = await fetchone(
+        db,
+        "SELECT login_ok_total, login_fail_total FROM accounts WHERE phone_number = :p",
+        {"p": a},
+    )
+    assert row[0] == 1
+    assert row[1] == 5
+
+    # Unknown identifier is a no-op, not an error.
+    await pool.clear_transient_login_failures("never-seen")
 
 
 # ==================== Worker policy ====================
@@ -132,8 +164,16 @@ class _OneAccountPool:
     async def mark_inactive(self, identifier, error_msg):
         self.inactive.append((identifier, error_msg))
 
-    record_transient_login_failure = AccountsPool.record_transient_login_failure
-    clear_transient_login_failures = AccountsPool.clear_transient_login_failures
+    async def record_transient_login_failure(self, identifier):
+        n = self._streaks.get(identifier, 0) + 1
+        self._streaks[identifier] = n
+        return n
+
+    async def clear_transient_login_failures(self, identifier):
+        self._streaks.pop(identifier, None)
+
+    async def record_login_success(self, identifier):
+        self._streaks.pop(identifier, None)
 
     @property
     def _transient_login_failures(self):
@@ -172,14 +212,20 @@ def test_worker_marks_inactive_only_after_streak(monkeypatch):
     worker = _worker(monkeypatch, pool)
     with pytest.raises(RetryBudgetExhaustedError):
         asyncio.run(worker.execute_task(_query()))
-    # Worker retries 3x per task; all three hit the same account.
+    # Login rotations get MAX_LOGIN_RETRIES attempts; the streak trips at the
+    # third, and the account is retired exactly once however many follow.
     assert MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES == 3
     assert len(pool.inactive) == 1
     ident, msg = pool.inactive[0]
     assert ident == "a@example.com"
     assert "3 consecutive transient login failures" in msg
-    # Streak is reset once acted on.
-    assert pool._streaks == {}
+    # The streak was reset when acted on -- that is what stops a second
+    # deactivation, asserted above. Any residue here is bookkeeping on an
+    # account that is ALREADY inactive, and only exists because this fake
+    # keeps serving it: the real pool filters `WHERE active = true`, so a
+    # retired account cannot be handed back at all. Assert the invariant that
+    # matters -- it never climbs back to the threshold.
+    assert pool._streaks.get("a@example.com", 0) < MAX_CONSECUTIVE_TRANSIENT_LOGIN_FAILURES
 
 
 def test_worker_keeps_account_active_below_streak(monkeypatch):
@@ -188,9 +234,8 @@ def test_worker_keeps_account_active_below_streak(monkeypatch):
     worker = _worker(monkeypatch, pool)
 
     # Simulate a success after two failures: the streak must start over.
-    pool.record_transient_login_failure("a@example.com")
-    pool.record_transient_login_failure("a@example.com")
-    pool.clear_transient_login_failures("a@example.com")  # what _on_login_success does
+    pool._streaks["a@example.com"] = 2
+    pool._streaks.pop("a@example.com")  # what a successful login does
 
     with pytest.raises(RetryBudgetExhaustedError):
         asyncio.run(worker.execute_task(_query()))

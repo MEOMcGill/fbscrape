@@ -462,14 +462,50 @@ class AccountsPool:
 
         await execute(self._db_file, qs)
 
-    def record_transient_login_failure(self, identifier: str) -> int:
-        """Count one more consecutive transient login failure; return the streak."""
-        n = self._transient_login_failures.get(identifier, 0) + 1
+    async def record_transient_login_failure(self, identifier: str) -> int:
+        """Count one more consecutive transient login failure; return the streak.
+
+        Persisted, not in-memory: a caller that runs one process per unit of
+        work would otherwise reset the streak every time and never reach the
+        retirement threshold. See migrate_v4.
+        """
+        qs = f"""
+        UPDATE accounts
+           SET login_fail_total = login_fail_total + 1,
+               login_fail_streak = login_fail_streak + 1
+        WHERE {self._identifier_condition(identifier)}
+        """
+        await execute(self._db_file, qs)
+        row = await fetchone(
+            self._db_file,
+            f"SELECT login_fail_streak FROM accounts WHERE {self._identifier_condition(identifier)}",
+        )
+        n = int(row[0]) if row else 1
         self._transient_login_failures[identifier] = n
         return n
 
-    def clear_transient_login_failures(self, identifier: str) -> None:
-        """Reset the transient-login-failure streak (on success or once acted on)."""
+    async def record_login_success(self, identifier: str) -> None:
+        """A login completed: credit it and end any failure streak."""
+        qs = f"""
+        UPDATE accounts
+           SET login_ok_total = login_ok_total + 1,
+               login_fail_streak = 0
+        WHERE {self._identifier_condition(identifier)}
+        """
+        await execute(self._db_file, qs)
+        self._transient_login_failures.pop(identifier, None)
+
+    async def clear_transient_login_failures(self, identifier: str) -> None:
+        """Reset the streak WITHOUT crediting a success.
+
+        Used once a streak has been acted on (the account was retired), where
+        counting a success would be a lie.
+        """
+        qs = f"""
+        UPDATE accounts SET login_fail_streak = 0
+        WHERE {self._identifier_condition(identifier)}
+        """
+        await execute(self._db_file, qs)
         self._transient_login_failures.pop(identifier, None)
 
     async def mark_inactive(self, identifier: str, error_msg: str | None):
