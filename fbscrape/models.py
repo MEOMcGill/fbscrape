@@ -289,13 +289,21 @@ class Query:
                         # Sub-tab keys to fetch, matched against the
                         # directory discovered on the About landing page
                         # (`all_collections`). Default picks the 3
-                        # empirically highest-value Page sections; override
-                        # per call for personal-profile-shaped accounts
-                        # (e.g. "directory_work", "directory_education").
+                        # empirically highest-value Page sections, plus the
+                        # personal-profile tabs: `directory_personal_details`
+                        # (city, hometown, birthday, relationship, family in
+                        # FB's directory-style About layout, the most common
+                        # one as of 2026-11) and `about_places` /
+                        # `about_contact_and_basic_info` (the older layout).
+                        # Keys absent from an account's directory are skipped
+                        # at no cost, so each layout only navigates its own.
                         "sections": (
                             "directory_contact_info",
                             "directory_basic_info",
                             "directory_links",
+                            "directory_personal_details",
+                            "about_places",
+                            "about_contact_and_basic_info",
                         ),
                         "post_nav_sleep_seconds": 3.0,
                         "document_wait_seconds": 4.0,

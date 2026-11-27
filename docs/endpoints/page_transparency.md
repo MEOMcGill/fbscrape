@@ -135,6 +135,15 @@ for accounts with a linked Page. The `handle=uid` argument is cosmetic.
   `User` on posts, so you can't pre-filter — call `ProfileAuthenticity` on every
   distinct `author_id` and branch on `delegate_page_id`.
 
+## Page vs professional profile
+
+`page_type_name_for_content` separates the two kinds of linked Page: `"PAGE"` is a standalone
+(classic) Page (organisation, brand, outlet, persona), `"PROFILE"` is a person's profile in
+professional mode. `is_person_profile` does **not** separate them: it is `true` for every Page
+under Facebook's current Page system. Combine with ProfileAuthenticity's `delegate_page_id` via
+`fbscrape.response.classify_account(delegate_page_id, page_type_name_for_content)` to get
+`personal_profile` / `professional_profile` / `classic_page`.
+
 ## Output shape
 
 `data = [transparency_dict]`. Flattened via

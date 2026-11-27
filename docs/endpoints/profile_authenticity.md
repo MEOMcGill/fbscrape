@@ -74,6 +74,14 @@ The most common use is as **stage 1 of the transparency pipeline**: flatten,
 read `delegate_page_id`, and feed the non-null ones into
 [`PageTransparency`](page_transparency.md#usage).
 
+## Account type
+
+`delegate_page_id` plus the linked Page's `page_type_name_for_content` (from
+[PageTransparency](page_transparency.md#page-vs-professional-profile)) gives the account type:
+`fbscrape.response.classify_account()`. For group posters, check
+`fbscrape.response.is_group_anonymous_id(author_id)` first: anonymous-posting aliases have no
+profile to scrape.
+
 ## Gotchas
 
 - **`delegate_page_id` is `null` for pure personal profiles** — no transparency

@@ -60,6 +60,16 @@ HYBRID_HEADER_OVERRIDE = {"Accept-Encoding": ALLOWED_ACCEPT_ENCODING}
 
 HYBRID_TARGET_FRIENDLY_NAME = "ProfileCometTimelineFeedRefetchQuery"
 
+def _error_summary(e: BaseException) -> str:
+    """First line of an exception message.
+
+    Playwright's request errors append a "Call log" with the full request,
+    headers and session cookies included. Those strings end up in result
+    statuses (saved to output files) and in logs, so keep only the first line.
+    """
+    return str(e).split("\n", 1)[0].split(" Call log:", 1)[0].strip()
+
+
 def _profile_target_url(handle: str) -> str:
     """Build a profile URL from a handle.
 
@@ -2064,6 +2074,9 @@ class BrowserSession:
             "directory_contact_info",
             "directory_basic_info",
             "directory_links",
+            "directory_personal_details",
+            "about_places",
+            "about_contact_and_basic_info",
         ),
         post_nav_sleep_seconds: float = 3.0,
         document_wait_seconds: float = 4.0,
@@ -2360,7 +2373,7 @@ class BrowserSession:
         try:
             await self.goto(target_url, wait_until="domcontentloaded")
         except Exception as e:
-            return f'navigation_error: {e}'
+            return f'navigation_error: {_error_summary(e)}'
         await asyncio.sleep(post_nav_sleep_seconds)
 
         if dismiss_overlays:
@@ -3510,8 +3523,8 @@ class BrowserSession:
                     f"page.request.post timed out after {operation_timeout_seconds}s"
                 )
             except Exception as e:
-                logger.warning(f"[hybrid] @{handle}: page.request.post failed: {e}")
-                return None, "", f'pagination_error: {e}'
+                logger.warning(f"[hybrid] @{handle}: page.request.post failed: {_error_summary(e)}")
+                return None, "", f'pagination_error: {_error_summary(e)}'
 
             status = response.status
 
@@ -3554,7 +3567,7 @@ class BrowserSession:
             try:
                 text = await response.text()
             except Exception as e:
-                return None, "", f'pagination_error: read body: {e}'
+                return None, "", f'pagination_error: read body: {_error_summary(e)}'
 
             if self._hybrid_body_looks_like_html(text):
                 raise FailedLoginError(

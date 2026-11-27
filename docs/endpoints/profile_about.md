@@ -30,7 +30,7 @@ Defaults from `Query.ENDPOINT_REGISTRY["ProfileAbout"]["modes"]["hybrid"]["param
 
 | Param | Default | Meaning |
 |---|---|---|
-| `sections` | `("directory_contact_info", "directory_basic_info", "directory_links")` | Sub-tab keys to fetch, matched against the discovered directory. Defaults are the highest-value **Page** sections; override for personal-profile-shaped accounts. |
+| `sections` | `("directory_contact_info", "directory_basic_info", "directory_links", "directory_personal_details", "about_places", "about_contact_and_basic_info")` | Sub-tab keys to fetch, matched against the discovered directory. Personal profiles come in several About layouts: in the directory-style one (the most common as of 2026-11) city, hometown, birthday, relationship and family sit on `directory_personal_details`; in the older one they are on `about_places` / `about_contact_and_basic_info`, or rendered on the landing page. The other `directory_*` keys are the highest-value **Page** sections. Keys absent from an account's directory are skipped without a navigation, so each layout only fetches its own. |
 | `post_nav_sleep_seconds` | `3.0` | Pause after each navigation (landing + per-section). |
 | `document_wait_seconds` | `4.0` | Extra settle time before reading each rendered document. |
 | `operation_timeout_seconds` | `120` | Per-await safety timeout for renderer hangs. |
@@ -47,7 +47,9 @@ fbscrape scrape profile-about 61582991935083 --headless
 fbscrape scrape profile-about zuck --section directory_work --section directory_education
 ```
 
-Other observed section keys: `directory_intro`, `directory_category`, `directory_personal_details`, `directory_work`, `directory_education`, `directory_privacy_and_legal_info`.
+Other observed personal-profile keys: `about_details`, `about_work_and_education`, `about_family_and_relationships`, `about_life_events`.
+
+Other observed Page section keys: `directory_intro`, `directory_category`, `directory_personal_details`, `directory_work`, `directory_education`, `directory_privacy_and_legal_info`.
 
 ```python
 result = await scraper.profile_about("zuck")
@@ -74,6 +76,9 @@ Identifying column: **`profile_id`**. Selected columns:
 | `messenger_url` | `business_messenger` link |
 | `address`, `address_map_url`, `hours`, `rating_text` | dispatched from `directory_basic_info` |
 | `website`, `website_url` | dispatched from `directory_links` |
-| `about_fields` | full list of `{field_section_type, field_type, text, link_url}` — every field, dispatched or not |
+| `friend_count`, `friends_url` | header, personal profiles only (see [ProfileInfo](profile_info.md)) |
+| `relationship` | personal profiles: the value ("Single"), taken from the field's `text_content` since its title is only the label |
+| `current_city`, `hometown` | personal profiles: bare place from `about_places` ("Winder, Georgia"), else the landing overview's "Lives in …" / "From …" text |
+| `about_fields` | full list of `{field_section_type, field_type, text, detail, link_url}` (`detail` = the field's `text_content`, when it has one) — every field, dispatched or not |
 
 Named About keys are `None` when their section was not fetched or not present. See `tests/unit/test_flatten_profile_about.py`.
