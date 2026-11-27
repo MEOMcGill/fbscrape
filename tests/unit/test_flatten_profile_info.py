@@ -14,7 +14,8 @@ FIXTURE_NAME = "profile_info"
 EXPECTED_KEYS = {
     "profile_id", "name", "url", "gender", "username_for_profile",
     "is_verified", "is_viewer_friend", "is_memorialized",
-    "follower_count", "followers_url", "following_count", "bio",
+    "follower_count", "followers_url", "following_count",
+    "friend_count", "friends_url", "reaction_count", "bio",
     "category", "intro_card_fields",
     "cover_photo_url", "profile_picture_url",
 }
@@ -95,6 +96,38 @@ def test_missing_social_context_does_not_crash(record):
     assert flat["follower_count"] is None
     assert flat["followers_url"] is None
     assert flat["following_count"] is None
+    assert flat["friend_count"] is None
+    assert flat["friends_url"] is None
+
+
+def test_friend_count_from_social_context(record):
+    """Ordinary personal profiles show "N friends" in the social context
+    instead of followers (zuck is professional-mode, so the fixture has
+    none) — inject one and check it's matched by its `/friends/` uri."""
+    injected = copy.deepcopy(record)
+    friends_uri = "https://www.facebook.com/some.user/friends/"
+    injected["profile_social_context"] = {"content": [
+        {"text": {"text": "1.2K friends"}, "uri": friends_uri},
+    ]}
+
+    flat = PARSER.flatten(injected, "ProfileInfo")
+    assert flat["friend_count"] == 1_200
+    assert flat["friends_url"] == friends_uri
+    assert flat["follower_count"] is None
+
+
+def test_reaction_count_matched_on_text(record):
+    """The "N reactions" entry links to the profile root, not a /reactions/
+    path, so it can only be recognised by its text."""
+    injected = copy.deepcopy(record)
+    injected["profile_social_context"] = {"content": [
+        {"text": {"text": "18K followers"}, "uri": "https://www.facebook.com/x/followers/"},
+        {"text": {"text": "321K reactions"}, "uri": "https://www.facebook.com/x/"},
+    ]}
+
+    flat = PARSER.flatten(injected, "ProfileInfo")
+    assert flat["reaction_count"] == 321_000
+    assert flat["follower_count"] == 18_000
 
 
 def test_intro_card_fields_is_list(record):

@@ -2837,10 +2837,14 @@ def scrape_profile_info(
               help='About sub-tab key to fetch (repeatable). A key absent '
                    "from the account's own directory is skipped, not an "
                    'error. Default: directory_contact_info, '
-                   'directory_basic_info, directory_links. Other observed '
-                   'keys: directory_intro, directory_category, '
-                   'directory_personal_details, directory_work, '
-                   'directory_education, directory_privacy_and_legal_info.')
+                   'directory_basic_info, directory_links (Pages); '
+                   'directory_personal_details, about_places, '
+                   'about_contact_and_basic_info (personal profiles). Other '
+                   'observed keys: directory_intro, directory_category, '
+                   'directory_work, directory_education, '
+                   'directory_privacy_and_legal_info; about_details, '
+                   'about_work_and_education, about_family_and_relationships, '
+                   'about_life_events.')
 @click.option('--max-sessions', default=5, type=int,
               help='Max concurrent browser sessions')
 @click.option('--scroll-threshold', default=5000, type=int,

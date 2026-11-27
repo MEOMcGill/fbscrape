@@ -59,6 +59,7 @@ Each target is written to `<handle>_profileinfo_<timestamp>.jsonl` under `--outp
 
 ## Gotchas
 
+- **`friend_count` only exists on ordinary personal profiles.** They show "N friends" where Pages and professional-mode profiles show followers; it's `None` when the user hides their friend list. Same abbreviated-string caveat as below.
 - **`follower_count` / `following_count` are approximate.** FB ships them only as abbreviated strings (e.g. `"121M followers"`), parsed into an order-of-magnitude int (`121000000`), never an exact count. Use for sorting/comparison, not precise reporting.
 - **Private / not-visible profiles yield `parse_error`** with empty `data` — the header node is absent from the document, not an exception.
 - **Missing intro card or social context does not crash:** dispatched fields fall back to `None`/`[]` (`category`, `follower_count`, `followers_url`, `following_count`, `intro_card_fields`).
@@ -68,6 +69,6 @@ Each target is written to `<handle>_profileinfo_<timestamp>.jsonl` under `--outp
 
 `data = [profile_dict]`. Flattened via `FacebookGraphQLParser.flatten(record, "ProfileInfo")` → `_flatten_profile_info_record`. Identifying column: `profile_id`.
 
-Flattened keys: `profile_id`, `name`, `url`, `gender`, `username_for_profile`, `is_verified`, `is_viewer_friend`, `is_memorialized`, `follower_count`, `followers_url`, `following_count`, `bio`, `category`, `intro_card_fields`, `cover_photo_url`, `profile_picture_url`.
+Flattened keys: `profile_id`, `name`, `url`, `gender`, `username_for_profile`, `is_verified`, `is_viewer_friend`, `is_memorialized`, `follower_count`, `followers_url`, `following_count`, `friend_count`, `friends_url`, `reaction_count`, `bio`, `category`, `intro_card_fields`, `cover_photo_url`, `profile_picture_url`.
 
 See `tests/unit/test_flatten_profile_info.py`.

@@ -16,12 +16,13 @@ FIXTURE_NAME = "profile_about"
 EXPECTED_KEYS = {
     "profile_id", "name", "url", "gender", "username_for_profile",
     "is_verified", "is_viewer_friend", "is_memorialized",
-    "follower_count", "followers_url", "following_count", "bio",
+    "follower_count", "followers_url", "following_count",
+    "friend_count", "friends_url", "reaction_count", "bio",
     "category", "intro_card_fields",
     "cover_photo_url", "profile_picture_url",
     "phone", "email", "messenger_url",
     "address", "address_map_url", "hours", "rating_text",
-    "website", "website_url", "about_fields",
+    "website", "website_url", "current_city", "hometown", "relationship", "about_fields",
 }
 
 
@@ -84,6 +85,7 @@ def test_about_fields_is_nonempty_list(record):
         assert "field_section_type" in f
         assert "field_type" in f
         assert "text" in f
+        assert "detail" in f
         assert "link_url" in f
 
 
@@ -100,6 +102,77 @@ def test_missing_sections_does_not_crash(record):
     assert flat["phone"] is None
     assert flat["email"] is None
     assert flat["about_fields"] == []
+
+
+def _field_section(section_type, fields):
+    return {
+        "field_section_type": section_type,
+        "profile_fields": {"nodes": [
+            {"field_type": ft, "title": {"text": text}, "link_url": None}
+            for ft, text in fields
+        ]},
+    }
+
+
+def test_places_dispatched_preferring_places_subtab(record):
+    """Personal profiles: the landing overview says "Lives in X" / "From Y";
+    the about_places sub-tab (appended later) has the bare place name, which
+    should win."""
+    injected = copy.deepcopy(record)
+    injected["sections"] = [
+        _field_section("overview", [
+            ("current_city", "Lives in Winder, Georgia"),
+            ("hometown", "From Franklin, North Carolina"),
+        ]),
+        _field_section("places_lived", [
+            ("current_city", "Winder, Georgia"),
+            ("hometown", "Franklin, North Carolina"),
+        ]),
+    ]
+
+    flat = PARSER.flatten(injected, "ProfileAbout")
+    assert flat["current_city"] == "Winder, Georgia"
+    assert flat["hometown"] == "Franklin, North Carolina"
+
+
+def test_relationship_value_from_text_content(record):
+    """Relationship's title is just the label; the value is in text_content."""
+    injected = copy.deepcopy(record)
+    injected["sections"] = [{
+        "field_section_type": "relationship",
+        "profile_fields": {"nodes": [{
+            "field_type": "relationship",
+            "title": {"text": "Relationship"},
+            "renderer": {"field": {"text_content": {"text": "Single"}}},
+            "link_url": None,
+        }]},
+    }]
+
+    flat = PARSER.flatten(injected, "ProfileAbout")
+    assert flat["relationship"] == "Single"
+    assert flat["about_fields"][0]["detail"] == "Single"
+
+
+def test_category_falls_back_to_about_field(record):
+    """Directory-style About layouts list the category only as an About field."""
+    injected = copy.deepcopy(record)
+    header_top_row = injected["profile"].get("header_top_row") or {}
+    (header_top_row.get("profile_user") or {})["profile_intro_card"] = {}
+    injected["sections"] = [_field_section("directory_category", [("category", "Digital creator")])]
+
+    flat = PARSER.flatten(injected, "ProfileAbout")
+    assert flat["category"] == "Digital creator"
+
+
+def test_places_from_overview_only(record):
+    injected = copy.deepcopy(record)
+    injected["sections"] = [
+        _field_section("overview", [("current_city", "Lives in Winder, Georgia")]),
+    ]
+
+    flat = PARSER.flatten(injected, "ProfileAbout")
+    assert flat["current_city"] == "Lives in Winder, Georgia"
+    assert flat["hometown"] is None
 
 
 def test_missing_profile_returns_none():

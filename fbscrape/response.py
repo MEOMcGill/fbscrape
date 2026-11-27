@@ -46,6 +46,43 @@ _ABBREVIATED_COUNT_RE = re.compile(
 _ABBREVIATED_COUNT_MULTIPLIERS = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 
+def classify_account(delegate_page_id, page_type_name_for_content) -> str:
+    """Account type of a profile from two endpoint results.
+
+    `delegate_page_id` comes from ProfileAuthenticity: set when the profile has
+    a linked Page. `page_type_name_for_content` comes from that Page's
+    PageTransparency record: "PAGE" for a standalone (classic) Page, "PROFILE"
+    for a person's profile in professional mode. PageTransparency's
+    `is_person_profile` does not separate the two (it is True for every Page
+    under Facebook's current Page system), and neither does gender.
+
+    Returns "personal_profile", "professional_profile", "classic_page", or
+    "linked_page_unknown_type" when there is a linked Page but its type was
+    not read.
+    """
+    if not delegate_page_id:
+        return "personal_profile"
+    return {
+        "PAGE": "classic_page",
+        "PROFILE": "professional_profile",
+    }.get(page_type_name_for_content, "linked_page_unknown_type")
+
+
+def is_group_anonymous_id(author_id) -> bool:
+    """True for a group's anonymous-posting alias (e.g. "SwiftHamster8268").
+
+    Facebook types these GroupAnonAuthorProfile; they have no profile page to
+    scrape. Their ids are 16-17 digits, or 15 digits not starting "100", while
+    real profile ids are at most 14 digits or 15 starting "100" (checked on
+    3,178 scraped ids, 2026-11: 88/88 aliases and 3,090/3,090 users). Authors
+    shown as "Anonymous participant" are anonymous too but get a new id per
+    post, so check the author name for those.
+    """
+    author_id = str(author_id or "")
+    n = len(author_id)
+    return n >= 16 or (n == 15 and not author_id.startswith("100"))
+
+
 def _parse_abbreviated_count(text) -> int | None:
     """Parse FB's abbreviated count strings (e.g. "121M followers", "22K",
     "1 following") into an approximate integer, stripping the trailing
@@ -1188,11 +1225,17 @@ class FacebookGraphQLParser:
         (work / education / location / relationship status, ...).
 
         `profile_social_context.content` is a list — one entry for followers,
-        one for following when FB renders both (personal profiles only show
-        followers). Entries are matched by their `uri` (`.../followers...` /
-        `.../following...`) rather than position, since the URI format itself
+        one for following when FB renders both, and on ordinary personal
+        profiles (not Pages / professional mode) a "164 friends" entry
+        instead, absent when the user hides their friend list. Entries are
+        matched by their `uri` (`.../followers...` / `.../following...` /
+        `.../friends...`) rather than position, since the URI format itself
         varies (path-style `/<handle>/followers/` vs query-style
         `?...&sk=followers`) and ordering isn't guaranteed either way.
+        `friend_count` carries the same abbreviated-string caveat as
+        `follower_count` ("1.2K friends" -> 1200). Professional-mode
+        profiles can also show a "321K reactions" entry whose `uri` is just
+        the profile itself, so that one is matched on its text instead.
         """
         if not isinstance(record, dict) or not record.get("id"):
             return None
@@ -1201,6 +1244,7 @@ class FacebookGraphQLParser:
         context_content = social_context.get("content") or []
 
         follower_text = follower_uri = following_text = None
+        friend_text = friend_uri = reaction_text = None
         for item in context_content:
             if not isinstance(item, dict):
                 continue
@@ -1210,6 +1254,10 @@ class FacebookGraphQLParser:
                 following_text = text
             elif "followers" in uri:
                 follower_text, follower_uri = text, uri
+            elif "friends" in uri:
+                friend_text, friend_uri = text, uri
+            elif isinstance(text, str) and "reaction" in text.lower():
+                reaction_text = text
 
         bio = _g(
             record, "header_top_row", "profile_user", "profile_status",
@@ -1251,6 +1299,9 @@ class FacebookGraphQLParser:
             "follower_count": _parse_abbreviated_count(follower_text),
             "followers_url": follower_uri,
             "following_count": _parse_abbreviated_count(following_text),
+            "friend_count": _parse_abbreviated_count(friend_text),
+            "friends_url": friend_uri,
+            "reaction_count": _parse_abbreviated_count(reaction_text),
             "bio": bio,
             "category": _g(category, "short_title", "text"),
             "intro_card_fields": intro_card_fields,
@@ -1273,7 +1324,8 @@ class FacebookGraphQLParser:
 
         About fields are dispatched into named convenience keys for the
         highest-value, most consistently-present field types observed
-        (phone, email, messenger, address, hours, rating, website), with
+        (phone, email, messenger, address, hours, rating, website; and for
+        personal profiles current_city, hometown), with
         every field — dispatched or not — also preserved in the generic
         `about_fields` list, since section coverage varies enormously by
         account (Pages typically expose contact/basic-info/links; personal
@@ -1298,20 +1350,36 @@ class FacebookGraphQLParser:
                 field_type = f.get("field_type")
                 text = _g(f, "title", "text")
                 link = f.get("link_url")
+                # Some fields put only a label in `title` and the value in
+                # `text_content` (relationship: "Relationship" / "Single").
+                detail = _g(f, "renderer", "field", "text_content", "text")
                 if isinstance(field_type, str):
-                    by_field_type[field_type] = {"text": text, "link_url": link}
+                    by_field_type[field_type] = {
+                        "text": text, "link_url": link, "detail": detail,
+                    }
                 about_fields.append({
                     "field_section_type": section_type,
                     "field_type": field_type,
                     "text": text,
+                    "detail": detail,
                     "link_url": link,
                 })
 
         def _val(field_type):
             return (by_field_type.get(field_type) or {}).get("text")
 
+        # current_city / hometown appear twice on personal profiles: as
+        # "Lives in Winder, Georgia" on the landing overview, and as bare
+        # "Winder, Georgia" in the `about_places` sub-tab. by_field_type is
+        # last-wins and sub-tab sections are appended after the overview, so
+        # the bare form wins whenever about_places was fetched.
+
         def _link(field_type):
             return (by_field_type.get(field_type) or {}).get("link_url")
+
+        def _detail_or_val(field_type):
+            entry = by_field_type.get(field_type) or {}
+            return entry.get("detail") or entry.get("text")
 
         flat.update({
             "phone": _val("profile_phone"),
@@ -1323,6 +1391,12 @@ class FacebookGraphQLParser:
             "rating_text": _val("ratings"),
             "website": _val("website"),
             "website_url": _link("website"),
+            # The header's intro card carries `category` only in some About
+            # layouts; otherwise it is an About field (field_type "category").
+            "category": flat.get("category") or _val("category"),
+            "current_city": _val("current_city"),
+            "hometown": _val("hometown"),
+            "relationship": _detail_or_val("relationship"),
             "about_fields": about_fields,
         })
         return flat
